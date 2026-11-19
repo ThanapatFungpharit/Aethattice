@@ -1,6 +1,6 @@
 # Implementation Plan — Cloud System Workspace Platform
 
-- Source of truth: `Cloud_System_Workspace_Platform_Specification.md` (v2.4, with approved errata C1–C10 recorded in `docs/SPEC_ERRATA.md`).
+- Source of truth: `Cloud_System_Workspace_Platform_Specification.md` (v2.4.1 = v2.4 + approved errata C1–C10, see `docs/SPEC_ERRATA.md`).
 - Status of this plan: **approved** (2026-11-19). Approved scope: **M0–M3 only**. M4–M9 are planned but not approved for implementation.
 - Requirement tracking: `docs/traceability.md`. Every normative requirement (MUST / MUST NOT / mandatory) is either implemented, in progress, or explicitly deferred with a target milestone. Nothing is omitted silently.
 

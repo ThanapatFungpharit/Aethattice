@@ -1,6 +1,6 @@
 # Cloud System — Workspace Platform Specification
 
-- Version: 2.4
+- Version: 2.4.1 (v2.4 plus approved errata C1–C10, recorded in docs/SPEC_ERRATA.md)
 - Status: Normative architecture specification and source of truth for implementation
 - Part 1 of 4: sections 1–9 (platform, resources, identity, authorization, applications, data, integration).
 - Part 2: sections 10–16 (collaboration, events, search, sync, UI, security, reference applications).
@@ -410,6 +410,7 @@ Authorization uses a single Authorization Decision Service (ADS) backed by the a
 - The public consistency context has a strict maximum encoded size. Large dependency sets are represented by a server-side immutable snapshot handle bound to the principal, tenant, audience and expiry; the handle resolves to a bounded vector. Expired, malformed, unknown-version or oversized contexts are rejected, not silently truncated.
 - The ADS issues signed, short-lived decision tickets for storage and realtime enforcement. A ticket is bound to the exact resource/version or channel, principal, session, operation, audience, authorization snapshot, epoch and expiry. Storage/realtime nodes still enforce local revocation watermarks and stream checkpoints; a decision ticket is not a substitute for revocation delivery.
 - Group closure is versioned. Membership mutations invalidate the relevant closure generation. Nested group cycles are rejected at write time; expansion has configured depth and cardinality limits. A limit breach returns a typed policy/complexity error, never a partial allow.
+- Signature algorithm: every signed artifact in this specification (access tokens, data-plane tokens, consistency contexts and snapshot handles, decision tickets, revocation records and watermark heartbeats, storage receipts, state attestations and signed cursors) uses Ed25519. Each artifact type has its own domain-separation context string included in the signed bytes, and signed payloads use one canonical serialization, so a signature for one artifact type can never verify as another. HMAC-protected artifacts (for example listing cursors, section 19.3) remain HMAC.
 - A write response carries the context required by subsequent dependent reads. Clients may omit it only for explicitly eventual-consistency reads that do not make authorization decisions or expose protected data.
 
 ### 6.5 Sharing
@@ -444,7 +445,7 @@ API nodes issue narrowly scoped tokens for direct client/storage transfers.
 - Tokens authorize a transfer capability, not a long-lived right to read. Default read lifetime is 60 seconds and write lifetime is 5 minutes. Renewal requires a fresh authorization check. Tokens cannot be broadened or replayed at another node.
 - Storage-node checks include signature, issuer, audience, expiry, site epoch, tenant, DPoP, exact extent/session binding, resource generation, current revocation epoch and freshness of its applied revocation position. A stale node denies access.
 - Every transfer is a cancellable stateful stream with bounded buffers. The storage node rechecks revocation at least every 1 MiB or 1 second, before range continuation and before issuing any additional response body. Revocation cancels the stream and discards queued unsent bytes.
-- Ancestor paths are not embedded as unbounded raw lists. Tokens carry the resource generation and a signed ancestry snapshot handle with a maximum depth of 256. The storage node resolves it through a bounded local authorization snapshot cache; a missing or stale snapshot denies access. Short-lived fallback tokens are permitted only for explicitly public data, never as a protected-resource workaround.
+- Ancestor paths are not embedded as unbounded raw lists. Tokens carry the resource generation and a signed ancestry snapshot handle with a maximum depth of 256. The storage node resolves it through a bounded local authorization snapshot cache; a missing or stale snapshot denies access. Short-lived fallback tokens are permitted only for explicitly public data, never as a protected-resource workaround. No resource depth within the supported limit (256, appendix H.5) uses a weaker token form.
 
 ### 6.8 Administrative roles and policy
 
@@ -699,7 +700,7 @@ Isolation never relies on a session setting that application code can change.
 
 - No credentials: applications hold no database credentials and cannot open database connections. All access goes through the host data interface, which runs on host-owned connections.
 - Statement validation: the host parses every statement (SQL parser in the host, not in the database) and accepts only:
-  - SELECT, INSERT, UPDATE, DELETE and UPSERT on the application's own tables and views;
+  - SELECT, INSERT, UPDATE, DELETE and UPSERT (PostgreSQL INSERT … ON CONFLICT) on the application's own tables and views;
   - a fixed allowlist of built-in functions.
   It rejects SET, RESET, set_config, DO blocks, transaction-control statements, DDL, COPY, function and procedure calls outside the allowlist, references to other schemas or catalogs, and multiple statements per call. Transactions are opened and closed by the host API, not by SQL text.
 - Tenant binding: the host opens every application transaction itself. It binds the tenant from the authenticated invocation context; caller-supplied tenant_id is ignored or rejected, INSERT/UPSERT tenant_id is injected by the host, and UPDATE cannot change tenant_id. Because applications cannot issue SET or set_config, the value cannot be changed inside the transaction. Connections are reset and verified before reuse.
@@ -799,7 +800,7 @@ Isolation never relies on a session setting that application code can change.
 
 ---
 
-*Part 2 of 4: sections 10–16. Part 1: sections 1–9. Part 3: sections 17–27. Part 4: appendices A–L.*
+*Part 2 of 4: sections 10–16. Part 1: sections 1–9. Part 3: sections 17–27. Part 4: appendices A–M.*
 
 ## 10. Real-Time Collaboration
 
@@ -1139,7 +1140,7 @@ Notes       (none)                                        Drive (attachments), T
 
 ---
 
-*Part 3 of 4: sections 17–27. Part 1: sections 1–9. Part 2: sections 10–16. Part 4: appendices A–L.*
+*Part 3 of 4: sections 17–27. Part 1: sections 1–9. Part 2: sections 10–16. Part 4: appendices A–M.*
 
 ## 17. Object Storage Subsystem
 
@@ -1170,6 +1171,8 @@ Invariants
 - Random keys, salts and nonces use an operating-system CSPRNG through an audited cryptographic library. Entropy failure fails the operation; timestamps, ordinary PRNGs and non-durable counters are never fallbacks. A nonce MUST NOT repeat under the same AEAD key. Retries may resend identical sealed bytes but MUST NOT re-encrypt different plaintext with the same key/nonce pair. Uncertain key or nonce state requires a fresh seal key and seal ID.
 
 Sealed object format (format version 1)
+
+Status: non-production-stable. Format version 1 is implemented with published test vectors and fuzzing, but MUST NOT be represented as production-ready until independent cryptographic review has no unresolved critical or high findings (R4, appendix L.6).
 
 A sealed object is a header followed by segments. All integers are unsigned and big-endian; IDs are 16-byte binary UUIDs. The header is canonical: a fixed field order and fixed length (144 bytes), with no optional fields, so the same values always produce the same bytes.
 
@@ -1236,6 +1239,8 @@ Offset  Size  Field
 
 ### 17.3 Durability tiers
 
+Exactly four tiers exist: Hot, Standard, Cold and Archive.
+
 ```text
 Tier            Encoding                         At publication                                  Steady state
 Hot, Standard   R replicas (default 3)           R durable receipts from R distinct failure       R replicas in R distinct failure domains
@@ -1245,7 +1250,7 @@ Cold, Archive   LRC(k,l,r) where eligible        Reached only by transcoding (17
                                                   verified before representation switch
 ```
 
-- Publication durability and steady-state redundancy are separate contracts. A published hot chunk MUST have all R replicas durable in distinct configured failure domains. W=R at publication; there is no default W=min(2,R) publication shortcut.
+- Publication durability and steady-state redundancy are separate contracts. A published hot chunk MUST have all R replicas durable in distinct configured failure domains. W=R at publication; there is no default W=min(2,R) publication shortcut. Throughout this specification W ≡ R: the number of durable receipts required for publication always equals the configured replica count R.
 - A deployment may define an explicit degraded-publication mode only for non-durable temporary staging data. It cannot publish a resource version, return a durable-success response or count the object as committed. Once full R is reached, the normal publication pivot may proceed.
 - After publication, repair maintains R distinct failure domains. If a failure reduces redundancy below R, the object remains readable only while its effective tolerance remains positive; it is marked degraded, repair is prioritized, and the console exposes exact remaining tolerance. The platform does not claim that acknowledged data survives failure of more domains than its actual placement can tolerate.
 - LRC coefficients MUST be maximally recoverable for their parameters. Build-time enumeration verifies every claimed erasure pattern and reports the decodable fraction for the next failure count. Only measured effective tolerance is advertised.
@@ -1296,7 +1301,7 @@ fewer than 11                        Replication (R = 3) with the tier's compres
   Such chunks are reported as degraded placement and rebalanced when domains return.
 - If the domain count stays below the LRC threshold for longer than a policy period (default 7 days), LRC chunks are transcoded back to replication and an alert is raised.
 - Placement: two fragments of the same local group MUST NOT share a correlated failure domain. A representation whose effective tolerance is below the tier minimum is never published.
-- Compression (LZ4 for Hot, Zstandard for Warm and Cold, Zstandard maximum or LZMA for Archive, chosen by benchmark; adaptive skipping for incompressible content) is applied to plaintext before sealing. Compression algorithm and level are recorded in the seal header.
+- Compression (LZ4 for Hot, Zstandard for Standard and Cold, Zstandard maximum or LZMA for Archive, chosen by benchmark; adaptive skipping for incompressible content) is applied to plaintext before sealing. Compression algorithm and level are recorded in the seal header.
 
 ### 17.4 Publication of representations
 
@@ -1307,7 +1312,7 @@ Every change of a chunk's representation (initial replication, transcoding to LR
 4. Commit: one compare-and-set in the objects domain: set the chunk's current seal from the old seal to the new one, mark the new extents committed, mark the old extents retiring with delete_after = now + max(read grace, recovery window + maximum replication lag).
 5. Failure at any step leaves the old seal current. Staged extents expire and are reclaimed only after the owning operation is authoritatively terminal and no provisional reference protects them. Retrying is always safe.
 6. The objects-domain compare-and-set is the sole representation publication point. It verifies the expected old seal, chunk generation, all R durable receipts for replicated Hot data (or every required LRC fragment plus verified parity), node incarnations, durability and failure-domain constraints in one transaction. A timeout with an unknown result is resolved by reading the chunk's authoritative seal generation and operation ID; a retry never assumes that the compare-and-set failed.
-7. The durable state model is: staged extent → committed extent → retiring extent → deleted extent; chunk state is live → retiring → reclaimed; seal state is staged → current → superseded. Transitions are compare-and-set operations with monotonically increasing generations. A committed extent may remain unreferenced only while a durable operation or provisional reference protects it. A retiring or reclaimed chunk cannot be resurrected by incrementing a reference count; a new publication must create or verify a live chunk generation and acquire a reference before it becomes visible.
+7. The durable state model is: staged extent → committed extent → retiring extent → deleted extent; chunk state is live → retiring → reclaimed; seal state is staged → current → retired (canonical terminal state; "superseded" is accepted only as a compatibility synonym for a seal). Transitions are compare-and-set operations with monotonically increasing generations. A committed extent may remain unreferenced only while a durable operation or provisional reference protects it. A retiring or reclaimed chunk cannot be resurrected by incrementing a reference count; a new publication must create or verify a live chunk generation and acquire a reference before it becomes visible.
 New data is always published replicated first. LRC is reached only by transcoding, so a degraded stripe is never the only copy.
 
 ### 17.5 Upload protocol
@@ -1323,7 +1328,7 @@ New data is always published replicated first. LRC is reached only by transcodin
    - A periodic reconciliation compares reservations with sessions and releases reservations without an open session; it never touches reservations converted into usage.
 2. Chunk plan: for each chunk, the API node assigns the chunk ID, seal ID and seal salt, issues SK (client sealing), chooses placement targets, assigns a new extent ID per target, and issues write tokens. When the client's plaintext hash matches a chunk of a version of the same resource that the caller can read, the plan can reuse that chunk instead of uploading it again.
 3. Transfer: transfers are resumable per chunk with offset semantics (an offset mismatch returns 409 with the current offset). The client sends ciphertext to the primary target, which forwards to the others. A node verifies the ciphertext BLAKE3 before appending and returns a signed receipt after fdatasync: (session ID, chunk index, chunk ID, seal ID, extent ID, ciphertext BLAKE3, size, node ID, node incarnation). The primary returns every receipt it obtained.
-4. Retry: with fewer than W receipts, the client asks for a new placement (new extent IDs) and resends the same sealed bytes. Superseded staged extents expire.
+4. Retry: with fewer than R receipts (W ≡ R), the client asks for a new placement (new extent IDs) and resends the same sealed bytes. Superseded staged extents expire.
 5. Receipt rules: receipts are signed with node keys issued by the cluster CA and bound to the session and extent ID. Finalize rejects receipts for another session, from an unknown incarnation, or with a duplicate extent ID, and deduplicates by extent ID.
 6. Finalize (saga, section 18.4):
    - a. Prepare, objects domain: verify every receipt, seal, checksum, placement and durability requirement. Register newly uploaded extents as committed-but-unreferenced and add provisional references for both new and reused chunks. A chunk is publication-ready only when its current seal is verified and its committed extents satisfy the selected tier's full publication durability contract and failure-domain policy. This step is idempotent. No resource version references the chunks yet.
@@ -1708,7 +1713,7 @@ app databases      Restore from verified backup/PITR; an application may rebuild
 
 ### 25.2 Key metrics
 
-- Durability: chunks below W, redundancy satisfied/pending/degraded, chunks at zero remaining tolerance, repair queue and repair-time objective, scrub progress and errors, lost chunks.
+- Durability: chunks below R (W ≡ R), redundancy satisfied/pending/degraded, chunks at zero remaining tolerance, repair queue and repair-time objective, scrub progress and errors, lost chunks.
 - Storage: fdatasync latency, group-commit sizes, capacity and headroom per failure domain.
 - Coordination: partition ownership and epochs, fenced rejections, node clock uncertainty, saga states.
 - Authorization: check latency and cache hit rate, consistency-token read-throughs, revocation-feed lag per consumer, token rejections by reason.
@@ -2165,6 +2170,8 @@ finalizing  finalized (terminal)    version published
 finalizing  open                    finalize failed with a retryable error before the pivot
 ```
 
+- Expiry does not apply in finalizing. A finalizing session leaves that state only through the finalize pivot (finalized) or authoritative proof that the pivot did not commit (back to open, after which expiry applies again), as specified in section 17.5 step 8.
+
 ### F.4 Chunk, seal and extent
 
 ```text
@@ -2180,7 +2187,21 @@ extent   staged → committed → retiring → deleted;                    retir
 
 ### F.5 Plugin
 
-installed → enabled → disabled → enabled; disabled → removing → removed (terminal). Enabling requires a resolution plan whose required dependencies are enabled (section 7.9).
+installed → enabled → disabled → enabled; disabled → removing → removed (terminal); installed → removing (a plugin that was never enabled). Enabling requires a resolution plan whose required dependencies are enabled (section 7.9).
+
+- A plugin is usable (routes, handlers, UI, host calls) only in state enabled, and only when its installation or upgrade saga has completed. A plugin whose installation saga has not completed is not in state installed and can never become usable.
+- Installation, upgrade and rollback are durable sagas (section 18.4) recorded in the operations domain with explicit states:
+
+```text
+Saga             States
+installation     created → fetching → validating → awaiting_approval → registering (pivot: registry row committed in state installed)
+                 → completed; failure before the pivot → compensating → failed (terminal, nothing registered or usable)
+upgrade          created → fetching → validating → awaiting_approval → migrating_expand → activating (pivot: active version switched)
+                 → completed; failure before the pivot → compensating → failed (previous version stays active)
+rollback         created → activating (pivot: retained version reactivated) → completed
+```
+
+- After a pivot, these sagas complete forward or enter blocked_for_operator; they never compensate (section 18.4).
 
 ## Appendix G. Plugin SDK and Developer Tooling
 
@@ -2252,7 +2273,7 @@ Revocation propagation to all consumers        0.5 s      2 s
 #### H.3.1 Workload definitions and acceptance
 
 - Throughput targets are measured with declared payload distributions, tenant counts, object/document size distributions, read/write ratios, concurrency, cache state, offered load and duration. Reports include p50/p95/p99/p99.9, error rate, CPU, memory, network, disk, tablet leaders, compaction and queue depth.
-- Upload throughput counts only successful publication after full publication durability, not session creation, accepted bytes or W<R staged receipts. Read throughput counts bytes delivered to authorized clients.
+- Upload throughput counts only successful publication after full publication durability, not session creation, accepted bytes or partial (fewer than R) staged receipts. Read throughput counts bytes delivered to authorized clients.
 - Tests cover uniform and skewed tenant distributions, hot folders, large nested groups, mass revocation, bulk import, large downloads, slow clients, concurrent repair, degraded failure domains and recovery replay.
 - Performance targets are evaluated at healthy load and under the defined degraded profiles. Correctness, revocation and repair reserves may not be disabled to meet throughput.
 
@@ -2269,7 +2290,7 @@ Tenants per cluster                      100,000
 Users per tenant                         1,000,000
 Resources per tenant                     10,000,000,000
 Entries per folder                       10,000,000 (bucketed listings)
-Resource depth                           256 (data-plane tokens list 64 ancestors; deeper resources use 1-minute tokens)
+Resource depth                           256 (data-plane tokens carry a signed ancestry snapshot handle, section 6.7)
 File size                                5 TiB
 Storage nodes per cluster                1,000
 Raw capacity per cluster                 100 PB
@@ -2453,4 +2474,4 @@ A release is published only when this suite passes.
 - Revoked or deleted data may remain in user-controlled exports or unmanaged copies. The platform guarantees revocation of future server access and managed-client reconciliation, not remote erasure of plaintext already copied outside platform control.
 
 ---
-*End of Cloud System Workspace Platform Specification v2.4.*
+*End of Cloud System Workspace Platform Specification v2.4.1.*
