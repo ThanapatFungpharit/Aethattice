@@ -497,7 +497,7 @@ impl Migrator {
     }
 }
 
-/// Migrations every domain receives (outbox, outbox counters, idempotency records).
+/// Migrations every domain receives (outbox, outbox counters, idempotency records, saga step receipts).
 pub fn common_migrations() -> Result<MigrationSet, MigrationError> {
     MigrationSet::from_files(&[
         (
@@ -507,6 +507,10 @@ pub fn common_migrations() -> Result<MigrationSet, MigrationError> {
         (
             "0002_idempotency_records.expand.sql",
             include_str!("../migrations/common/0002_idempotency_records.expand.sql"),
+        ),
+        (
+            "0003_saga_step_receipts.expand.sql",
+            include_str!("../migrations/common/0003_saga_step_receipts.expand.sql"),
         ),
     ])
 }
@@ -602,7 +606,7 @@ mod tests {
             Err(MigrationError::DuplicateVersion(1))
         );
         let common = common_migrations().unwrap();
-        assert_eq!(common.expected_version(), 2);
+        assert_eq!(common.expected_version(), 3);
         assert!(common.clone().merge(common).is_err());
     }
 }

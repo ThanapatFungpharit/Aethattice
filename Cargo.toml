@@ -50,6 +50,7 @@ tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter", "fmt", "registry"] }
 uuid = { version = "1.29.2", default-features = false, features = ["std", "serde"] }
 zeroize = { version = "1.9.1", features = ["derive"] }
+serde_jcs = "0.2.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

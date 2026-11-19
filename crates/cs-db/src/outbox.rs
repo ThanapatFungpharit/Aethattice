@@ -1,10 +1,13 @@
-//! Per-domain transactional outbox (contract §5.2; spec App. E, C2, §18.4).
+//! Per-domain transactional outbox (contract §5.2 rev 2; spec App. E, App. C rule C2, §18.4).
 //!
 //! [`Outbox::append`] is the only write path. It takes the domain transaction, so the event
-//! commits atomically with the state change. Sequences are allocated from `outbox_counters`
-//! with `UPDATE … RETURNING` (row lock held until commit), which makes them contiguous per
-//! partition and makes commit order equal sequence order within a partition. A missing
-//! sequence is therefore a real gap, and [`Outbox::read`] reports it.
+//! commits atomically with the state change. The source partition (§18.4) is the pair
+//! `(tenant_id, partition)`. Sequences are allocated from `outbox_counters` with an
+//! `INSERT … ON CONFLICT DO UPDATE … RETURNING` (row lock held until commit), which makes them
+//! contiguous per source partition and makes commit order equal sequence order within it. A
+//! missing sequence is therefore a real gap, and [`Outbox::read`] reports it.
+//!
+//! Consumer dedup key: `(cluster_id, domain_id, tenant_id, partition, sequence)`.
 
 use crate::error::DbError;
 use crate::pool::{DomainPool, DomainTx};
@@ -16,10 +19,15 @@ use uuid::Uuid;
 /// Maximum payload size (row limit, App. E).
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
+/// Number of partitions per tenant, P (design). Fixed for every domain at creation: changing
+/// it would remap partition keys and break per-key ordering, so it is a format constant.
+pub const OUTBOX_PARTITIONS: u32 = 16;
+
 /// An event to append.
 #[derive(Debug)]
 pub struct NewEvent<'a, T: Serialize + ?Sized> {
-    pub tenant_id: TenantId,
+    /// `None` for domain-level (non-tenant) events, stored as the nil UUID.
+    pub tenant_id: Option<TenantId>,
     /// e.g. `resource.created`: `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$`.
     pub event_type: &'a str,
     pub event_version: i32,
@@ -29,11 +37,12 @@ pub struct NewEvent<'a, T: Serialize + ?Sized> {
     pub payload: &'a T,
 }
 
-/// Where an appended event landed. With the domain's cluster ID this is the consumer dedup
-/// key `(cluster_id, domain_id, partition, sequence)` (§18.4).
+/// Where an appended event landed. With the domain's cluster ID this is the consumer dedup key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxPosition {
     pub domain: DomainId,
+    /// Nil UUID for domain-level events.
+    pub tenant_id: Uuid,
     pub partition: i32,
     pub sequence: i64,
     pub event_id: EventId,
@@ -73,11 +82,11 @@ pub struct Outbox;
 impl Outbox {
     /// `hash(partition_key) mod P`: first 8 bytes of BLAKE3 over the 16 key bytes, big-endian.
     /// Deterministic across nodes and versions.
-    pub fn partition_for(key: &Uuid, partitions: u32) -> i32 {
+    pub fn partition_for(key: &Uuid) -> i32 {
         let h = blake3::hash(key.as_bytes());
         let mut b = [0u8; 8];
         b.copy_from_slice(&h.as_bytes()[..8]);
-        let p = u64::from_be_bytes(b) % u64::from(partitions.max(1));
+        let p = u64::from_be_bytes(b) % u64::from(OUTBOX_PARTITIONS);
         i32::try_from(p).unwrap_or(0)
     }
 
@@ -103,24 +112,23 @@ impl Outbox {
                 payload.len()
             )));
         }
-        let partitions = tx.outbox_partitions().await?;
-        let partition = Self::partition_for(&ev.partition_key, partitions);
+        let tenant = ev.tenant_id.map_or(Uuid::nil(), TenantId::into_uuid);
+        let partition = Self::partition_for(&ev.partition_key);
         let event_id = EventId::generate()?;
-        let sequence: Option<i64> = sqlx::query_scalar(
-            "UPDATE outbox_counters SET next_sequence = next_sequence + 1 \
-             WHERE partition = $1 RETURNING next_sequence - 1",
+        let sequence: i64 = sqlx::query_scalar(
+            "INSERT INTO outbox_counters (tenant_id, partition, next_sequence) VALUES ($1, $2, 2) \
+             ON CONFLICT (tenant_id, partition) DO UPDATE SET next_sequence = outbox_counters.next_sequence + 1 \
+             RETURNING next_sequence - 1",
         )
+        .bind(tenant)
         .bind(partition)
-        .fetch_optional(tx.conn())
+        .fetch_one(tx.conn())
         .await?;
-        let sequence = sequence.ok_or_else(|| {
-            DbError::Invalid(format!("outbox partition {partition} has no counter"))
-        })?;
         sqlx::query(
             "INSERT INTO outbox (tenant_id, partition, sequence, event_id, event_type, event_version, partition_key, payload) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
-        .bind(ev.tenant_id.as_uuid())
+        .bind(tenant)
         .bind(partition)
         .bind(sequence)
         .bind(event_id.as_uuid())
@@ -132,17 +140,20 @@ impl Outbox {
         .await?;
         Ok(OutboxPosition {
             domain: tx.domain().clone(),
+            tenant_id: tenant,
             partition,
             sequence,
             event_id,
         })
     }
 
-    /// Read up to `limit` events of `partition` with `sequence > after`, in order. Fails with
-    /// [`DbError::OutboxGap`] if any sequence between `after` and the committed head is
-    /// missing.
+    /// Read up to `limit` events of source partition `(tenant_id, partition)` with
+    /// `sequence > after`, in order. Fails with [`DbError::OutboxGap`] if any sequence between
+    /// `after` and the committed head is missing. `tenant_id = Uuid::nil()` reads domain-level
+    /// events.
     pub async fn read(
         pool: &DomainPool,
+        tenant_id: Uuid,
         partition: i32,
         after: i64,
         limit: i64,
@@ -152,17 +163,19 @@ impl Outbox {
         }
         // Read the head first: every sequence below it has committed (commit order equals
         // sequence order), so the rows read afterwards must contain all of them.
-        let next: Option<i64> =
-            sqlx::query_scalar("SELECT next_sequence FROM outbox_counters WHERE partition = $1")
-                .bind(partition)
-                .fetch_optional(pool.raw())
-                .await?;
-        let next =
-            next.ok_or_else(|| DbError::Invalid(format!("unknown outbox partition {partition}")))?;
+        let next: Option<i64> = sqlx::query_scalar(
+            "SELECT next_sequence FROM outbox_counters WHERE tenant_id = $1 AND partition = $2",
+        )
+        .bind(tenant_id)
+        .bind(partition)
+        .fetch_optional(pool.raw())
+        .await?;
+        let next = next.unwrap_or(1);
         let rows: Vec<OutboxRecord> = sqlx::query_as(
             "SELECT tenant_id, partition, sequence, event_id, event_type, event_version, partition_key, payload \
-             FROM outbox WHERE partition = $1 AND sequence > $2 ORDER BY sequence ASC LIMIT $3",
+             FROM outbox WHERE tenant_id = $1 AND partition = $2 AND sequence > $3 ORDER BY sequence ASC LIMIT $4",
         )
+        .bind(tenant_id)
         .bind(partition)
         .bind(after)
         .bind(limit)
@@ -180,8 +193,7 @@ impl Outbox {
             expected += 1;
         }
         // Fewer rows than requested but the head is further on: the tail is missing.
-        let head_last = next - 1;
-        if (rows.len() as i64) < limit && expected <= head_last {
+        if (rows.len() as i64) < limit && expected < next {
             return Err(DbError::OutboxGap {
                 partition,
                 expected,
@@ -189,14 +201,6 @@ impl Outbox {
             });
         }
         Ok(rows)
-    }
-
-    /// Number of partitions of this domain's outbox.
-    pub async fn partition_count(pool: &DomainPool) -> Result<u32, DbError> {
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox_counters")
-            .fetch_one(pool.raw())
-            .await?;
-        u32::try_from(n).map_err(|_| DbError::Invalid("bad partition count".into()))
     }
 }
 
@@ -207,14 +211,13 @@ mod tests {
     #[test]
     fn partitioning_is_stable() {
         let k = Uuid::from_bytes([1; 16]);
-        let p = Outbox::partition_for(&k, 16);
+        let p = Outbox::partition_for(&k);
         assert!((0..16).contains(&p));
-        assert_eq!(p, Outbox::partition_for(&k, 16));
+        assert_eq!(p, Outbox::partition_for(&k));
         // golden value: guards against accidental changes of the hash mapping
-        assert_eq!(Outbox::partition_for(&Uuid::nil(), 16), {
-            let h = blake3::hash(&[0u8; 16]);
-            (u64::from_be_bytes(h.as_bytes()[..8].try_into().unwrap()) % 16) as i32
-        });
+        let h = blake3::hash(&[0u8; 16]);
+        let expect = (u64::from_be_bytes(h.as_bytes()[..8].try_into().unwrap()) % 16) as i32;
+        assert_eq!(Outbox::partition_for(&Uuid::nil()), expect);
     }
 
     #[test]

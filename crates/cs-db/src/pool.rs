@@ -20,7 +20,6 @@ use sqlx::{Connection as _, PgConnection, Postgres, Transaction};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::OnceCell;
 
 /// Bounded retry policy for conflicting transactions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,7 +89,6 @@ struct Inner {
     domain: DomainId,
     pool: PgPool,
     retry: RetryPolicy,
-    outbox_partitions: OnceCell<u32>,
 }
 
 /// A connection pool bound to exactly one domain.
@@ -111,7 +109,6 @@ impl std::fmt::Debug for DomainPool {
 pub struct DomainTx {
     domain: DomainId,
     tx: Transaction<'static, Postgres>,
-    pool: Arc<Inner>,
 }
 
 impl std::fmt::Debug for DomainTx {
@@ -131,24 +128,6 @@ impl DomainTx {
     /// The underlying connection, for executing queries inside the transaction.
     pub fn conn(&mut self) -> &mut PgConnection {
         &mut self.tx
-    }
-
-    pub(crate) async fn outbox_partitions(&mut self) -> Result<u32, DbError> {
-        let inner = self.pool.clone();
-        let tx = &mut self.tx;
-        inner
-            .outbox_partitions
-            .get_or_try_init(|| async move {
-                let n: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox_counters")
-                    .fetch_one(&mut **tx)
-                    .await?;
-                u32::try_from(n)
-                    .ok()
-                    .filter(|n| *n > 0)
-                    .ok_or_else(|| DbError::Invalid("outbox_counters is empty".into()))
-            })
-            .await
-            .copied()
     }
 }
 
@@ -190,7 +169,6 @@ impl DomainPool {
                 domain,
                 pool,
                 retry,
-                outbox_partitions: OnceCell::new(),
             }),
         }
     }
@@ -300,7 +278,6 @@ impl DomainPool {
         let mut dtx = DomainTx {
             domain: self.inner.domain.clone(),
             tx,
-            pool: self.inner.clone(),
         };
         match f(&mut dtx).await {
             Ok(v) => match dtx.tx.commit().await {

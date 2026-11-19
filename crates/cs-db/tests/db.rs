@@ -8,7 +8,7 @@ use cs_common::id::{PrincipalId, TenantId};
 use cs_common::idempotency::IdempotencyKey;
 use cs_common::vector::DomainId;
 use cs_db::idempotency::{
-    Begin, IdempotencyRecords, IdempotencyScope, InProgress, StoredResponse, request_digest,
+    Begin, IdempotencyRecords, IdempotencyScope, RequestBody, StoredResponse, request_digest,
 };
 use cs_db::migrate::{MigrationError, MigrationSet, Migrator, common_migrations};
 use cs_db::outbox::{NewEvent, Outbox};
@@ -298,7 +298,7 @@ async fn isolation_levels() {
     let err = pool
         .read_snapshot(|tx| {
             Box::pin(async move {
-                sqlx::query("INSERT INTO outbox_counters VALUES (999, 1)")
+                sqlx::query("INSERT INTO outbox_counters VALUES ('00000000-0000-0000-0000-000000000000', 999, 1)")
                     .execute(tx.conn())
                     .await?;
                 Ok(())
@@ -356,7 +356,7 @@ async fn migrations_are_idempotent_and_report_status() {
     let s = common_migrations().unwrap();
     let r = Migrator::run(pool, &s).await.unwrap();
     assert!(r.applied.is_empty());
-    assert_eq!(r.already_applied, vec![1, 2]);
+    assert_eq!(r.already_applied, vec![1, 2, 3]);
     let st = Migrator::status(pool, &s).await.unwrap();
     assert!(st.is_current());
     let more = s
@@ -547,7 +547,7 @@ async fn append(
             Outbox::append(
                 tx,
                 NewEvent {
-                    tenant_id: tenant,
+                    tenant_id: Some(tenant),
                     event_type: "test.happened",
                     event_version: 1,
                     partition_key: key,
@@ -565,7 +565,6 @@ async fn append(
 async fn outbox_sequences_are_contiguous_and_read_in_order() {
     let Some(t) = setup().await else { return };
     let pool = t.pool(&D).clone();
-    assert_eq!(Outbox::partition_count(&pool).await.unwrap(), 16);
     let tenant = TenantId::generate().unwrap();
     let key = Uuid::from_bytes([3; 16]);
     // concurrent appenders on the same partition
@@ -596,7 +595,7 @@ async fn outbox_sequences_are_contiguous_and_read_in_order() {
                 let a = Outbox::append(
                     tx,
                     NewEvent {
-                        tenant_id: tenant,
+                        tenant_id: Some(tenant),
                         event_type: "test.happened",
                         event_version: 1,
                         partition_key: key,
@@ -607,7 +606,7 @@ async fn outbox_sequences_are_contiguous_and_read_in_order() {
                 let b = Outbox::append(
                     tx,
                     NewEvent {
-                        tenant_id: tenant,
+                        tenant_id: Some(tenant),
                         event_type: "test.happened",
                         event_version: 1,
                         partition_key: key,
@@ -621,13 +620,17 @@ async fn outbox_sequences_are_contiguous_and_read_in_order() {
         .await
         .unwrap();
     assert_eq!(multi, (21, 22));
-    let rows = Outbox::read(&pool, partition, 0, 100).await.unwrap();
+    let rows = Outbox::read(&pool, tenant.into_uuid(), partition, 0, 100)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 22);
     assert!(rows.windows(2).all(|w| w[1].sequence == w[0].sequence + 1));
     let last: Ev = cs_crypto::cbor::from_canonical(&rows[21].payload, 1024).unwrap();
     assert_eq!(last, Ev { n: 101 });
     // paging
-    let page = Outbox::read(&pool, partition, 10, 5).await.unwrap();
+    let page = Outbox::read(&pool, tenant.into_uuid(), partition, 10, 5)
+        .await
+        .unwrap();
     assert_eq!(
         page.iter().map(|r| r.sequence).collect::<Vec<_>>(),
         vec![11, 12, 13, 14, 15]
@@ -647,7 +650,7 @@ async fn outbox_rolled_back_append_leaves_no_gap() {
                 Outbox::append(
                     tx,
                     NewEvent {
-                        tenant_id: tenant,
+                        tenant_id: Some(tenant),
                         event_type: "test.happened",
                         event_version: 1,
                         partition_key: key,
@@ -663,7 +666,10 @@ async fn outbox_rolled_back_append_leaves_no_gap() {
     let p = append(pool, tenant, key, 1).await;
     assert_eq!(p.sequence, 1);
     assert_eq!(
-        Outbox::read(pool, p.partition, 0, 10).await.unwrap().len(),
+        Outbox::read(pool, tenant.into_uuid(), p.partition, 0, 10)
+            .await
+            .unwrap()
+            .len(),
         1
     );
     t.cleanup().await;
@@ -682,16 +688,21 @@ async fn outbox_gap_detection() {
     // simulate a lost row in the middle
     pool.transaction(move |tx| {
         Box::pin(async move {
-            sqlx::query("DELETE FROM outbox WHERE partition = $1 AND sequence = 2")
-                .bind(part)
-                .execute(tx.conn())
-                .await?;
+            sqlx::query(
+                "DELETE FROM outbox WHERE partition = $1 AND sequence = 2 AND tenant_id = $2",
+            )
+            .bind(part)
+            .bind(tenant.into_uuid())
+            .execute(tx.conn())
+            .await?;
             Ok(())
         })
     })
     .await
     .unwrap();
-    let err = Outbox::read(pool, part, 0, 10).await.unwrap_err();
+    let err = Outbox::read(pool, tenant.into_uuid(), part, 0, 10)
+        .await
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -704,20 +715,31 @@ async fn outbox_gap_detection() {
         "{err:?}"
     );
     // reading past the gap works
-    assert_eq!(Outbox::read(pool, part, 2, 10).await.unwrap().len(), 2);
+    assert_eq!(
+        Outbox::read(pool, tenant.into_uuid(), part, 2, 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     // simulate a lost tail row
     pool.transaction(move |tx| {
         Box::pin(async move {
-            sqlx::query("DELETE FROM outbox WHERE partition = $1 AND sequence = 4")
-                .bind(part)
-                .execute(tx.conn())
-                .await?;
+            sqlx::query(
+                "DELETE FROM outbox WHERE partition = $1 AND sequence = 4 AND tenant_id = $2",
+            )
+            .bind(part)
+            .bind(tenant.into_uuid())
+            .execute(tx.conn())
+            .await?;
             Ok(())
         })
     })
     .await
     .unwrap();
-    let err = Outbox::read(pool, part, 2, 10).await.unwrap_err();
+    let err = Outbox::read(pool, tenant.into_uuid(), part, 2, 10)
+        .await
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -745,7 +767,7 @@ async fn outbox_rejects_invalid_events() {
                 Outbox::append(
                     tx,
                     NewEvent {
-                        tenant_id: tenant,
+                        tenant_id: Some(tenant),
                         event_type: "test.big",
                         event_version: 1,
                         partition_key: Uuid::nil(),
@@ -764,7 +786,7 @@ async fn outbox_rejects_invalid_events() {
                 Outbox::append(
                     tx,
                     NewEvent {
-                        tenant_id: tenant,
+                        tenant_id: Some(tenant),
                         event_type: "Bad",
                         event_version: 1,
                         partition_key: Uuid::nil(),
@@ -797,7 +819,13 @@ fn scope(tenant: TenantId, key: &str) -> IdempotencyScope {
 }
 
 fn digest(body: &[u8]) -> [u8; 32] {
-    request_digest("POST", "/api/v2/things", &BTreeMap::new(), body).unwrap()
+    request_digest(
+        "POST",
+        "/api/v2/things",
+        &BTreeMap::new(),
+        RequestBody::Raw(body),
+    )
+    .unwrap()
 }
 
 /// A single-domain operation: begin + effect + complete in one transaction.
@@ -810,9 +838,7 @@ async fn do_op(
     pool.transaction(move |tx| {
         let s = s.clone();
         Box::pin(async move {
-            match IdempotencyRecords::begin(tx, &s, &digest(body), 24, InProgress::NotYetCommitted)
-                .await?
-            {
+            match IdempotencyRecords::begin(tx, &s, &digest(body), 24).await? {
                 Begin::Replay(r) => Ok(r),
                 Begin::Started => {
                     sqlx::query("INSERT INTO t_effects (tenant_id) VALUES ($1)")
@@ -871,8 +897,7 @@ async fn idempotency_replay_mismatch_and_rollback() {
         .transaction(move |tx| {
             let s = s3c.clone();
             Box::pin(async move {
-                IdempotencyRecords::begin(tx, &s, &digest(b"x"), 24, InProgress::NotYetCommitted)
-                    .await?;
+                IdempotencyRecords::begin(tx, &s, &digest(b"x"), 24).await?;
                 Err::<(), _>(DbError::app(ErrorCode::Conflict))
             })
         })
@@ -882,7 +907,7 @@ async fn idempotency_replay_mismatch_and_rollback() {
 }
 
 #[tokio::test]
-async fn idempotency_in_progress_conflict_or_outcome_unknown() {
+async fn idempotency_in_progress_is_outcome_unknown() {
     let Some(t) = setup().await else { return };
     let pool = t.pool(&D);
     let tenant = TenantId::generate().unwrap();
@@ -892,47 +917,31 @@ async fn idempotency_in_progress_conflict_or_outcome_unknown() {
     let started = pool
         .transaction(move |tx| {
             let s = sc.clone();
-            Box::pin(async move {
-                IdempotencyRecords::begin(tx, &s, &digest(b"b"), 24, InProgress::NotYetCommitted)
-                    .await
-            })
+            Box::pin(async move { IdempotencyRecords::begin(tx, &s, &digest(b"b"), 24).await })
         })
         .await
         .unwrap();
     assert_eq!(started, Begin::Started);
-    for (mode, expected) in [
-        (InProgress::NotYetCommitted, ErrorCode::Conflict),
-        (InProgress::MayBeCommitted, ErrorCode::OutcomeUnknown),
-    ] {
+    for expected in [ErrorCode::OutcomeUnknown, ErrorCode::OutcomeUnknown] {
         let sc = s.clone();
         let err = pool
             .transaction(move |tx| {
                 let s = sc.clone();
-                Box::pin(
-                    async move { IdempotencyRecords::begin(tx, &s, &digest(b"b"), 24, mode).await },
-                )
+                Box::pin(async move { IdempotencyRecords::begin(tx, &s, &digest(b"b"), 24).await })
             })
             .await
             .unwrap_err();
         let api = cs_common::Error::from(err);
         assert_eq!(api.code(), &cs_common::Code::Core(expected));
-        assert_eq!(api.retryable(), expected == ErrorCode::OutcomeUnknown);
+        assert_eq!(api.status(), 504);
+        assert!(api.retryable());
     }
     // mismatch takes precedence over in-progress
     let sc = s.clone();
     let err = pool
         .transaction(move |tx| {
             let s = sc.clone();
-            Box::pin(async move {
-                IdempotencyRecords::begin(
-                    tx,
-                    &s,
-                    &digest(b"other"),
-                    24,
-                    InProgress::NotYetCommitted,
-                )
-                .await
-            })
+            Box::pin(async move { IdempotencyRecords::begin(tx, &s, &digest(b"other"), 24).await })
         })
         .await
         .unwrap_err();
@@ -962,8 +971,7 @@ async fn idempotency_expired_record_is_reclaimed_and_large_responses_refused() {
         .transaction(move |tx| {
             let s = sc.clone();
             Box::pin(async move {
-                IdempotencyRecords::begin(tx, &s, &digest(b"z"), 24, InProgress::NotYetCommitted)
-                    .await?;
+                IdempotencyRecords::begin(tx, &s, &digest(b"z"), 24).await?;
                 IdempotencyRecords::complete(
                     tx,
                     &s,
@@ -1139,5 +1147,115 @@ async fn lost_commit_reply_is_outcome_unknown() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(count(t.pool(&D), "SELECT count(*) FROM t_unknown").await, 1);
     pool.close().await;
+    t.cleanup().await;
+}
+
+#[tokio::test]
+async fn outbox_sequences_are_per_tenant_and_domain_events_use_nil_tenant() {
+    let Some(t) = setup().await else { return };
+    let pool = t.pool(&D);
+    let (t1, t2) = (TenantId::generate().unwrap(), TenantId::generate().unwrap());
+    let key = Uuid::from_bytes([6; 16]);
+    let a1 = append(pool, t1, key, 1).await;
+    let b1 = append(pool, t2, key, 1).await;
+    let a2 = append(pool, t1, key, 2).await;
+    assert_eq!((a1.sequence, b1.sequence, a2.sequence), (1, 1, 2));
+    assert_eq!(
+        a1.partition, b1.partition,
+        "same key, same partition number"
+    );
+    let d = pool
+        .transaction(move |tx| {
+            Box::pin(async move {
+                Outbox::append(
+                    tx,
+                    NewEvent {
+                        tenant_id: None,
+                        event_type: "domain.ticked",
+                        event_version: 1,
+                        partition_key: key,
+                        payload: &Ev { n: 0 },
+                    },
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!((d.tenant_id, d.sequence), (Uuid::nil(), 1));
+    assert_eq!(
+        Outbox::read(pool, Uuid::nil(), d.partition, 0, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        Outbox::read(pool, t1.into_uuid(), a1.partition, 0, 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    // an unknown source partition is simply empty
+    assert!(
+        Outbox::read(pool, TenantId::generate().unwrap().into_uuid(), 0, 0, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    t.cleanup().await;
+}
+
+#[tokio::test]
+async fn idempotency_execute_helper_and_oversized_response_is_internal() {
+    let Some(t) = setup().await else { return };
+    let pool = t.pool(&D);
+    exec(pool, "CREATE TABLE IF NOT EXISTS t_effects (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), tenant_id uuid NOT NULL)").await;
+    let s = scope(TenantId::generate().unwrap(), "exec");
+    let dg = digest(b"payload");
+    let runs = Arc::new(AtomicU32::new(0));
+    for _ in 0..3 {
+        let r = runs.clone();
+        let tenant = s.tenant_id;
+        let resp = IdempotencyRecords::execute(pool, &s, dg, 24, move |tx| {
+            r.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                sqlx::query("INSERT INTO t_effects (tenant_id) VALUES ($1)")
+                    .bind(tenant.as_uuid())
+                    .execute(tx.conn())
+                    .await?;
+                Ok(StoredResponse {
+                    status: 201,
+                    body: b"made".to_vec(),
+                })
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp.body, b"made");
+    }
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "effect ran once; duplicates replayed"
+    );
+    assert_eq!(count(pool, "SELECT count(*) FROM t_effects").await, 1);
+    let big = scope(s.tenant_id, "big-exec");
+    let err = IdempotencyRecords::execute(pool, &big, digest(b"z"), 24, |_tx| {
+        Box::pin(async move {
+            Ok(StoredResponse {
+                status: 200,
+                body: vec![7; 70_000],
+            })
+        })
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(
+        code(err),
+        ErrorCode::Internal,
+        "never truncated, never stored"
+    );
     t.cleanup().await;
 }
