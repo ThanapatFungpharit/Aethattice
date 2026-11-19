@@ -5,12 +5,13 @@
 //!   is advanced only by compare-and-set on `version`; [`SagaState::can_transition`] is the
 //!   state machine.
 //! - Every step is exactly one local transaction in its own domain plus at least one outbox
-//!   event in that transaction. The step's stable idempotency key `saga:{operation}:{step}` is
-//!   recorded in the same transaction in that domain's `idempotency_records`, so duplicate
-//!   delivery returns the original result and never re-applies the effect.
+//!   event in that transaction. Step idempotency is the framework's job (contract §5.4 rev 2):
+//!   the framework writes a `saga_step_receipts (tenant_id, operation_id, step, result)` row in
+//!   the same local transaction as the step's effect, so a redelivered step finds its receipt
+//!   and returns the stored result without re-running. Saga authors implement only the body.
 //! - Authoritative proof instead of guessing: before compensating, the executor *fences* the
-//!   pivot (and, during compensation, each pre-pivot step) by writing an "aborted" record
-//!   under the step's key in the step's own domain. A concurrent or later execution of that
+//!   pivot (and, during compensation, each pre-pivot step) by writing an "aborted" receipt
+//!   for the step in the step's own domain. A concurrent or later execution of that
 //!   step then observes the fence and cannot commit; if the step had already committed, the
 //!   fence observes that instead. Timeouts, lost responses and missing events never decide an
 //!   outcome.
@@ -23,9 +24,7 @@ use cs_common::error::{Error as CsError, ErrorCode};
 use cs_common::id::{OperationId, PrincipalId, TenantId};
 use cs_common::idempotency::IdempotencyKey;
 use cs_common::vector::DomainId;
-use cs_db::idempotency::{
-    Begin, IdempotencyRecords, IdempotencyScope, InProgress, RequestDigest, StoredResponse,
-};
+use cs_db::idempotency::RequestDigest;
 use cs_db::outbox::OutboxPosition;
 use cs_db::{DbError, DomainPool, DomainTx};
 use futures::future::BoxFuture;
@@ -37,16 +36,10 @@ use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Retention of per-step idempotency records (design): long enough to outlive any saga,
-/// including one that waits for an operator. Never below the client policy.
-pub const STEP_RECORD_RETENTION_HOURS: i64 = 720;
 /// Maximum size of the CBOR `steps` document and of results.
 pub const MAX_DOC_BYTES: usize = 64 * 1024;
 /// Forward retries of a post-pivot step before the saga is blocked for an operator.
 pub const DEFAULT_MAX_FORWARD_ATTEMPTS: u32 = 10;
-
-const STATUS_COMMITTED: u16 = 200;
-const STATUS_ABORTED: u16 = 410;
 
 // ---------------------------------------------------------------------------------------------
 // States
@@ -106,21 +99,26 @@ impl SagaState {
         matches!(self, SagaState::Created | SagaState::RunningPrePivot)
     }
 
-    /// The state machine. Self-transitions record step progress.
-    /// - `compensating` is reachable only from pre-pivot states;
-    /// - from `pivot_committed` on, only forward transitions and `blocked_for_operator`.
+    /// The state machine (contract §5.4 rev 2). Self-transitions record step progress.
+    /// - `compensating` is reachable only from the pre-pivot state `running_pre_pivot`;
+    /// - from `pivot_committed` on, only forward transitions and `blocked_for_operator`;
+    /// - `blocked_for_operator` leaves only through an audited operator action (M4), never
+    ///   through this automatic state machine.
     pub fn can_transition(self, to: SagaState) -> bool {
         use SagaState::*;
         matches!(
             (self, to),
-            (Created, RunningPrePivot | Compensating | BlockedForOperator)
+            (Created, RunningPrePivot | Compensated | BlockedForOperator)
                 | (
                     RunningPrePivot,
                     RunningPrePivot | PivotCommitted | Compensating | BlockedForOperator
                 )
-                | (PivotCommitted, Completing | BlockedForOperator)
+                | (PivotCommitted, Completing | Completed | BlockedForOperator)
                 | (Completing, Completing | Completed | BlockedForOperator)
-                | (Compensating, Compensating | Compensated | BlockedForOperator)
+                | (
+                    Compensating,
+                    Compensating | Compensated | BlockedForOperator
+                )
         )
     }
 }
@@ -267,7 +265,8 @@ pub struct SagaDoc {
 
 impl SagaDoc {
     fn encode(&self) -> Result<Vec<u8>, OpsError> {
-        let b = cs_crypto::cbor::to_canonical(self).map_err(|e| OpsError::Encoding(e.to_string()))?;
+        let b =
+            cs_crypto::cbor::to_canonical(self).map_err(|e| OpsError::Encoding(e.to_string()))?;
         if b.len() > MAX_DOC_BYTES {
             return Err(OpsError::Encoding("saga document exceeds 64 KiB".into()));
         }
@@ -275,7 +274,8 @@ impl SagaDoc {
     }
 
     fn decode(b: &[u8]) -> Result<Self, OpsError> {
-        cs_crypto::cbor::from_canonical(b, MAX_DOC_BYTES).map_err(|e| OpsError::Encoding(e.to_string()))
+        cs_crypto::cbor::from_canonical(b, MAX_DOC_BYTES)
+            .map_err(|e| OpsError::Encoding(e.to_string()))
     }
 }
 
@@ -313,6 +313,8 @@ pub enum OpsError {
     Encoding(String),
     #[error("illegal saga transition {from} -> {to}")]
     IllegalTransition { from: SagaState, to: SagaState },
+    #[error("operation record version {expected} is stale (current {current})")]
+    VersionMismatch { expected: i64, current: i64 },
     #[error("invalid saga definition: {0}")]
     Definition(String),
     /// Test-only crash injection fired.
@@ -331,6 +333,9 @@ impl From<OpsError> for CsError {
         match e {
             OpsError::Db(d) => d.into(),
             OpsError::NotFound(_) => CsError::new(ErrorCode::NotFound),
+            OpsError::IllegalTransition { .. } | OpsError::VersionMismatch { .. } => {
+                CsError::new(ErrorCode::Conflict).with_cause(e)
+            }
             other => CsError::internal(other),
         }
     }
@@ -398,35 +403,78 @@ struct StepRecordBody {
     done: Option<StepDone>,
 }
 
-fn step_digest(op: OperationId, step: &str, kind: &str) -> RequestDigest {
-    let mut h = blake3::Hasher::new();
-    h.update(b"cs-saga-step/v1\0");
-    h.update(op.as_bytes());
-    h.update(kind.as_bytes());
-    h.update(b"\0");
-    h.update(step.as_bytes());
-    *h.finalize().as_bytes()
+/// Receipt `step` value of a compensation.
+fn compensation_step(name: &str) -> String {
+    format!("{name}:compensate")
 }
 
-fn step_scope(rec_tenant: TenantId, actor: PrincipalId, op: OperationId, step: &str, kind: &str) -> Result<IdempotencyScope, OpsError> {
-    let key = IdempotencyKey::parse(&format!("saga:{op}:{kind}:{step}"))
-        .map_err(|_| OpsError::Definition(format!("step name {step:?} makes an invalid key")))?;
-    Ok(IdempotencyScope {
-        tenant_id: rec_tenant,
-        principal_id: actor,
-        key,
-    })
+enum Receipt {
+    /// This transaction inserted the receipt row; it must fill it in before committing.
+    Claimed,
+    /// A committed receipt exists.
+    Existing(StepRecordBody),
 }
 
-fn encode_record(body: &StepRecordBody) -> Result<StoredResponse, DbError> {
-    Ok(StoredResponse {
-        status: if body.committed { STATUS_COMMITTED } else { STATUS_ABORTED },
-        body: cs_crypto::cbor::to_canonical(body).map_err(|e| DbError::Invalid(e.to_string()))?,
-    })
+fn encode_receipt(body: &StepRecordBody) -> Result<Vec<u8>, DbError> {
+    cs_crypto::cbor::to_canonical(body).map_err(|e| DbError::Invalid(e.to_string()))
 }
 
-fn decode_record(r: &StoredResponse) -> Result<StepRecordBody, DbError> {
-    cs_crypto::cbor::from_canonical(&r.body, MAX_DOC_BYTES).map_err(|e| DbError::Invalid(e.to_string()))
+/// Claim the receipt `(tenant, operation, step)` inside `tx`, or return the committed one.
+/// A concurrent claimer blocks on the row until this transaction ends, then sees its result.
+async fn claim_receipt(
+    tx: &mut DomainTx,
+    tenant: Uuid,
+    op: Uuid,
+    step: &str,
+) -> Result<Receipt, DbError> {
+    let claimed: Option<bool> = sqlx::query_scalar(
+        "INSERT INTO saga_step_receipts (tenant_id, operation_id, step, result) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (tenant_id, operation_id, step) DO NOTHING RETURNING true",
+    )
+    .bind(tenant)
+    .bind(op)
+    .bind(step)
+    .bind(Vec::<u8>::new())
+    .fetch_optional(tx.conn())
+    .await?;
+    if claimed.is_some() {
+        return Ok(Receipt::Claimed);
+    }
+    let r: Vec<u8> = sqlx::query_scalar(
+        "SELECT result FROM saga_step_receipts WHERE tenant_id = $1 AND operation_id = $2 AND step = $3",
+    )
+    .bind(tenant)
+    .bind(op)
+    .bind(step)
+    .fetch_one(tx.conn())
+    .await?;
+    let body = cs_crypto::cbor::from_canonical(&r, MAX_DOC_BYTES)
+        .map_err(|e| DbError::Invalid(format!("saga step receipt: {e}")))?;
+    Ok(Receipt::Existing(body))
+}
+
+/// Fill in a claimed receipt (same transaction as the claim).
+async fn write_receipt(
+    tx: &mut DomainTx,
+    tenant: Uuid,
+    op: Uuid,
+    step: &str,
+    body: &StepRecordBody,
+) -> Result<(), DbError> {
+    let n = sqlx::query(
+        "UPDATE saga_step_receipts SET result = $4 WHERE tenant_id = $1 AND operation_id = $2 AND step = $3",
+    )
+    .bind(tenant)
+    .bind(op)
+    .bind(step)
+    .bind(encode_receipt(body)?)
+    .execute(tx.conn())
+    .await?
+    .rows_affected();
+    if n != 1 {
+        return Err(DbError::Invalid("saga step receipt vanished".into()));
+    }
+    Ok(())
 }
 
 #[derive(sqlx::FromRow)]
@@ -459,10 +507,25 @@ impl SagaExecutor {
     pub fn register(&mut self, def: Arc<dyn SagaDefinition>) -> Result<(), OpsError> {
         let steps = def.steps();
         if steps.is_empty() || !steps.iter().any(|s| s.name == def.pivot()) {
-            return Err(OpsError::Definition(format!("{}: pivot must be one of the steps", def.saga_type())));
+            return Err(OpsError::Definition(format!(
+                "{}: pivot must be one of the steps",
+                def.saga_type()
+            )));
         }
         let mut names = std::collections::BTreeSet::new();
         for s in &steps {
+            let valid = !s.name.is_empty()
+                && s.name.len() <= 64
+                && s.name.as_bytes()[0].is_ascii_lowercase()
+                && s.name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            if !valid {
+                return Err(OpsError::Definition(format!(
+                    "invalid step name {:?}",
+                    s.name
+                )));
+            }
             if !names.insert(s.name) {
                 return Err(OpsError::Definition(format!("duplicate step {}", s.name)));
             }
@@ -513,7 +576,9 @@ impl SagaExecutor {
     }
 
     fn pool(&self, d: &DomainId) -> Result<&DomainPool, OpsError> {
-        self.pools.get(d).ok_or_else(|| OpsError::MissingPool(d.to_string()))
+        self.pools
+            .get(d)
+            .ok_or_else(|| OpsError::MissingPool(d.to_string()))
     }
 
     /// Create the operation record (before any side effect). A duplicate request (same
@@ -591,14 +656,15 @@ impl SagaExecutor {
     }
 
     /// Load an operation record.
-    pub async fn load(&self, op: OperationId) -> Result<SagaRecord, OpsError> {
+    pub async fn load(&self, tenant: TenantId, op: OperationId) -> Result<SagaRecord, OpsError> {
         let row: Option<Row> = self
             .ops
             .transaction(move |tx| Box::pin(async move {
                 Ok(sqlx::query_as(
                     "SELECT operation_id, tenant_id, saga_type, protocol_version, actor, state, pivot, steps, version, \
-                     (deadline <= now()) AS deadline_passed, result FROM sagas WHERE operation_id = $1",
+                     (deadline <= now()) AS deadline_passed, result FROM sagas WHERE tenant_id = $1 AND operation_id = $2",
                 )
+                .bind(tenant.as_uuid())
                 .bind(op.as_uuid())
                 .fetch_optional(tx.conn())
                 .await?)
@@ -612,7 +678,8 @@ impl SagaExecutor {
             saga_type: r.saga_type,
             protocol_version: r.protocol_version,
             actor: PrincipalId::from_uuid(r.actor).map_err(bad)?,
-            state: SagaState::parse(&r.state).ok_or_else(|| OpsError::Encoding(format!("state {}", r.state)))?,
+            state: SagaState::parse(&r.state)
+                .ok_or_else(|| OpsError::Encoding(format!("state {}", r.state)))?,
             pivot: r.pivot,
             doc: SagaDoc::decode(&r.steps)?,
             version: r.version,
@@ -630,10 +697,14 @@ impl SagaExecutor {
         result: Option<Vec<u8>>,
     ) -> Result<bool, OpsError> {
         if !rec.state.can_transition(to) {
-            return Err(OpsError::IllegalTransition { from: rec.state, to });
+            return Err(OpsError::IllegalTransition {
+                from: rec.state,
+                to,
+            });
         }
         let doc = Arc::new(doc.encode()?);
         let op = rec.operation_id;
+        let tenant = rec.tenant_id;
         let expected = rec.version;
         let result = Arc::new(result);
         let n = self
@@ -644,13 +715,14 @@ impl SagaExecutor {
                     Ok(sqlx::query(
                         "UPDATE sagas SET state = $3, steps = $4, result = COALESCE($5, result), \
                          version = version + 1, updated_at = now() \
-                         WHERE operation_id = $1 AND version = $2",
+                         WHERE operation_id = $1 AND version = $2 AND tenant_id = $6",
                     )
                     .bind(op.as_uuid())
                     .bind(expected)
                     .bind(to.as_str())
                     .bind(doc.as_slice())
                     .bind(result.as_deref())
+                    .bind(tenant.as_uuid())
                     .execute(tx.conn())
                     .await?
                     .rows_affected())
@@ -684,52 +756,67 @@ impl SagaExecutor {
         step: &StepDef,
     ) -> Result<Option<StepDone>, OpsError> {
         let pool = self.pool(&step.domain)?;
-        let scope = Arc::new(step_scope(rec.tenant_id, rec.actor, rec.operation_id, step.name, "apply")?);
-        let digest = step_digest(rec.operation_id, step.name, "apply");
+        let (tenant, op) = (rec.tenant_id.into_uuid(), rec.operation_id.into_uuid());
         let ctx = Arc::new(Self::ctx(rec, step.name));
         let def = def.clone();
         let out = pool
             .transaction(move |tx| {
-                let (def, ctx, scope) = (def.clone(), ctx.clone(), scope.clone());
+                let (def, ctx) = (def.clone(), ctx.clone());
                 Box::pin(async move {
-                    match IdempotencyRecords::begin(tx, &scope, &digest, STEP_RECORD_RETENTION_HOURS, InProgress::NotYetCommitted).await? {
-                        Begin::Replay(r) => Ok(decode_record(&r)?.done),
-                        Begin::Started => {
+                    match claim_receipt(tx, tenant, op, ctx.step).await? {
+                        Receipt::Existing(b) => Ok(b.done),
+                        Receipt::Claimed => {
                             let done = def.apply(&ctx, tx).await?;
                             if done.outbox.is_empty() {
-                                return Err(DbError::Invalid(format!("step {} wrote no outbox event", ctx.step)));
+                                return Err(DbError::Invalid(format!(
+                                    "step {} wrote no outbox event",
+                                    ctx.step
+                                )));
                             }
-                            IdempotencyRecords::complete(tx, &scope, &encode_record(&StepRecordBody { committed: true, done: Some(done.clone()) })?).await?;
+                            let body = StepRecordBody {
+                                committed: true,
+                                done: Some(done.clone()),
+                            };
+                            write_receipt(tx, tenant, op, ctx.step, &body).await?;
                             Ok(Some(done))
                         }
                     }
                 })
             })
             .await?;
-        self.crash_at(CrashPoint::AfterStepTx { step: step.name.to_owned(), kind: "apply" })?;
+        self.crash_at(CrashPoint::AfterStepTx {
+            step: step.name.to_owned(),
+            kind: "apply",
+        })?;
         Ok(out)
     }
 
     /// Fence a step in its domain: afterwards it can never commit. Reports whether it had.
     async fn fence(&self, rec: &SagaRecord, step: &StepDef) -> Result<Fence, OpsError> {
         let pool = self.pool(&step.domain)?;
-        let scope = Arc::new(step_scope(rec.tenant_id, rec.actor, rec.operation_id, step.name, "apply")?);
-        let digest = step_digest(rec.operation_id, step.name, "apply");
+        let (tenant, op) = (rec.tenant_id.into_uuid(), rec.operation_id.into_uuid());
+        let name = step.name;
         let out = pool
             .transaction(move |tx| {
-                let scope = scope.clone();
                 Box::pin(async move {
-                    match IdempotencyRecords::begin(tx, &scope, &digest, STEP_RECORD_RETENTION_HOURS, InProgress::NotYetCommitted).await? {
-                        Begin::Started => {
-                            IdempotencyRecords::complete(tx, &scope, &encode_record(&StepRecordBody { committed: false, done: None })?).await?;
+                    match claim_receipt(tx, tenant, op, name).await? {
+                        Receipt::Claimed => {
+                            let body = StepRecordBody {
+                                committed: false,
+                                done: None,
+                            };
+                            write_receipt(tx, tenant, op, name, &body).await?;
                             Ok(None)
                         }
-                        Begin::Replay(r) => Ok(decode_record(&r)?.done),
+                        Receipt::Existing(b) => Ok(b.done),
                     }
                 })
             })
             .await?;
-        self.crash_at(CrashPoint::AfterStepTx { step: step.name.to_owned(), kind: "fence" })?;
+        self.crash_at(CrashPoint::AfterStepTx {
+            step: step.name.to_owned(),
+            kind: "fence",
+        })?;
         Ok(match out {
             None => Fence::NotCommitted,
             Some(d) => Fence::Committed(d),
@@ -745,42 +832,129 @@ impl SagaExecutor {
         step: &StepDef,
     ) -> Result<Option<StepDone>, OpsError> {
         let pool = self.pool(&step.domain)?;
-        let apply_scope = Arc::new(step_scope(rec.tenant_id, rec.actor, rec.operation_id, step.name, "apply")?);
-        let comp_scope = Arc::new(step_scope(rec.tenant_id, rec.actor, rec.operation_id, step.name, "compensate")?);
-        let apply_digest = step_digest(rec.operation_id, step.name, "apply");
-        let comp_digest = step_digest(rec.operation_id, step.name, "compensate");
+        let (tenant, op) = (rec.tenant_id.into_uuid(), rec.operation_id.into_uuid());
+        let comp = Arc::new(compensation_step(step.name));
         let ctx = Arc::new(Self::ctx(rec, step.name));
         let def = def.clone();
         let out = pool
             .transaction(move |tx| {
-                let (def, ctx, a, c) = (def.clone(), ctx.clone(), apply_scope.clone(), comp_scope.clone());
+                let (def, ctx, comp) = (def.clone(), ctx.clone(), comp.clone());
                 Box::pin(async move {
-                    let applied = match IdempotencyRecords::begin(tx, &a, &apply_digest, STEP_RECORD_RETENTION_HOURS, InProgress::NotYetCommitted).await? {
-                        Begin::Started => {
-                            IdempotencyRecords::complete(tx, &a, &encode_record(&StepRecordBody { committed: false, done: None })?).await?;
+                    let applied = match claim_receipt(tx, tenant, op, ctx.step).await? {
+                        Receipt::Claimed => {
+                            let body = StepRecordBody {
+                                committed: false,
+                                done: None,
+                            };
+                            write_receipt(tx, tenant, op, ctx.step, &body).await?;
                             return Ok(None);
                         }
-                        Begin::Replay(r) => match decode_record(&r)?.done {
+                        Receipt::Existing(b) => match b.done {
                             None => return Ok(None),
                             Some(d) => d,
                         },
                     };
-                    match IdempotencyRecords::begin(tx, &c, &comp_digest, STEP_RECORD_RETENTION_HOURS, InProgress::NotYetCommitted).await? {
-                        Begin::Replay(r) => Ok(decode_record(&r)?.done),
-                        Begin::Started => {
+                    match claim_receipt(tx, tenant, op, &comp).await? {
+                        Receipt::Existing(b) => Ok(b.done),
+                        Receipt::Claimed => {
                             let done = def.compensate(&ctx, &applied, tx).await?;
                             if done.outbox.is_empty() {
-                                return Err(DbError::Invalid(format!("compensation of {} wrote no outbox event", ctx.step)));
+                                return Err(DbError::Invalid(format!(
+                                    "compensation of {} wrote no outbox event",
+                                    ctx.step
+                                )));
                             }
-                            IdempotencyRecords::complete(tx, &c, &encode_record(&StepRecordBody { committed: true, done: Some(done.clone()) })?).await?;
+                            let body = StepRecordBody {
+                                committed: true,
+                                done: Some(done.clone()),
+                            };
+                            write_receipt(tx, tenant, op, &comp, &body).await?;
                             Ok(Some(done))
                         }
                     }
                 })
             })
             .await?;
-        self.crash_at(CrashPoint::AfterStepTx { step: step.name.to_owned(), kind: "compensate" })?;
+        self.crash_at(CrashPoint::AfterStepTx {
+            step: step.name.to_owned(),
+            kind: "compensate",
+        })?;
         Ok(out)
+    }
+
+    /// The stored receipt of a step (apply), if any. For inspection and tests.
+    pub async fn step_receipt(
+        &self,
+        tenant: TenantId,
+        op: OperationId,
+        step: &StepDef,
+    ) -> Result<Option<Option<StepDone>>, OpsError> {
+        let pool = self.pool(&step.domain)?;
+        let name = step.name;
+        let r: Option<Vec<u8>> = pool
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    Ok(sqlx::query_scalar(
+                        "SELECT result FROM saga_step_receipts WHERE tenant_id = $1 AND operation_id = $2 AND step = $3",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(op.as_uuid())
+                    .bind(name)
+                    .fetch_optional(tx.conn())
+                    .await?)
+                })
+            })
+            .await?;
+        r.map(|b| {
+            cs_crypto::cbor::from_canonical::<StepRecordBody>(&b, MAX_DOC_BYTES)
+                .map(|body| body.done)
+                .map_err(|e| OpsError::Encoding(e.to_string()))
+        })
+        .transpose()
+    }
+
+    /// Redeliver one step (apply) as a duplicate delivery would: if its receipt exists the
+    /// stored result is returned and the step body does not run. For tests and operators.
+    pub async fn redeliver_step(
+        &self,
+        tenant: TenantId,
+        op: OperationId,
+        step_index: usize,
+    ) -> Result<Option<StepDone>, OpsError> {
+        let rec = self.load(tenant, op).await?;
+        let def = self.def(&rec.saga_type)?;
+        let steps = def.steps();
+        let step = steps
+            .get(step_index)
+            .ok_or_else(|| OpsError::Definition("no such step".into()))?;
+        self.run_apply(&def, &rec, step).await
+    }
+
+    /// Compare-and-set a state transition requested from outside the executor (operator
+    /// tooling, tests). Enforces the transition table and the expected version.
+    pub async fn try_transition(
+        &self,
+        tenant: TenantId,
+        op: OperationId,
+        expected_version: i64,
+        to: SagaState,
+    ) -> Result<(), OpsError> {
+        let rec = self.load(tenant, op).await?;
+        if rec.version != expected_version {
+            return Err(OpsError::VersionMismatch {
+                expected: expected_version,
+                current: rec.version,
+            });
+        }
+        if self.cas(&rec, to, &rec.doc, None).await? {
+            Ok(())
+        } else {
+            let cur = self.load(tenant, op).await?.version;
+            Err(OpsError::VersionMismatch {
+                expected: expected_version,
+                current: cur,
+            })
+        }
     }
 
     /// Decide pre-pivot failure: prove the pivot did not commit (fence), then compensate.
@@ -797,8 +971,7 @@ impl SagaExecutor {
             Fence::Committed(done) => {
                 doc.steps[pivot_idx].status = StepStatus::Done;
                 doc.steps[pivot_idx].done = Some(done);
-                let to = if rec.state == SagaState::Created { SagaState::RunningPrePivot } else { SagaState::PivotCommitted };
-                self.cas(rec, to, &doc, None).await
+                self.cas(rec, SagaState::PivotCommitted, &doc, None).await
             }
             Fence::NotCommitted => {
                 doc.steps[pivot_idx].status = StepStatus::Skipped;
@@ -810,16 +983,18 @@ impl SagaExecutor {
 
     /// Advance the saga as far as possible. Returns the state reached (terminal unless a
     /// transient error stopped progress, which is returned as an error and retried later).
-    pub async fn drive(&self, op: OperationId) -> Result<SagaState, OpsError> {
+    pub async fn drive(&self, tenant: TenantId, op: OperationId) -> Result<SagaState, OpsError> {
         loop {
-            let rec = self.load(op).await?;
+            let rec = self.load(tenant, op).await?;
             if rec.state.is_terminal() {
                 return Ok(rec.state);
             }
             let def = self.def(&rec.saga_type)?;
             let steps = def.steps();
             if steps.len() != rec.doc.steps.len() {
-                return Err(OpsError::Definition("step list changed for an existing operation".into()));
+                return Err(OpsError::Definition(
+                    "step list changed for an existing operation".into(),
+                ));
             }
             let pivot_idx = steps
                 .iter()
@@ -828,33 +1003,59 @@ impl SagaExecutor {
             let mut doc = rec.doc.clone();
             match rec.state {
                 SagaState::Created => {
-                    self.cas(&rec, SagaState::RunningPrePivot, &doc, None).await?;
+                    self.cas(&rec, SagaState::RunningPrePivot, &doc, None)
+                        .await?;
                 }
                 SagaState::RunningPrePivot => {
                     if rec.deadline_passed {
                         // A deadline is not a failure; it only triggers the proof-based abort.
-                        self.abort_pre_pivot(&rec, &steps, pivot_idx, "deadline passed before pivot".into()).await?;
+                        self.abort_pre_pivot(
+                            &rec,
+                            &steps,
+                            pivot_idx,
+                            "deadline passed before pivot".into(),
+                        )
+                        .await?;
                         continue;
                     }
-                    let Some(i) = (0..=pivot_idx).find(|i| doc.steps[*i].status == StepStatus::Pending) else {
-                        self.cas(&rec, SagaState::PivotCommitted, &doc, None).await?;
+                    let Some(i) =
+                        (0..=pivot_idx).find(|i| doc.steps[*i].status == StepStatus::Pending)
+                    else {
+                        self.cas(&rec, SagaState::PivotCommitted, &doc, None)
+                            .await?;
                         continue;
                     };
                     match self.run_apply(&def, &rec, &steps[i]).await {
                         Ok(Some(done)) => {
                             doc.steps[i].status = StepStatus::Done;
                             doc.steps[i].done = Some(done);
-                            let to = if i == pivot_idx { SagaState::PivotCommitted } else { SagaState::RunningPrePivot };
+                            let to = if i == pivot_idx {
+                                SagaState::PivotCommitted
+                            } else {
+                                SagaState::RunningPrePivot
+                            };
                             self.cas(&rec, to, &doc, None).await?;
                         }
                         // Fenced by a concurrent abort. The abort fenced the pivot first, so
                         // this re-proves the outcome and follows it (the CAS loses if the
                         // other executor already advanced the record).
                         Ok(None) => {
-                            self.abort_pre_pivot(&rec, &steps, pivot_idx, format!("step {} fenced", steps[i].name)).await?;
+                            self.abort_pre_pivot(
+                                &rec,
+                                &steps,
+                                pivot_idx,
+                                format!("step {} fenced", steps[i].name),
+                            )
+                            .await?;
                         }
                         Err(OpsError::Db(DbError::App(e))) => {
-                            self.abort_pre_pivot(&rec, &steps, pivot_idx, format!("step {} failed: {}", steps[i].name, e.code())).await?;
+                            self.abort_pre_pivot(
+                                &rec,
+                                &steps,
+                                pivot_idx,
+                                format!("step {} failed: {}", steps[i].name, e.code()),
+                            )
+                            .await?;
                         }
                         Err(e) => {
                             self.note_attempt(&rec, i).await?;
@@ -866,7 +1067,9 @@ impl SagaExecutor {
                     self.cas(&rec, SagaState::Completing, &doc, None).await?;
                 }
                 SagaState::Completing => {
-                    let Some(i) = (pivot_idx + 1..steps.len()).find(|i| doc.steps[*i].status == StepStatus::Pending) else {
+                    let Some(i) = (pivot_idx + 1..steps.len())
+                        .find(|i| doc.steps[*i].status == StepStatus::Pending)
+                    else {
                         let result = doc.steps[pivot_idx].done.as_ref().map(|d| d.result.clone());
                         self.cas(&rec, SagaState::Completed, &doc, result).await?;
                         continue;
@@ -879,18 +1082,29 @@ impl SagaExecutor {
                         }
                         Ok(None) => {
                             // Post-pivot steps are never fenced; this indicates corruption.
-                            doc.failure = Some(format!("post-pivot step {} found fenced", steps[i].name));
-                            self.cas(&rec, SagaState::BlockedForOperator, &doc, None).await?;
+                            doc.failure =
+                                Some(format!("post-pivot step {} found fenced", steps[i].name));
+                            self.cas(&rec, SagaState::BlockedForOperator, &doc, None)
+                                .await?;
                         }
                         Err(OpsError::Db(DbError::App(e))) => {
-                            doc.failure = Some(format!("post-pivot step {} failed permanently: {}", steps[i].name, e.code()));
-                            self.cas(&rec, SagaState::BlockedForOperator, &doc, None).await?;
+                            doc.failure = Some(format!(
+                                "post-pivot step {} failed permanently: {}",
+                                steps[i].name,
+                                e.code()
+                            ));
+                            self.cas(&rec, SagaState::BlockedForOperator, &doc, None)
+                                .await?;
                         }
                         Err(e) => {
                             if doc.steps[i].attempts + 1 >= self.max_forward_attempts {
                                 doc.steps[i].attempts += 1;
-                                doc.failure = Some(format!("post-pivot step {} exhausted forward retries: {e}", steps[i].name));
-                                self.cas(&rec, SagaState::BlockedForOperator, &doc, None).await?;
+                                doc.failure = Some(format!(
+                                    "post-pivot step {} exhausted forward retries: {e}",
+                                    steps[i].name
+                                ));
+                                self.cas(&rec, SagaState::BlockedForOperator, &doc, None)
+                                    .await?;
                                 continue;
                             }
                             self.note_attempt(&rec, i).await?;
@@ -900,9 +1114,13 @@ impl SagaExecutor {
                 }
                 SagaState::Compensating => {
                     // Reverse dependency order over pre-pivot steps not yet resolved.
-                    let Some(i) = (0..pivot_idx).rev().find(|i| matches!(doc.steps[*i].status, StepStatus::Pending | StepStatus::Done)) else {
-                        let result = cs_crypto::cbor::to_canonical(&doc.failure).map_err(|e| OpsError::Encoding(e.to_string()))?;
-                        self.cas(&rec, SagaState::Compensated, &doc, Some(result)).await?;
+                    let Some(i) = (0..pivot_idx).rev().find(|i| {
+                        matches!(doc.steps[*i].status, StepStatus::Pending | StepStatus::Done)
+                    }) else {
+                        let result = cs_crypto::cbor::to_canonical(&doc.failure)
+                            .map_err(|e| OpsError::Encoding(e.to_string()))?;
+                        self.cas(&rec, SagaState::Compensated, &doc, Some(result))
+                            .await?;
                         continue;
                     };
                     match self.run_compensation(&def, &rec, &steps[i]).await {
@@ -912,8 +1130,13 @@ impl SagaExecutor {
                         }
                         Ok(None) => doc.steps[i].status = StepStatus::Skipped,
                         Err(OpsError::Db(DbError::App(e))) => {
-                            doc.failure = Some(format!("compensation of {} failed permanently: {}", steps[i].name, e.code()));
-                            self.cas(&rec, SagaState::BlockedForOperator, &doc, None).await?;
+                            doc.failure = Some(format!(
+                                "compensation of {} failed permanently: {}",
+                                steps[i].name,
+                                e.code()
+                            ));
+                            self.cas(&rec, SagaState::BlockedForOperator, &doc, None)
+                                .await?;
                             continue;
                         }
                         Err(e) => {
@@ -933,15 +1156,20 @@ impl SagaExecutor {
     async fn note_attempt(&self, rec: &SagaRecord, i: usize) -> Result<(), OpsError> {
         let mut doc = rec.doc.clone();
         doc.steps[i].attempts = doc.steps[i].attempts.saturating_add(1);
-        metrics::counter!("cs_saga_step_failures_total", "saga_type" => rec.saga_type.clone()).increment(1);
+        metrics::counter!("cs_saga_step_failures_total", "saga_type" => rec.saga_type.clone())
+            .increment(1);
         // Losing this CAS to another executor is fine: the count is advisory.
         let _ = self.cas(rec, rec.state, &doc, None).await?;
         Ok(())
     }
 
     /// Evaluate the definition's reconciliation predicate for one operation.
-    pub async fn verify(&self, op: OperationId) -> Result<ReconcileVerdict, OpsError> {
-        let rec = self.load(op).await?;
+    pub async fn verify(
+        &self,
+        tenant: TenantId,
+        op: OperationId,
+    ) -> Result<ReconcileVerdict, OpsError> {
+        let rec = self.load(tenant, op).await?;
         let def = self.def(&rec.saga_type)?;
         let ctx = ReconcileContext {
             operation_id: rec.operation_id,
@@ -983,12 +1211,12 @@ impl Reconciler {
     /// One pass over up to `batch` active sagas (oldest update first).
     pub async fn run_once(&self) -> Result<ReconcileReport, OpsError> {
         let batch = self.batch;
-        let ids: Vec<(Uuid, f64)> = self
+        let ids: Vec<(Uuid, Uuid, f64)> = self
             .exec
             .ops
             .transaction(move |tx| Box::pin(async move {
                 Ok(sqlx::query_as(
-                    "SELECT operation_id, EXTRACT(EPOCH FROM now() - created_at)::float8 FROM sagas \
+                    "SELECT tenant_id, operation_id, EXTRACT(EPOCH FROM now() - created_at)::float8 FROM sagas \
                      WHERE state IN ('created', 'running_pre_pivot', 'pivot_committed', 'completing', 'compensating') \
                      ORDER BY updated_at ASC LIMIT $1",
                 )
@@ -999,14 +1227,16 @@ impl Reconciler {
             .await?;
         let mut report = ReconcileReport::default();
         let mut oldest = 0f64;
-        for (id, age) in ids {
+        for (tenant, id, age) in ids {
             oldest = oldest.max(age);
             report.examined += 1;
             let op = OperationId::from_uuid(id).map_err(|e| OpsError::Encoding(e.to_string()))?;
-            match self.exec.drive(op).await {
+            let tenant =
+                TenantId::from_uuid(tenant).map_err(|e| OpsError::Encoding(e.to_string()))?;
+            match self.exec.drive(tenant, op).await {
                 Ok(state) if state.is_terminal() => {
                     report.terminal += 1;
-                    if let ReconcileVerdict::Divergent(why) = self.exec.verify(op).await? {
+                    if let ReconcileVerdict::Divergent(why) = self.exec.verify(tenant, op).await? {
                         tracing::error!(operation_id = %op, %why, "saga divergence");
                         report.divergent.push((op, why));
                     }
@@ -1045,35 +1275,48 @@ mod tests {
     #[test]
     fn state_machine() {
         use SagaState::*;
+        // The full rev 2 table: every allowed (from, to) pair, everything else rejected.
+        let allowed: &[(SagaState, &[SagaState])] = &[
+            (Created, &[RunningPrePivot, Compensated, BlockedForOperator]),
+            (
+                RunningPrePivot,
+                &[
+                    RunningPrePivot,
+                    PivotCommitted,
+                    Compensating,
+                    BlockedForOperator,
+                ],
+            ),
+            (PivotCommitted, &[Completing, Completed, BlockedForOperator]),
+            (Completing, &[Completing, Completed, BlockedForOperator]),
+            (
+                Compensating,
+                &[Compensating, Compensated, BlockedForOperator],
+            ),
+            (BlockedForOperator, &[]),
+            (Completed, &[]),
+            (Compensated, &[]),
+        ];
+        for (from, tos) in allowed {
+            for to in SagaState::ALL {
+                assert_eq!(from.can_transition(to), tos.contains(&to), "{from} -> {to}");
+            }
+        }
         // compensating only from pre-pivot states
         for s in SagaState::ALL {
-            assert_eq!(s.can_transition(Compensating), matches!(s, Created | RunningPrePivot | Compensating), "{s}");
+            if s.can_transition(Compensating) {
+                assert!(matches!(s, RunningPrePivot | Compensating), "{s}");
+            }
         }
-        // after the pivot: forward or blocked only
-        for to in SagaState::ALL {
-            assert_eq!(PivotCommitted.can_transition(to), matches!(to, Completing | BlockedForOperator), "{to}");
-            assert_eq!(Completing.can_transition(to), matches!(to, Completing | Completed | BlockedForOperator), "{to}");
-        }
-        for t in [Completed, Compensated, BlockedForOperator] {
-            assert!(t.is_terminal());
-            assert!(SagaState::ALL.iter().all(|to| !t.can_transition(*to)));
-        }
-        assert!(!Compensating.can_transition(PivotCommitted));
-        assert!(!RunningPrePivot.can_transition(Completed));
         for s in SagaState::ALL {
             assert_eq!(SagaState::parse(s.as_str()), Some(s));
         }
+        assert_eq!(SagaState::parse("superseded"), None);
     }
 
     #[test]
-    fn step_keys_are_valid_and_distinct() {
-        let op = OperationId::generate().unwrap();
-        let t = TenantId::generate().unwrap();
-        let a = PrincipalId::generate().unwrap();
-        let s1 = step_scope(t, a, op, "reserve", "apply").unwrap();
-        let s2 = step_scope(t, a, op, "reserve", "compensate").unwrap();
-        assert_ne!(s1.key, s2.key);
-        assert_ne!(step_digest(op, "reserve", "apply"), step_digest(op, "reserve", "compensate"));
-        assert!(step_scope(t, a, op, &"x".repeat(300), "apply").is_err());
+    fn compensation_receipts_are_distinct() {
+        assert_eq!(compensation_step("reserve"), "reserve:compensate");
+        assert_ne!(compensation_step("a"), "a");
     }
 }

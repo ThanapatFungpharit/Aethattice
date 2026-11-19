@@ -45,7 +45,7 @@ async fn emit(tx: &mut DomainTx, ctx: &StepContext, event_type: &str) -> Result<
     let pos = Outbox::append(
         tx,
         NewEvent {
-            tenant_id: ctx.tenant_id,
+            tenant_id: Some(ctx.tenant_id),
             event_type,
             event_version: 1,
             partition_key: ctx.operation_id.into_uuid(),
@@ -53,7 +53,10 @@ async fn emit(tx: &mut DomainTx, ctx: &StepContext, event_type: &str) -> Result<
         },
     )
     .await?;
-    Ok(StepDone { result: event_type.as_bytes().to_vec(), outbox: vec![(&pos).into()] })
+    Ok(StepDone {
+        result: event_type.as_bytes().to_vec(),
+        outbox: vec![(&pos).into()],
+    })
 }
 
 impl SagaDefinition for TransferSaga {
@@ -65,15 +68,28 @@ impl SagaDefinition for TransferSaga {
     }
     fn steps(&self) -> Vec<StepDef> {
         vec![
-            StepDef { name: "reserve", domain: A },
-            StepDef { name: "commit", domain: B },
-            StepDef { name: "finalize", domain: A },
+            StepDef {
+                name: "reserve",
+                domain: A,
+            },
+            StepDef {
+                name: "commit",
+                domain: B,
+            },
+            StepDef {
+                name: "finalize",
+                domain: A,
+            },
         ]
     }
     fn pivot(&self) -> &'static str {
         "commit"
     }
-    fn apply<'c>(&'c self, ctx: &'c StepContext, tx: &'c mut DomainTx) -> BoxFuture<'c, Result<StepDone, DbError>> {
+    fn apply<'c>(
+        &'c self,
+        ctx: &'c StepContext,
+        tx: &'c mut DomainTx,
+    ) -> BoxFuture<'c, Result<StepDone, DbError>> {
         Box::pin(async move {
             let op = ctx.operation_id.into_uuid();
             match ctx.step {
@@ -87,7 +103,10 @@ impl SagaDefinition for TransferSaga {
                         return Err(DbError::app(ErrorCode::QuotaExceeded));
                     }
                     sqlx::query("INSERT INTO ledger (operation_id, tenant_id) VALUES ($1, $2)")
-                        .bind(op).bind(ctx.tenant_id.as_uuid()).execute(tx.conn()).await?;
+                        .bind(op)
+                        .bind(ctx.tenant_id.as_uuid())
+                        .execute(tx.conn())
+                        .await?;
                     emit(tx, ctx, "test.committed").await
                 }
                 "finalize" => {
@@ -107,7 +126,12 @@ impl SagaDefinition for TransferSaga {
             }
         })
     }
-    fn compensate<'c>(&'c self, ctx: &'c StepContext, _applied: &'c StepDone, tx: &'c mut DomainTx) -> BoxFuture<'c, Result<StepDone, DbError>> {
+    fn compensate<'c>(
+        &'c self,
+        ctx: &'c StepContext,
+        _applied: &'c StepDone,
+        tx: &'c mut DomainTx,
+    ) -> BoxFuture<'c, Result<StepDone, DbError>> {
         Box::pin(async move {
             assert_eq!(ctx.step, "reserve", "only pre-pivot steps are compensated");
             let n = sqlx::query("UPDATE reservations SET state = 'released' WHERE operation_id = $1 AND state = 'held'")
@@ -116,28 +140,50 @@ impl SagaDefinition for TransferSaga {
             emit(tx, ctx, "test.released").await
         })
     }
-    fn reconcile<'a>(&'a self, ctx: &'a ReconcileContext<'a>) -> BoxFuture<'a, Result<ReconcileVerdict, DbError>> {
+    fn reconcile<'a>(
+        &'a self,
+        ctx: &'a ReconcileContext<'a>,
+    ) -> BoxFuture<'a, Result<ReconcileVerdict, DbError>> {
         Box::pin(async move {
             let op = ctx.operation_id.into_uuid();
             let res: Option<String> = ctx.pools[&A]
-                .transaction(move |tx| Box::pin(async move {
-                    Ok(sqlx::query_scalar("SELECT state FROM reservations WHERE operation_id = $1").bind(op).fetch_optional(tx.conn()).await?)
-                }))
+                .transaction(move |tx| {
+                    Box::pin(async move {
+                        Ok(sqlx::query_scalar(
+                            "SELECT state FROM reservations WHERE operation_id = $1",
+                        )
+                        .bind(op)
+                        .fetch_optional(tx.conn())
+                        .await?)
+                    })
+                })
                 .await?;
             let ledger: i64 = ctx.pools[&B]
-                .transaction(move |tx| Box::pin(async move {
-                    Ok(sqlx::query_scalar("SELECT count(*) FROM ledger WHERE operation_id = $1").bind(op).fetch_one(tx.conn()).await?)
-                }))
+                .transaction(move |tx| {
+                    Box::pin(async move {
+                        Ok(sqlx::query_scalar(
+                            "SELECT count(*) FROM ledger WHERE operation_id = $1",
+                        )
+                        .bind(op)
+                        .fetch_one(tx.conn())
+                        .await?)
+                    })
+                })
                 .await?;
             let ok = match ctx.state {
                 SagaState::Completed => res.as_deref() == Some("final") && ledger == 1,
-                SagaState::Compensated => matches!(res.as_deref(), None | Some("released")) && ledger == 0,
+                SagaState::Compensated => {
+                    matches!(res.as_deref(), None | Some("released")) && ledger == 0
+                }
                 _ => true,
             };
             Ok(if ok {
                 ReconcileVerdict::Consistent
             } else {
-                ReconcileVerdict::Divergent(format!("state {} reservation {res:?} ledger {ledger}", ctx.state))
+                ReconcileVerdict::Divergent(format!(
+                    "state {} reservation {res:?} ledger {ledger}",
+                    ctx.state
+                ))
             })
         })
     }
@@ -151,7 +197,12 @@ impl Env {
     async fn new() -> Option<Self> {
         let t = TestDomains::create(&[OPS, A, B]).await?;
         let common = common_migrations().unwrap();
-        Migrator::run(t.pool(&OPS), &common.clone().merge(cs_ops::migrations().unwrap()).unwrap()).await.unwrap();
+        Migrator::run(
+            t.pool(&OPS),
+            &common.clone().merge(cs_ops::migrations().unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
         let a = MigrationSet::from_files(&[(
             "1000_reservations.expand.sql",
             "CREATE TABLE IF NOT EXISTS reservations (operation_id uuid PRIMARY KEY, tenant_id uuid NOT NULL, \
@@ -163,8 +214,12 @@ impl Env {
             "CREATE TABLE IF NOT EXISTS ledger (operation_id uuid PRIMARY KEY, tenant_id uuid NOT NULL);",
         )])
         .unwrap();
-        Migrator::run(t.pool(&A), &common.clone().merge(a).unwrap()).await.unwrap();
-        Migrator::run(t.pool(&B), &common.merge(b).unwrap()).await.unwrap();
+        Migrator::run(t.pool(&A), &common.clone().merge(a).unwrap())
+            .await
+            .unwrap();
+        Migrator::run(t.pool(&B), &common.merge(b).unwrap())
+            .await
+            .unwrap();
         Some(Self { t })
     }
 
@@ -172,7 +227,8 @@ impl Env {
         let mut pools = BTreeMap::new();
         pools.insert(A, self.t.pool(&A).clone());
         pools.insert(B, self.t.pool(&B).clone());
-        let mut e = SagaExecutor::new(self.t.pool(&OPS).clone(), pools).with_max_forward_attempts(3);
+        let mut e =
+            SagaExecutor::new(self.t.pool(&OPS).clone(), pools).with_max_forward_attempts(3);
         e.register(def).unwrap();
         match crash {
             Some(h) => e.with_crash_hook(h),
@@ -187,7 +243,11 @@ impl Env {
             .transaction(move |tx| {
                 let sql = sql.clone();
                 Box::pin(async move {
-                    Ok(sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str().to_owned())).fetch_one(tx.conn()).await?)
+                    Ok(
+                        sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str().to_owned()))
+                            .fetch_one(tx.conn())
+                            .await?,
+                    )
                 })
             })
             .await
@@ -196,20 +256,30 @@ impl Env {
 
     async fn assert_outbox_contiguous(&self, d: &DomainId) {
         let pool: &DomainPool = self.t.pool(d);
-        for p in 0..Outbox::partition_count(pool).await.unwrap() as i32 {
-            Outbox::read(pool, p, 0, 10_000).await.unwrap();
+        for p in 0..cs_db::outbox::OUTBOX_PARTITIONS as i32 {
+            Outbox::read(pool, t().into_uuid(), p, 0, 10_000)
+                .await
+                .unwrap();
         }
     }
 }
 
 fn saga() -> Arc<TransferSaga> {
-    Arc::new(TransferSaga { transient_post_failures: AtomicU32::new(0) })
+    Arc::new(TransferSaga {
+        transient_post_failures: AtomicU32::new(0),
+    })
+}
+
+/// One tenant per test process (every test has its own databases).
+fn t() -> TenantId {
+    static T: std::sync::OnceLock<TenantId> = std::sync::OnceLock::new();
+    *T.get_or_init(|| TenantId::generate().unwrap())
 }
 
 fn start_req(input: &Input, key: &str) -> StartSaga {
     StartSaga {
         saga_type: "test.transfer".into(),
-        tenant_id: TenantId::generate().unwrap(),
+        tenant_id: t(),
         actor: PrincipalId::generate().unwrap(),
         idempotency_key: IdempotencyKey::parse(key).unwrap(),
         request_digest: *blake3::hash(&cs_crypto::cbor::to_canonical(input).unwrap()).as_bytes(),
@@ -236,19 +306,37 @@ fn crash_at(k: u32) -> CrashHook {
 async fn happy_path_completes_with_effects_once() {
     let Some(env) = Env::new().await else { return };
     let exec = Arc::new(env.executor(saga(), None));
-    let op = exec.start(start_req(&Input::default(), "happy")).await.unwrap();
-    assert_eq!(exec.load(op).await.unwrap().state, SagaState::Created);
-    assert_eq!(exec.drive(op).await.unwrap(), SagaState::Completed);
-    let rec = exec.load(op).await.unwrap();
+    let op = exec
+        .start(start_req(&Input::default(), "happy"))
+        .await
+        .unwrap();
+    assert_eq!(exec.load(t(), op).await.unwrap().state, SagaState::Created);
+    assert_eq!(exec.drive(t(), op).await.unwrap(), SagaState::Completed);
+    let rec = exec.load(t(), op).await.unwrap();
     assert_eq!(rec.result.as_deref(), Some(&b"test.committed"[..]));
-    assert!(rec.doc.steps.iter().all(|s| s.done.as_ref().is_some_and(|d| !d.outbox.is_empty())));
-    assert_eq!(exec.verify(op).await.unwrap(), ReconcileVerdict::Consistent);
-    assert_eq!(env.count(&A, "SELECT count(*) FROM reservations WHERE state = 'final'").await, 1);
+    assert!(
+        rec.doc
+            .steps
+            .iter()
+            .all(|s| s.done.as_ref().is_some_and(|d| !d.outbox.is_empty()))
+    );
+    assert_eq!(
+        exec.verify(t(), op).await.unwrap(),
+        ReconcileVerdict::Consistent
+    );
+    assert_eq!(
+        env.count(
+            &A,
+            "SELECT count(*) FROM reservations WHERE state = 'final'"
+        )
+        .await,
+        1
+    );
     assert_eq!(env.count(&B, "SELECT count(*) FROM ledger").await, 1);
     assert_eq!(env.count(&A, "SELECT count(*) FROM outbox").await, 2);
     assert_eq!(env.count(&B, "SELECT count(*) FROM outbox").await, 1);
     // driving a terminal saga again changes nothing
-    assert_eq!(exec.drive(op).await.unwrap(), SagaState::Completed);
+    assert_eq!(exec.drive(t(), op).await.unwrap(), SagaState::Completed);
     assert_eq!(env.count(&A, "SELECT count(*) FROM outbox").await, 2);
     env.t.cleanup().await;
 }
@@ -265,7 +353,10 @@ async fn duplicate_start_returns_same_operation_and_mismatch_is_rejected() {
     other.request_digest = [9; 32];
     let err = exec.start(other).await.unwrap_err();
     let api: cs_common::Error = err.into();
-    assert_eq!(api.code(), &cs_common::Code::Core(ErrorCode::IdempotencyMismatch));
+    assert_eq!(
+        api.code(),
+        &cs_common::Code::Core(ErrorCode::IdempotencyMismatch)
+    );
     assert_eq!(env.count(&OPS, "SELECT count(*) FROM sagas").await, 1);
     env.t.cleanup().await;
 }
@@ -276,7 +367,7 @@ async fn crash_sweep(input: Input, expected: SagaState) {
     let counter = Arc::new(AtomicU32::new(0));
     let exec = env.executor(saga(), Some(counting_hook(counter.clone())));
     let op = exec.start(start_req(&input, "probe")).await.unwrap();
-    assert_eq!(exec.drive(op).await.unwrap(), expected);
+    assert_eq!(exec.drive(t(), op).await.unwrap(), expected);
     let points = counter.load(Ordering::SeqCst);
     assert!(points >= 6, "too few crash points: {points}");
     drop(exec);
@@ -284,28 +375,53 @@ async fn crash_sweep(input: Input, expected: SagaState) {
     // 2. crash at each point, drop the executor, recover with the reconciler.
     for k in 0..points {
         let crashing = env.executor(saga(), Some(crash_at(k)));
-        let op = crashing.start(start_req(&input, &format!("crash-{k}"))).await.unwrap();
-        let err = crashing.drive(op).await.unwrap_err();
+        let op = crashing
+            .start(start_req(&input, &format!("crash-{k}")))
+            .await
+            .unwrap();
+        let err = crashing.drive(t(), op).await.unwrap_err();
         assert!(matches!(err, OpsError::Crashed(_)), "point {k}: {err:?}");
         drop(crashing); // the "process" dies
 
         let fresh = Arc::new(env.executor(saga(), None));
         let report = Reconciler::new(fresh.clone()).run_once().await.unwrap();
         assert!(report.divergent.is_empty(), "point {k}: {report:?}");
-        assert_eq!(fresh.load(op).await.unwrap().state, expected, "point {k}");
-        assert_eq!(fresh.verify(op).await.unwrap(), ReconcileVerdict::Consistent, "point {k}");
+        assert_eq!(
+            fresh.load(t(), op).await.unwrap().state,
+            expected,
+            "point {k}"
+        );
+        assert_eq!(
+            fresh.verify(t(), op).await.unwrap(),
+            ReconcileVerdict::Consistent,
+            "point {k}"
+        );
     }
     let n = i64::from(points) + 1;
     // exactly-once effects across all runs
     match expected {
         SagaState::Completed => {
-            assert_eq!(env.count(&A, "SELECT count(*) FROM reservations WHERE state = 'final'").await, n);
+            assert_eq!(
+                env.count(
+                    &A,
+                    "SELECT count(*) FROM reservations WHERE state = 'final'"
+                )
+                .await,
+                n
+            );
             assert_eq!(env.count(&B, "SELECT count(*) FROM ledger").await, n);
             assert_eq!(env.count(&A, "SELECT count(*) FROM outbox").await, 2 * n);
             assert_eq!(env.count(&B, "SELECT count(*) FROM outbox").await, n);
         }
         SagaState::Compensated => {
-            assert_eq!(env.count(&A, "SELECT count(*) FROM reservations WHERE state <> 'released'").await, 0);
+            assert_eq!(
+                env.count(
+                    &A,
+                    "SELECT count(*) FROM reservations WHERE state <> 'released'"
+                )
+                .await,
+                0
+            );
             assert_eq!(env.count(&B, "SELECT count(*) FROM ledger").await, 0);
             assert_eq!(env.count(&B, "SELECT count(*) FROM outbox").await, 0);
             // one reserve + one release event per saga
@@ -315,7 +431,17 @@ async fn crash_sweep(input: Input, expected: SagaState) {
     }
     env.assert_outbox_contiguous(&A).await;
     env.assert_outbox_contiguous(&B).await;
-    assert_eq!(env.count(&OPS, &format!("SELECT count(*) FROM sagas WHERE state = '{}'", expected.as_str())).await, n);
+    assert_eq!(
+        env.count(
+            &OPS,
+            &format!(
+                "SELECT count(*) FROM sagas WHERE state = '{}'",
+                expected.as_str()
+            )
+        )
+        .await,
+        n
+    );
     env.t.cleanup().await;
 }
 
@@ -326,20 +452,43 @@ async fn crash_after_every_step_recovers_forward() {
 
 #[tokio::test]
 async fn crash_after_every_step_recovers_compensation() {
-    crash_sweep(Input { fail_pivot: true, fail_post: false }, SagaState::Compensated).await;
+    crash_sweep(
+        Input {
+            fail_pivot: true,
+            fail_post: false,
+        },
+        SagaState::Compensated,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn post_pivot_permanent_failure_blocks_without_compensation() {
     let Some(env) = Env::new().await else { return };
     let exec = env.executor(saga(), None);
-    let op = exec.start(start_req(&Input { fail_pivot: false, fail_post: true }, "post")).await.unwrap();
-    assert_eq!(exec.drive(op).await.unwrap(), SagaState::BlockedForOperator);
-    let rec = exec.load(op).await.unwrap();
+    let op = exec
+        .start(start_req(
+            &Input {
+                fail_pivot: false,
+                fail_post: true,
+            },
+            "post",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        exec.drive(t(), op).await.unwrap(),
+        SagaState::BlockedForOperator
+    );
+    let rec = exec.load(t(), op).await.unwrap();
     assert!(rec.doc.failure.unwrap().contains("finalize"));
     // the committed pivot result is preserved; nothing was compensated
     assert_eq!(env.count(&B, "SELECT count(*) FROM ledger").await, 1);
-    assert_eq!(env.count(&A, "SELECT count(*) FROM reservations WHERE state = 'held'").await, 1);
+    assert_eq!(
+        env.count(&A, "SELECT count(*) FROM reservations WHERE state = 'held'")
+            .await,
+        1
+    );
     env.t.cleanup().await;
 }
 
@@ -347,22 +496,33 @@ async fn post_pivot_permanent_failure_blocks_without_compensation() {
 async fn post_pivot_transient_failures_retry_forward_then_block() {
     let Some(env) = Env::new().await else { return };
     // two transient failures (< 3 allowed): completes on later reconciler passes
-    let def = Arc::new(TransferSaga { transient_post_failures: AtomicU32::new(2) });
+    let def = Arc::new(TransferSaga {
+        transient_post_failures: AtomicU32::new(2),
+    });
     let exec = Arc::new(env.executor(def.clone(), None));
-    let op = exec.start(start_req(&Input::default(), "transient")).await.unwrap();
-    assert!(exec.drive(op).await.is_err());
+    let op = exec
+        .start(start_req(&Input::default(), "transient"))
+        .await
+        .unwrap();
+    assert!(exec.drive(t(), op).await.is_err());
     let rec = Reconciler::new(exec.clone());
     for _ in 0..3 {
         rec.run_once().await.unwrap();
     }
-    assert_eq!(exec.load(op).await.unwrap().state, SagaState::Completed);
+    assert_eq!(
+        exec.load(t(), op).await.unwrap().state,
+        SagaState::Completed
+    );
     // persistent transient failure: blocked after the bound, never compensated
     def.transient_post_failures.store(100, Ordering::SeqCst);
-    let op2 = exec.start(start_req(&Input::default(), "persistent")).await.unwrap();
+    let op2 = exec
+        .start(start_req(&Input::default(), "persistent"))
+        .await
+        .unwrap();
     for _ in 0..5 {
-        let _ = exec.drive(op2).await;
+        let _ = exec.drive(t(), op2).await;
     }
-    let r2 = exec.load(op2).await.unwrap();
+    let r2 = exec.load(t(), op2).await.unwrap();
     assert_eq!(r2.state, SagaState::BlockedForOperator);
     assert!(r2.doc.failure.unwrap().contains("exhausted"));
     assert_eq!(env.count(&B, "SELECT count(*) FROM ledger").await, 2);
@@ -376,14 +536,18 @@ async fn concurrent_executors_apply_effects_once() {
     let e2 = Arc::new(env.executor(saga(), None));
     let mut ops = Vec::new();
     for i in 0..5 {
-        ops.push(e1.start(start_req(&Input::default(), &format!("cc-{i}"))).await.unwrap());
+        ops.push(
+            e1.start(start_req(&Input::default(), &format!("cc-{i}")))
+                .await
+                .unwrap(),
+        );
     }
     let mut tasks = Vec::new();
     for op in ops.clone() {
         for e in [e1.clone(), e2.clone()] {
             tasks.push(tokio::spawn(async move {
                 // a transient error from a lost race is fine; the reconciler finishes
-                let _ = e.drive(op).await;
+                let _ = e.drive(t(), op).await;
             }));
         }
     }
@@ -392,7 +556,7 @@ async fn concurrent_executors_apply_effects_once() {
     }
     Reconciler::new(e1.clone()).run_once().await.unwrap();
     for op in ops {
-        assert_eq!(e1.load(op).await.unwrap().state, SagaState::Completed);
+        assert_eq!(e1.load(t(), op).await.unwrap().state, SagaState::Completed);
     }
     assert_eq!(env.count(&B, "SELECT count(*) FROM ledger").await, 5);
     assert_eq!(env.count(&A, "SELECT count(*) FROM outbox").await, 10);
@@ -407,10 +571,10 @@ async fn deadline_before_pivot_compensates_only_with_proof() {
     let mut req = start_req(&Input::default(), "late");
     req.deadline = Duration::ZERO;
     let op = exec.start(req).await.unwrap();
-    assert_eq!(exec.drive(op).await.unwrap(), SagaState::Compensated);
+    assert_eq!(exec.drive(t(), op).await.unwrap(), SagaState::Compensated);
     assert_eq!(env.count(&B, "SELECT count(*) FROM ledger").await, 0);
     // the pivot is fenced: even a late, direct execution of the pivot cannot commit now
-    let rec = exec.load(op).await.unwrap();
+    let rec = exec.load(t(), op).await.unwrap();
     assert!(rec.doc.failure.unwrap().contains("deadline"));
     env.t.cleanup().await;
 }
@@ -422,16 +586,158 @@ async fn illegal_registration_rejected() {
     }
     struct Bad;
     impl SagaDefinition for Bad {
-        fn saga_type(&self) -> &'static str { "bad" }
-        fn protocol_version(&self) -> i32 { 1 }
-        fn steps(&self) -> Vec<StepDef> { vec![StepDef { name: "x", domain: A }] }
-        fn pivot(&self) -> &'static str { "missing" }
-        fn apply<'c>(&'c self, _: &'c StepContext, _: &'c mut DomainTx) -> BoxFuture<'c, Result<StepDone, DbError>> { unreachable!() }
-        fn compensate<'c>(&'c self, _: &'c StepContext, _: &'c StepDone, _: &'c mut DomainTx) -> BoxFuture<'c, Result<StepDone, DbError>> { unreachable!() }
-        fn reconcile<'a>(&'a self, _: &'a ReconcileContext<'a>) -> BoxFuture<'a, Result<ReconcileVerdict, DbError>> { unreachable!() }
+        fn saga_type(&self) -> &'static str {
+            "bad"
+        }
+        fn protocol_version(&self) -> i32 {
+            1
+        }
+        fn steps(&self) -> Vec<StepDef> {
+            vec![StepDef {
+                name: "x",
+                domain: A,
+            }]
+        }
+        fn pivot(&self) -> &'static str {
+            "missing"
+        }
+        fn apply<'c>(
+            &'c self,
+            _: &'c StepContext,
+            _: &'c mut DomainTx,
+        ) -> BoxFuture<'c, Result<StepDone, DbError>> {
+            unreachable!()
+        }
+        fn compensate<'c>(
+            &'c self,
+            _: &'c StepContext,
+            _: &'c StepDone,
+            _: &'c mut DomainTx,
+        ) -> BoxFuture<'c, Result<StepDone, DbError>> {
+            unreachable!()
+        }
+        fn reconcile<'a>(
+            &'a self,
+            _: &'a ReconcileContext<'a>,
+        ) -> BoxFuture<'a, Result<ReconcileVerdict, DbError>> {
+            unreachable!()
+        }
     }
-    let Some(t) = TestDomains::create(&[OPS]).await else { return };
+    let Some(t) = TestDomains::create(&[OPS]).await else {
+        return;
+    };
     let mut e = SagaExecutor::new(t.pool(&OPS).clone(), BTreeMap::new());
     assert!(e.register(Arc::new(Bad)).is_err());
     t.cleanup().await;
+}
+
+#[tokio::test]
+async fn redelivered_step_returns_receipt_without_rerunning() {
+    let Some(env) = Env::new().await else { return };
+    let exec = env.executor(saga(), None);
+    let op = exec
+        .start(start_req(&Input::default(), "redeliver"))
+        .await
+        .unwrap();
+    assert_eq!(exec.drive(t(), op).await.unwrap(), SagaState::Completed);
+    let before_a = env.count(&A, "SELECT count(*) FROM outbox").await;
+    let before_b = env.count(&B, "SELECT count(*) FROM outbox").await;
+    for i in 0..3 {
+        let again = exec
+            .redeliver_step(t(), op, i)
+            .await
+            .unwrap()
+            .expect("committed step");
+        let rec = exec.load(t(), op).await.unwrap();
+        assert_eq!(
+            Some(&again),
+            rec.doc.steps[i].done.as_ref(),
+            "step {i}: stored result"
+        );
+    }
+    // the step bodies did not run again (they assert on double application and emit events)
+    assert_eq!(env.count(&A, "SELECT count(*) FROM outbox").await, before_a);
+    assert_eq!(env.count(&B, "SELECT count(*) FROM outbox").await, before_b);
+    assert_eq!(
+        env.count(&A, "SELECT count(*) FROM saga_step_receipts")
+            .await,
+        2
+    );
+    assert_eq!(
+        env.count(&B, "SELECT count(*) FROM saga_step_receipts")
+            .await,
+        1
+    );
+    env.t.cleanup().await;
+}
+
+#[tokio::test]
+async fn transitions_outside_the_table_are_rejected() {
+    let Some(env) = Env::new().await else { return };
+    let exec = env.executor(saga(), None);
+    let op = exec
+        .start(start_req(&Input::default(), "table"))
+        .await
+        .unwrap();
+    let v = exec.load(t(), op).await.unwrap().version;
+    // created -> compensating / pivot_committed / completed are illegal
+    for to in [
+        SagaState::Compensating,
+        SagaState::PivotCommitted,
+        SagaState::Completed,
+    ] {
+        let err = exec.try_transition(t(), op, v, to).await.unwrap_err();
+        assert!(
+            matches!(err, OpsError::IllegalTransition { .. }),
+            "{to}: {err:?}"
+        );
+        let api: cs_common::Error = err.into();
+        assert_eq!(api.code(), &cs_common::Code::Core(ErrorCode::Conflict));
+    }
+    // stale version is rejected (CAS)
+    assert!(matches!(
+        exec.try_transition(t(), op, v + 7, SagaState::RunningPrePivot)
+            .await,
+        Err(OpsError::VersionMismatch { .. })
+    ));
+    exec.try_transition(t(), op, v, SagaState::RunningPrePivot)
+        .await
+        .unwrap();
+    // the old version can no longer be used
+    assert!(
+        exec.try_transition(t(), op, v, SagaState::RunningPrePivot)
+            .await
+            .is_err()
+    );
+    // drive to completion, then nothing may leave a terminal state
+    assert_eq!(exec.drive(t(), op).await.unwrap(), SagaState::Completed);
+    let v = exec.load(t(), op).await.unwrap().version;
+    for to in SagaState::ALL {
+        assert!(
+            exec.try_transition(t(), op, v, to).await.is_err(),
+            "completed -> {to}"
+        );
+    }
+    // a blocked saga never resumes automatically
+    let op2 = exec
+        .start(start_req(
+            &Input {
+                fail_pivot: false,
+                fail_post: true,
+            },
+            "blocked",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        exec.drive(t(), op2).await.unwrap(),
+        SagaState::BlockedForOperator
+    );
+    let v2 = exec.load(t(), op2).await.unwrap().version;
+    assert!(
+        exec.try_transition(t(), op2, v2, SagaState::Completing)
+            .await
+            .is_err()
+    );
+    env.t.cleanup().await;
 }

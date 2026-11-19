@@ -1,8 +1,8 @@
--- Saga operation records (contract M0 §5.4; spec §18.4, C3). Operations domain.
+-- Saga operation records (contract M0 §5.4 rev 2; spec §18.4, App. C rule C3). Operations domain.
 -- State transitions are enforced by compare-and-set on `version` in cs_ops::saga.
 CREATE TABLE IF NOT EXISTS sagas (
-  operation_id     uuid        PRIMARY KEY,
   tenant_id        uuid        NOT NULL,
+  operation_id     uuid        NOT NULL,
   saga_type        text        NOT NULL,
   protocol_version int         NOT NULL CHECK (protocol_version >= 1),
   actor            uuid        NOT NULL,
@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS sagas (
   version          bigint      NOT NULL CHECK (version >= 1),
   created_at       timestamptz NOT NULL DEFAULT now(),
   updated_at       timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY ((tenant_id, operation_id) HASH),
   UNIQUE (tenant_id, saga_type, idempotency_key)
 );
 
