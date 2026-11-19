@@ -1,7 +1,8 @@
 //! Typed identifiers (contract §1, spec §4.1, App. E).
 //!
 //! Every ID is a UUIDv7 (RFC 9562) except [`ChunkId`] and [`ExtentId`], which are 128-bit
-//! random values in UUIDv4 layout (spec §17.1). All randomness comes from
+//! random values: 16 CSPRNG bytes with no version or variant bits (spec §17.1, contract rev 2).
+//! They use the same hyphenated hex text form and YSQL `uuid` storage but are not RFC 9562 UUIDs. All randomness comes from
 //! `cs_crypto::rand`; generation fails if the CSPRNG fails.
 //!
 //! Text form is lowercase hyphenated and parsing is strict (no braces, no URN prefix, no
@@ -45,13 +46,14 @@ pub fn new_v7() -> Result<Uuid, RandError> {
     Ok(uuid::Builder::from_unix_timestamp_millis(millis, &rnd).into_uuid())
 }
 
-/// Generate a 128-bit random identifier in UUIDv4 layout from the OS CSPRNG.
-pub fn new_v4() -> Result<Uuid, RandError> {
-    Ok(uuid::Builder::from_random_bytes(rand::bytes::<16>()?).into_uuid())
+/// Generate a full 128-bit random identifier (no version/variant bits) from the OS CSPRNG.
+pub fn new_random128() -> Result<Uuid, RandError> {
+    Ok(Uuid::from_bytes(rand::bytes::<16>()?))
 }
 
-/// Strictly parse a lowercase hyphenated UUID of the given version.
-pub fn parse_strict(s: &str, version: usize) -> Result<Uuid, IdError> {
+/// Strictly parse lowercase hyphenated hex. `version`: `Some(v)` requires an RFC 9562 UUID of
+/// version `v`; `None` accepts any 128-bit value.
+pub fn parse_strict(s: &str, version: Option<usize>) -> Result<Uuid, IdError> {
     let b = s.as_bytes();
     if b.len() != 36 {
         return Err(IdError::Syntax);
@@ -69,7 +71,10 @@ pub fn parse_strict(s: &str, version: usize) -> Result<Uuid, IdError> {
     check(u, version)
 }
 
-fn check(u: Uuid, version: usize) -> Result<Uuid, IdError> {
+fn check(u: Uuid, version: Option<usize>) -> Result<Uuid, IdError> {
+    let Some(version) = version else {
+        return Ok(u);
+    };
     if u.get_variant() != Variant::RFC4122 {
         return Err(IdError::WrongVariant);
     }
@@ -89,8 +94,8 @@ macro_rules! typed_id {
         pub struct $name(Uuid);
 
         impl $name {
-            /// UUID version required for this identifier type.
-            pub const VERSION: usize = $version;
+            /// UUID version required for this identifier type (`None`: 128 random bits).
+            pub const VERSION: Option<usize> = $version;
 
             /// Generate a new identifier. Fails if the CSPRNG fails.
             pub fn generate() -> Result<Self, RandError> {
@@ -181,35 +186,35 @@ macro_rules! typed_id {
 }
 
 typed_id!(/// Tenant identifier (UUIDv7).
-    TenantId, 7, new_v7);
+    TenantId, Some(7), new_v7);
 typed_id!(/// Principal identifier (UUIDv7): users, groups, guests, service and application identities.
-    PrincipalId, 7, new_v7);
+    PrincipalId, Some(7), new_v7);
 typed_id!(/// User identifier (UUIDv7).
-    UserId, 7, new_v7);
+    UserId, Some(7), new_v7);
 typed_id!(/// Group identifier (UUIDv7).
-    GroupId, 7, new_v7);
+    GroupId, Some(7), new_v7);
 typed_id!(/// Resource identifier (UUIDv7, spec §4.1).
-    ResourceId, 7, new_v7);
+    ResourceId, Some(7), new_v7);
 typed_id!(/// Space identifier (UUIDv7).
-    SpaceId, 7, new_v7);
+    SpaceId, Some(7), new_v7);
 typed_id!(/// Object version identifier (UUIDv7).
-    VersionId, 7, new_v7);
+    VersionId, Some(7), new_v7);
 typed_id!(/// Session identifier (UUIDv7): login sessions and upload sessions.
-    SessionId, 7, new_v7);
-typed_id!(/// Chunk identifier: 128-bit random, server-assigned (spec §17.1). NOT UUIDv7.
-    ChunkId, 4, new_v4);
+    SessionId, Some(7), new_v7);
+typed_id!(/// Chunk identifier: 128 random bits, server-assigned (spec §17.1). NOT a UUIDv7.
+    ChunkId, None, new_random128);
 typed_id!(/// Seal identifier (UUIDv7).
-    SealId, 7, new_v7);
-typed_id!(/// Extent identifier: 128-bit random per write attempt, never reused (spec §17.1). NOT UUIDv7.
-    ExtentId, 4, new_v4);
+    SealId, Some(7), new_v7);
+typed_id!(/// Extent identifier: 128 random bits per write attempt, never reused (spec §17.1). NOT a UUIDv7.
+    ExtentId, None, new_random128);
 typed_id!(/// Cluster node identifier (UUIDv7).
-    NodeId, 7, new_v7);
+    NodeId, Some(7), new_v7);
 typed_id!(/// Saga / operation identifier (UUIDv7).
-    OperationId, 7, new_v7);
+    OperationId, Some(7), new_v7);
 typed_id!(/// Event identifier (UUIDv7).
-    EventId, 7, new_v7);
+    EventId, Some(7), new_v7);
 typed_id!(/// Request identifier (UUIDv7), carried in `X-Request-Id` and problem bodies.
-    RequestId, 7, new_v7);
+    RequestId, Some(7), new_v7);
 
 #[cfg(test)]
 mod tests {
@@ -230,21 +235,34 @@ mod tests {
     }
 
     #[test]
-    fn chunk_and_extent_ids_are_random_v4() {
-        let c = ChunkId::generate().unwrap();
+    fn chunk_and_extent_ids_use_all_128_bits() {
+        // Over many samples every bit position (including the UUID version/variant bits)
+        // takes both values: there are no fixed layout bits (contract §1 rev 2).
+        let mut ones = [0u32; 128];
+        for _ in 0..512 {
+            let c = ChunkId::generate().unwrap();
+            for (i, b) in c.as_bytes().iter().enumerate() {
+                for bit in 0..8 {
+                    ones[i * 8 + bit] += u32::from((b >> bit) & 1);
+                }
+            }
+        }
+        assert!(ones.iter().all(|n| *n > 0 && *n < 512), "{ones:?}");
         let e = ExtentId::generate().unwrap();
-        assert_eq!(c.as_uuid().get_version_num(), 4);
-        assert_eq!(e.as_uuid().get_version_num(), 4);
-        // A v7 string is not a valid ChunkId and vice versa.
-        let v7 = ResourceId::generate().unwrap().to_string();
-        assert!(matches!(
-            v7.parse::<ChunkId>(),
-            Err(IdError::WrongVersion { .. })
-        ));
-        assert!(matches!(
-            c.to_string().parse::<ResourceId>(),
-            Err(IdError::WrongVersion { .. })
-        ));
+        assert_eq!(e.to_string().parse::<ExtentId>().unwrap(), e);
+        // Any 16 bytes are a valid ChunkId; an arbitrary value is not a UUIDv7 ID.
+        assert!(
+            ResourceId::generate()
+                .unwrap()
+                .to_string()
+                .parse::<ChunkId>()
+                .is_ok()
+        );
+        let zero = ChunkId::from_bytes([0u8; 16]).unwrap().to_string();
+        assert!(zero.parse::<ResourceId>().is_err());
+        // text form is still strict
+        let up = ChunkId::generate().unwrap().to_string().to_uppercase();
+        assert!(up.parse::<ChunkId>().is_err());
     }
 
     #[test]

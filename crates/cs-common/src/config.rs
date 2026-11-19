@@ -116,6 +116,14 @@ pub const POLICY_TABLE: &[PolicySpec] = &[
         source: "contract §5 default 5 s; range (design)",
     },
     PolicySpec {
+        key: "revocation_staleness_ms",
+        default: 2_000,
+        min: 1_000,
+        max: 30_000,
+        unit: "milliseconds",
+        source: "spec §6.6 S default 2 s, max 30 s; min 1 s (design, QA OQ-6: S below the 500 ms heartbeat would make every consumer stale). Enforced from M2",
+    },
+    PolicySpec {
         key: "saga_reconcile_interval_ms",
         default: 1_000,
         min: 100,
@@ -132,6 +140,7 @@ pub enum PolicyKey {
     DbRetryMaxAttempts,
     DbRetryMaxElapsedMs,
     SagaReconcileIntervalMs,
+    RevocationStalenessMs,
 }
 
 impl PolicyKey {
@@ -141,6 +150,7 @@ impl PolicyKey {
             PolicyKey::DbRetryMaxAttempts => "db_retry_max_attempts",
             PolicyKey::DbRetryMaxElapsedMs => "db_retry_max_elapsed_ms",
             PolicyKey::SagaReconcileIntervalMs => "saga_reconcile_interval_ms",
+            PolicyKey::RevocationStalenessMs => "revocation_staleness_ms",
         }
     }
 }

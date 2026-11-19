@@ -191,7 +191,7 @@ fn generate() -> (Json, Json) {
     push(
         "unknown-key",
         "key id not known to the resolver",
-        envelope(1, "test/v1", "other-key/v1", &p, &raw_sig),
+        envelope(1, "test/v1", "other-key@v1", &p, &raw_sig),
         "test/v1",
         "unknown_key",
     );

@@ -116,7 +116,7 @@ impl Urn {
         };
         let tenant: TenantId = t.parse()?;
         let resource_type = ResourceType::parse(ty)?;
-        let id = parse_strict(id, 7)?;
+        let id = parse_strict(id, Some(7))?;
         Ok(Self {
             tenant,
             resource_type,

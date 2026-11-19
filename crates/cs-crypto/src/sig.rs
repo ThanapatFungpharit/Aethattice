@@ -28,6 +28,8 @@ pub const SIG_PREFIX: &[u8] = b"cs-sig/v1";
 pub const ENVELOPE_VERSION: u64 = 1;
 /// Default maximum envelope size in bytes (contract §3).
 pub const DEFAULT_MAX_ENVELOPE_BYTES: usize = 16 * 1024;
+/// Maximum length of a key ID's text form.
+pub const MAX_KEY_ID_LEN: usize = 128;
 
 /// The closed registry of signing contexts. Adding a context is a contract change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -90,9 +92,10 @@ impl FromStr for Context {
     }
 }
 
-/// A versioned key identifier: `<name>/v<version>`, e.g. `token-signing/v3`.
+/// A versioned key identifier: `<key-name>@v<version>`, e.g. `token-signing@v3`; at most
+/// 128 bytes of text (contract §3 rev 2).
 ///
-/// `name` matches `^[a-z][a-z0-9_.-]{0,63}$`; `version` is ≥ 1.
+/// `name` matches `^[a-z][a-z0-9_.-]*$` (design); `version` is ≥ 1 without leading zeros.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct KeyId {
     name: String,
@@ -103,7 +106,7 @@ impl KeyId {
     /// Build a key ID, validating the name and version.
     pub fn new(name: &str, version: u32) -> Result<Self, SigError> {
         let valid_name = !name.is_empty()
-            && name.len() <= 64
+            && name.len() + 2 + version.to_string().len() <= MAX_KEY_ID_LEN
             && name.as_bytes()[0].is_ascii_lowercase()
             && name.bytes().all(|b| {
                 b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
@@ -134,14 +137,17 @@ impl KeyId {
 
 impl fmt::Display for KeyId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/v{}", self.name, self.version)
+        write!(f, "{}@v{}", self.name, self.version)
     }
 }
 
 impl FromStr for KeyId {
     type Err = SigError;
     fn from_str(s: &str) -> Result<Self, SigError> {
-        let (name, v) = s.rsplit_once("/v").ok_or(SigError::InvalidKeyId)?;
+        if s.len() > MAX_KEY_ID_LEN {
+            return Err(SigError::InvalidKeyId);
+        }
+        let (name, v) = s.rsplit_once("@v").ok_or(SigError::InvalidKeyId)?;
         // Strict: no leading zeros, no sign, digits only.
         if v.is_empty() || v.starts_with('0') || !v.bytes().all(|b| b.is_ascii_digit()) {
             return Err(SigError::InvalidKeyId);
@@ -389,7 +395,8 @@ pub fn to_text(envelope: &[u8]) -> String {
 
 /// Parse the text transport form, checking the size limit before decoding.
 pub fn from_text(text: &str, max_envelope_bytes: usize) -> Result<Vec<u8>, SigError> {
-    let max_text = max_envelope_bytes.div_ceil(3) * 4;
+    // Contract §3 rev 2: encoded length <= ceil(limit * 4 / 3), checked before decoding.
+    let max_text = (max_envelope_bytes * 4).div_ceil(3);
     if text.len() > max_text {
         return Err(SigError::TooLarge {
             limit: max_envelope_bytes,
@@ -510,7 +517,12 @@ mod tests {
                 limit: DEFAULT_MAX_ENVELOPE_BYTES
             })
         );
-        let text = "A".repeat(DEFAULT_MAX_ENVELOPE_BYTES / 3 * 4 + 8);
+        // exact bound: ceil(16384 * 4 / 3) = 21846 characters
+        assert!(!matches!(
+            from_text(&"A".repeat(21846), DEFAULT_MAX_ENVELOPE_BYTES),
+            Err(SigError::TooLarge { .. })
+        ));
+        let text = "A".repeat(21847);
         assert!(matches!(
             from_text(&text, DEFAULT_MAX_ENVELOPE_BYTES),
             Err(SigError::TooLarge { .. })
@@ -546,21 +558,27 @@ mod tests {
     #[test]
     fn key_id_parsing_is_strict() {
         assert_eq!(
-            "a/v1".parse::<KeyId>().unwrap(),
+            "a@v1".parse::<KeyId>().unwrap(),
             KeyId::new("a", 1).unwrap()
         );
-        assert_eq!(KeyId::new("tok", 12).unwrap().to_string(), "tok/v12");
+        let long = format!("{}@v1", "k".repeat(125));
+        assert_eq!(long.len(), 128);
+        assert!(long.parse::<KeyId>().is_ok());
+        assert!(format!("{}@v1", "k".repeat(126)).parse::<KeyId>().is_err());
+        assert!(format!("{}@v10", "k".repeat(125)).parse::<KeyId>().is_err());
+        assert!("a/v1".parse::<KeyId>().is_err());
+        assert_eq!(KeyId::new("tok", 12).unwrap().to_string(), "tok@v12");
         for bad in [
             "",
             "a",
-            "a/v0",
-            "a/v01",
-            "A/v1",
-            "a/v-1",
-            "/v1",
-            "a/v1 ",
-            "1a/v1",
-            "a/v99999999999",
+            "a@v0",
+            "a@v01",
+            "A@v1",
+            "a@v-1",
+            "@v1",
+            "a@v1 ",
+            "1a@v1",
+            "a@v99999999999",
         ] {
             assert!(bad.parse::<KeyId>().is_err(), "{bad}");
         }

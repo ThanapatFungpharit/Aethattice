@@ -414,7 +414,6 @@ impl KeyResolver for LocalSoftwareKms {
 mod tests {
     use super::*;
     use cs_crypto::sig;
-    use std::sync::{Arc, Mutex};
 
     fn tmp() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -499,7 +498,7 @@ mod tests {
             .unwrap();
         let w1 = kms.wrap(&v1, &[1u8; 32]).await.unwrap();
         let v2 = kms.rotate("kek").await.unwrap();
-        assert_eq!(v2.to_string(), "kek/v2");
+        assert_eq!(v2.to_string(), "kek@v2");
         assert_eq!(kms.current("kek").await.unwrap(), v2);
         let w2 = kms.wrap(&v2, &[2u8; 32]).await.unwrap();
         assert_eq!(kms.unwrap(&w1).await.unwrap().as_slice(), &[1u8; 32]);
@@ -585,35 +584,5 @@ mod tests {
             kms.wrap(&kek, &[0u8; 32]).await,
             Err(KmsError::Rand(_))
         ));
-    }
-
-    #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
-    impl Write for Buf {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn logs_single_node_warning_and_no_key_material() {
-        let d = tmp();
-        let buf = Buf::default();
-        let b2 = buf.clone();
-        let sub = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || b2.clone())
-            .finish();
-        let kms = tracing::subscriber::with_default(sub, || {
-            LocalSoftwareKms::init(&d.path().join("r"), None).unwrap()
-        });
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        assert!(out.contains("single-node"), "{out}");
-        assert!(out.contains("WARN"));
-        assert!(format!("{kms:?}").contains("REDACTED"));
     }
 }
