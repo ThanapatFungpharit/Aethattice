@@ -365,6 +365,20 @@ version = "0.0.0"
 [[package]]
 name = "cs-ops"
 version = "0.0.0"
+dependencies = [
+ "blake3",
+ "cs-common",
+ "cs-crypto",
+ "cs-db",
+ "futures",
+ "metrics",
+ "serde",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "cs-resources"
