@@ -9,3 +9,4 @@
 - Rust: no `unsafe`, no `unwrap`/`expect` outside tests, errors map to Appendix D codes. Web: strict TS, no backend implementation details in components.
 - Run `scripts/ci.sh` (and `--with-db` for DB work) before reporting a task done; report failures honestly with output.
 - Commits end with: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
+- Naming: "C1–C10" (C11+) are spec **errata** (docs/SPEC_ERRATA.md). Appendix C consistency rules are always written "App. C rule Cn".
