@@ -1,0 +1,46 @@
+[package]
+name = "cs-qa-tests"
+description = "Independent QA black-box tests written from the specification and frozen contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The library target is empty: everything lives in tests/. See src/lib.rs for how to run.
+
+[features]
+default = []
+# Bind the suite to the real M0 crates (cs-common, cs-db, cs-crypto, cs-ops, cs-kms, cs-api, cs binary).
+# OFF by default: until the M0 implementations are merged the bindings in
+# tests/support/contract.rs cannot compile.
+m0-contract = []
+# QA self-check: compiles the suite against a stub adapter (tests/support/contract_stub.rs) so that the
+# test logic itself is type-checked and linted before the implementations exist. Tests that need the
+# implementation panic with "QA stub" when run this way. Never enable together with m0-contract in CI.
+qa-selfcheck = []
+
+[dependencies]
+
+[dev-dependencies]
+# Crates under test (contract-specified public API names; see docs/contracts/M0-foundations.md).
+cs-common = { path = "../cs-common" }
+cs-db = { path = "../cs-db" }
+cs-crypto = { path = "../cs-crypto" }
+cs-ops = { path = "../cs-ops" }
+cs-kms = { path = "../cs-kms" }
+cs-api = { path = "../cs-api" }
+# Test tooling only.
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "time", "process", "net", "sync", "io-util"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde_json = "1"
+proptest = "1.12"
+uuid = { version = "1.29", features = ["v4", "v7"] }
+hex = "0.4"
+base64 = "0.22"
+tempfile = "3.27"
+futures = "0.3"
+
+[lints]
+workspace = true

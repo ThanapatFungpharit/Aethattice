@@ -1,1 +1,1 @@
-{ "extends": "../../tsconfig.base.json", "compilerOptions": { "rootDir": "src", "outDir": "dist/tsc" }, "include": ["src"], "references": [{ "path": "../../packages/sdk" }, { "path": "../../packages/components" }] }
+{ "extends": "../../tsconfig.base.json", "compilerOptions": { "rootDir": "src", "outDir": "dist/tsc", "types": ["vite/client"] }, "include": ["src"], "references": [{ "path": "../../packages/sdk" }, { "path": "../../packages/components" }] }
