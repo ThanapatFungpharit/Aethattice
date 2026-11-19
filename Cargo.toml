@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.0.0"
 edition = "2024"
 license = "UNLICENSED"
-rust-version = "1.90"
+rust-version = "1.94"
 
 [workspace.dependencies]
 # internal

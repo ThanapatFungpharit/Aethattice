@@ -1,6 +1,6 @@
 # M0 Contracts: Foundations (FROZEN)
 
-- Status: **frozen for M0**, revision 2 (Team Leader, 2026-11-19). Changes require Team Leader approval and a changelog entry at the bottom of this file.
+- Status: **frozen for M0**, revision 3 (Team Leader, 2026-11-19). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: v2.4.1. Where this contract adds detail the spec leaves open, it says "(design)".
 - Multi-node rule: nothing here may assume a single node, a single database cluster or a single process.
 
@@ -125,7 +125,7 @@ CREATE TABLE idempotency_records (
 Semantics:
 - Same key and same digest, completed: return the stored response.
 - Same key and different digest: `idempotency_mismatch` (422).
-- Same key, same digest, still in progress (a concurrent duplicate, or the original crashed mid-flight): `outcome_unknown` (504, retryable). Exactly one of N concurrent identical requests executes. The others get `outcome_unknown` and, when they retry with the same key, receive the stored result. (rev 2)
+- Same key, same digest, still in progress: exactly one of N concurrent identical requests executes. (rev 3) When the record is created in the same transaction as the effect, a concurrent duplicate blocks on the record's row lock and then receives the stored result. `outcome_unknown` (504, retryable) is returned only when an `in_progress` record is visible, meaning it was committed separately, for example by a multi-step or saga flow whose outcome is not yet known. Tests must accept either outcome for concurrent duplicates, but never two executions.
 - Request digest (rev 2): BLAKE3 over the deterministic-CBOR array `[method, route_template, sorted path params, body_digest]`, where `body_digest` = BLAKE3 of the RFC 8785 (JCS) canonical JSON of the body. An absent body has the body_digest of the empty string. Non-JSON bodies are hashed raw.
 - Expiry (rev 2): a record is honoured until `expires_at`. After that it may be swept, and the same key counts as a new request.
 - Size (rev 2): stored responses are ≤ 64 KiB by design; an operation whose response could be larger returns a reference instead. Exceeding the limit is an `internal` error, never truncation.
@@ -221,3 +221,4 @@ OpenTelemetry tracing with W3C trace context propagation, structured JSON logs, 
 ## Changelog
 - 2026-11-19: initial freeze.
 - 2026-11-19 rev 2 (from QA open questions): ChunkId/ExtentId use full 128 random bits; idempotency in-progress, digest, expiry and size rules; outbox and sagas primary keys lead with tenant_id (App. E); explicit saga transition table; the framework guarantees step idempotency through step receipts; envelope encoding, trailing-byte, key_id and size details; vector duplicates merge to the maximum position; problem `instance` excludes the query string; retry exhaustion returns `unavailable`; migrations only via `cs migrate`; malformed-body test moved to M1. Naming: "C1–C10" means spec errata. Appendix C rules are always written "App. C rule Cn".
+- 2026-11-20 rev 3: idempotency concurrent-duplicate semantics aligned with the single-transaction design (block, then stored result; `outcome_unknown` only for separately committed in-progress records). Minimum Rust version raised to 1.94 (sqlx 0.9).
