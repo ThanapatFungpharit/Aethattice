@@ -10,6 +10,19 @@ name = "cs"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
+cs-api.workspace = true
+cs-common.workspace = true
+cs-db.workspace = true
+cs-kms.workspace = true
+cs-ops.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+cs-common.workspace = true
+cs-db = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

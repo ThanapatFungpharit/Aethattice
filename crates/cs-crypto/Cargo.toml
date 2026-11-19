@@ -5,7 +5,23 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Enables a thread-local CSPRNG failure switch for tests in this and downstream crates.
+# Never enabled in release builds of the `cs` binary.
+fault-injection = []
+
 [dependencies]
+base64.workspace = true
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
