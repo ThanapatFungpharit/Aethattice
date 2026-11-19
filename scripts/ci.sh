@@ -11,6 +11,6 @@ if [[ "${1:-}" == "--with-db" ]]; then
   CS_REQUIRE_DB=1 CS_TEST_DATABASE_URL="${CS_TEST_DATABASE_URL:-postgres://yugabyte@localhost:5433/yugabyte}" \
     cargo test --workspace -- --test-threads=4
 fi
-echo "== web"; (cd web && npm ci --no-audit --no-fund >/dev/null && npm run typecheck && npm test --if-present -- --passWithNoTests && npm run build)
+echo "== web"; (cd web && npm ci --no-audit --no-fund >/dev/null && npm run typecheck && npm run lint && npm test --if-present -- --passWithNoTests && npm run build)
 echo "== traceability lint"; scripts/trace-lint.sh
 echo "CI OK"
