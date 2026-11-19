@@ -9,6 +9,7 @@
   "scripts": {
     "typecheck": "tsc -b",
     "test": "vitest run",
+    "lint": "node tools/lint/run.mjs",
     "build": "npm run build -w @cs/shell",
     "dev": "npm run dev -w @cs/shell"
   },
