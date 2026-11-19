@@ -6,6 +6,20 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+chacha20poly1305.workspace = true
+cs-crypto.workspace = true
+ed25519-dalek.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+cs-crypto = { workspace = true, features = ["fault-injection"] }
+tempfile.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
