@@ -1,0 +1,19 @@
+# Development infrastructure (spec §2.1, J.2). Single host => ONE failure domain; see docs/IMPLEMENTATION_PLAN.md §6.
+name: cs-dev
+services:
+  yugabyte:
+    image: yugabytedb/yugabyte:2026.1.2.0-b137
+    command: ["bin/yugabyted", "start", "--background=false", "--advertise_address=yugabyte",
+              "--tserver_flags=ysql_max_connections=300"]
+    ports: ["5433:5433", "15433:15433"]
+    volumes: ["yb-data:/root/var"]
+    healthcheck:
+      test: ["CMD-SHELL", "bin/ysqlsh -h yugabyte -U yugabyte -c 'select 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+  valkey:
+    image: valkey/valkey:9.2.0-alpine
+    ports: ["6379:6379"]
+volumes:
+  yb-data: {}

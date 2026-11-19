@@ -1,0 +1,3 @@
+[toolchain]
+channel = "stable"  # pinned via rust-version in Cargo.toml; dev host: 1.99.1
+components = ["rustfmt", "clippy"]
