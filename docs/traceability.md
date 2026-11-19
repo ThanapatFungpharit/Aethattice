@@ -1,11 +1,1039 @@
 # Requirement Traceability Matrix
 
-Source: Cloud_System_Workspace_Platform_Specification.md (v2.4 + errata, docs/SPEC_ERRATA.md).
+Source: Cloud_System_Workspace_Platform_Specification.md (v2.4.1 = v2.4 + errata C1–C10, docs/SPEC_ERRATA.md).
 
 Status values: `implemented` (code exists) · `tested` (code + passing tests named in the row) · `production-ready` (tested + reviewed for production; nothing in M0–M3 qualifies) · `in-progress` · `deferred(Mn)` · `n/a(reason)`.
 `scripts/trace-lint.sh` enforces that every row has a valid status.
 
-Populated during M0 by the QA Engineer and Team Leader.
+Populated during M0 by the QA Engineer (branch `m0/qa`); maintained by the Team Leader and engineers.
+
+## Conventions
+
+- **ID** = `<spec section>-<n>`; appendices use their letter (`D.2-5`, `F.3-2`, `L.5-1`). IDs are stable: never renumber, only append.
+- **Naming collision warning:** the spec's Appendix C rules are named C1–C16 and the approved errata are also named C1–C10. In this matrix, `erratum C8` means docs/SPEC_ERRATA.md and `App. C rule C1` means Appendix C.2. See Open question OQ-1.
+- **Milestone** follows docs/IMPLEMENTATION_PLAN.md §5. M0 rows are `in-progress`; later rows are `deferred(Mn)`. M4–M9 are planned but not approved, so their milestone is provisional.
+- **Code** names the crate or module expected to own the requirement (M0: per the plan §4 and the frozen contract docs/contracts/M0-foundations.md). It becomes a real path when code is merged.
+- **Tests** lists independent QA tests (`qa:<file>::<test>` in `crates/cs-qa-tests/tests/`, run with `--features m0-contract`) and, later, engineer tests. A test listed here is written but **not yet passing** until the status says `tested`.
+- A requirement spanning several milestones is split into one row per milestone portion, or is assigned to the milestone where it is first fully verifiable, with the earlier portion noted.
 
 | ID | Spec ref | Requirement | Milestone | Status | Code | Tests |
 |---|---|---|---|---|---|---|
+| 1.1-1 | §1.1 | Same software runs single-node and clustered; single node is the smallest configuration of the distributed design, not a separate implementation (no single-node assumptions in contracts) | M0 | in-progress | all crates; docs/contracts/M0-foundations.md | review: contract audit (docs/qa/M0-gate.md §4) |
+| 1.2-1 | §1.2 | Neutral core: no application business logic in core; every user-facing app incl. Drive is a plugin | M5 | deferred(M5) | — | — |
+| 1.2-2 | §1.2 | Goal priority order when goals conflict: correctness > durability > security > availability > performance | M0 | in-progress | review rule for all design decisions | review |
+| 1.3-1 | §1.3 | Out of scope for v2: cross-tenant dedup, active-active multi-region writes, public S3 API (must not be built or implied) | M0 | in-progress | scope rule | review |
+| 1.3-2 | §1.3 | Reference applications' detailed functional design belongs to each app's own spec | — | n/a(out of scope per §1.3; only platform usage in §16 is tracked) | — | — |
+| 1.4-1 | §1.4 | MUST/MUST NOT invariants cannot be disabled by any configuration | M0 | in-progress | cs-common::config (no switches for invariants) | qa:config::unknown_top_level_key_rejected |
+| 1.4-2 | §1.4 | Every Policy is a configurable parameter listed with its default and safe range | M0 | in-progress | cs-common::config [policy] | qa:config::revocation_staleness_s_range_enforced; see OQ-6 |
+| 2.1-1 | §2.1 | Three layers: infrastructure, core platform, application; applications use core only through public APIs/SDKs | M5 | deferred(M5) | — | — |
+| 2.1-2 | §2.1 | Core knows resource types, permission schemas, interfaces and UI surfaces only as data declared by applications; no app-specific code | M5 | deferred(M5) | — | — |
+| 2.2-1 | §2.2 | All server roles (edge, api, realtime, worker, search, storage, control) ship in one binary and are enabled per node | M0 | in-progress | crates/cs (role flags) | qa:config::unimplemented_role_refused_by_binary |
+| 2.2-2 | §2.2 | Single-node deployment enables every role on one host | M8 | deferred(M8) | — | — |
+| 2.4-1 | §2.4 | Edge routes core API calls to API nodes and /apps/{app-id}/... to app runtime | M5 | deferred(M5) | — | — |
+| 2.4-2 | §2.4 | API node authenticates token, resolves tenant and principal, evaluates permissions via authz service on every request | M2 | deferred(M2) | — | — |
+| 2.4-3 | §2.4 | File content flows directly between clients and storage nodes using data-plane tokens | M3 | deferred(M3) | — | — |
+| 2.4-4 | §2.4 | Every state change emits events through transactional outboxes | M0 | in-progress | cs-db::outbox | qa:outbox::rollback_leaves_no_gap |
+| 2.5-1 | §2.5 | Single node: every role on one host, LRC disabled, replicas across local disks; protects against disk failures only | M3 | deferred(M3) | — | — |
+| 2.5-2 | §2.5 | Small cluster 3–16 storage nodes, YugabyteDB RF3, node-level failure domains | M8 | deferred(M8) | — | — |
+| 2.5-3 | §2.5 | Large cluster: dedicated roles, rack/zone failure domains | M8 | deferred(M8) | — | — |
+| 2.6-1 | §2.6 Authority | Every durable fact has exactly one authoritative owner and serialization point (App. C); caches/indexes/events/replicas never authoritative by availability | M0 | in-progress | cs-db DomainPool per domain | review; qa:readiness tests |
+| 2.6-2 | §2.6 Authority | Every operation identifies its authoritative pivot; acknowledgements distinguish accepted / committed at pivot / fully completed | M3 | deferred(M3) | cs-ops saga framework (M0 portion) | qa:sagas::happy_path_reaches_completed |
+| 2.6-3 | §2.6 Durability | Acknowledged durable writes survive every failure within advertised tolerance; never acknowledged while only in memory/queue/socket/unsynced cache | M3 | deferred(M3) | — | — |
+| 2.6-4 | §2.6 Durability | Publication readiness distinct from eventual target redundancy; repair cannot retroactively make weaker publication safe | M3 | deferred(M3) | — | — |
+| 2.6-5 | §2.6 Durability | Deployment status exposes actual durability by disk/host/rack/zone/site incl. degraded state and remaining tolerance | M3 | deferred(M3) | — | — |
+| 2.6-6 | §2.6 Visibility | Data user-visible only after all referenced content and metadata crossed publication pivots; stale derived state never grants access | M3 | deferred(M3) | — | — |
+| 2.6-7 | §2.6 Visibility | Removal of visibility precedes physical reclamation; no timeout/missing event/lost response/absent record is evidence to delete | M3 | deferred(M3) | — | — |
+| 2.6-8 | §2.6 Consistency | Cross-domain causality = authenticated bounded vectors of authoritative positions; independent DB clocks not comparable; unsatisfiable vector returns unavailable, never stale allow | M2 | deferred(M2) | cs-common::consistency (M0 type) | qa:consistency_vector::* (M0 type portion) |
+| 2.6-9 | §2.6 Consistency | Every multi-domain workflow is a durable saga with unique idempotency key, explicit pivot, pre-pivot compensation, post-pivot forward recovery, level-triggered reconciler | M0 | in-progress | cs-ops::saga | qa:sagas::* |
+| 2.6-10 | §2.6 Recovery | Service ready only after authoritative state restored to causally closed recovery vector, revocations applied, operations reconciled, dependencies verified; process health never establishes readiness | M0 | in-progress | cs-api /readyz (M0: domains reachable + migrations); full barrier M8 | qa:readiness::readyz_503_lists_unreachable_domain_barrier; qa:readiness::healthz_200_while_domain_unreachable |
+| 2.6-11 | §2.6 Recovery | Backups, archives, inventories, keys, offsets, plugin artifacts, audit checkpoints have explicit ownership and recovery contracts; claims limited to covered classes | M8 | deferred(M8) | — | — |
+| 2.6-12 | §2.6 Security | Authorization evaluated against authoritative state or verified snapshot at least as fresh as request vector; every enforcement point has explicit stale behavior and measurable denial bound | M2 | deferred(M2) | — | — |
+| 2.6-13 | §2.6 Security | Long-lived streams and transfers continuously subject to revocation; token expiry alone does not terminate an authorized transfer | M3 | deferred(M3) | — | — |
+| 2.6-14 | §2.6 Isolation | Capacity, CPU, memory, I/O, tablet budgets, queues, network isolated by tenant and workload class; no subsystem consumes repair/control reserves | M8 | deferred(M8) | — | — |
+| 2.6-15 | §2.6 Isolation | Single-host, node, rack/zone and site guarantees are distinct and never presented as interchangeable | M3 | deferred(M3) | — | — |
+| 3.1-1 | §3.1 | Core owns tenants, principals, auth, sessions, directory, permission model, sharing, revocation, resource registry, object storage, platform data services, live-doc infra, cross-cutting services, app lifecycle, platform components | M0 | in-progress | crate layout (plan §4) | review |
+| 3.3-1 | §3.3 | Core MUST NOT depend on any application; removing every application leaves a working core with administration only | M5 | deferred(M5) | — | — |
+| 3.3-2 | §3.3 | Applications MUST NOT access another application's database, objects, services or UI internals | M5 | deferred(M5) | — | — |
+| 3.3-3 | §3.3 | Core resolves, enforces and brokers every inter-plugin call; never implements plugin functionality | M5 | deferred(M5) | — | — |
+| 3.3-4 | §3.3 | Applications MUST NOT implement own authentication, permission storage, sharing or file storage | M5 | deferred(M5) | — | — |
+| 3.3-5 | §3.3 | Every app operation on core data goes through core APIs with acting principal's authorization | M5 | deferred(M5) | — | — |
+| 3.3-6 | §3.3 | First-party applications follow same rules and public APIs as third-party | M5 | deferred(M5) | — | — |
+| 3.3-7 | §3.3 | Platform components are core (not plugins), run on platform origin, use the same public APIs, contain no application business logic | M0 | in-progress | web/apps/shell, web/packages/* | frontend review; docs/qa/M0-gate.md §3 |
+| 3.4-1 | §3.4 | Public client API is REST over HTTPS versioned by major (/api/v2), described by OpenAPI; gRPC-web for streaming | M1 | deferred(M1) | docs/contracts/openapi (M1+) | — |
+| 3.4-2 | §3.4 | Realtime protocol over WebSocket, versioned | M6 | deferred(M6) | — | — |
+| 3.4-3 | §3.4 | Application host API: WIT packages cs:platform/*, semver, with gRPC binding for native services | M5 | deferred(M5) | — | — |
+| 3.4-4 | §3.4 | SDKs: Rust, TypeScript web UI, generated REST clients | M5 | deferred(M5) | web/packages/sdk (M0 skeleton) | — |
+| 3.4-5 | §3.4 | Error responses follow Appendix D | M0 | in-progress | cs-common::error, cs-api | qa:error_model::*; qa:http_surface::* |
+| 3.5-1 | §3.5 | Core ships platform components: web shell, sign-in/account/security/recovery pages, admin console, shared UI components, UI SDK | M0 | in-progress | web/ (M0 skeleton; pages M1–M2) | frontend tests |
+| 3.5-2 | §3.5 | Platform components implement only core functions; content-specific features belong to plugins | M0 | in-progress | web/ | review |
+| 3.5-3 | §3.5 | Only platform components run on platform origin (except approved full-mode plugins) | M5 | deferred(M5) | — | — |
+| 3.5-4 | §3.5 | Plugins extend platform components only through declared extension surfaces, never patching | M5 | deferred(M5) | — | — |
+| 4.1-1 | §4.1 | Every nameable/shareable/trashable/linkable app object is a resource in the core registry | M2 | deferred(M2) | — | — |
+| 4.1-2 | §4.1 | Resource ID is 128-bit UUIDv7, globally unique; URN cs:{tenant}:{type}:{id} | M0 | in-progress | cs-common::id, cs-common::Urn | qa:ids::typed_ids_are_uuidv7; qa:ids::urn_parse_strict |
+| 4.1-3 | §4.1 | Resource record: type, space/parent, name, owner, creator, times, lifecycle state, retention/hold flags, optional content binding, ACL version + inheritance flag, metadata | M2 | deferred(M2) | — | — |
+| 4.1-4 | §4.1 | Typed application metadata is JSON validated against the type's declared schema | M5 | deferred(M5) | — | — |
+| 4.1-5 | §4.1 | Record authoritative for identity, hierarchy, lifecycle, permissions; owning app authoritative for type-specific content | M2 | deferred(M2) | — | — |
+| 4.2-1 | §4.2 | Apps declare resource types in manifest (name namespaced, binding kind, container/child types, schema ref, lifecycle behavior, visibility, interfaces) | M5 | deferred(M5) | — | — |
+| 4.2-2 | §4.2 | A type cannot be removed while resources of that type exist | M5 | deferred(M5) | — | — |
+| 4.3-1 | §4.3 | Spaces are roots: personal space per user, shared spaces, app-private spaces | M2 | deferred(M2) | — | — |
+| 4.3-2 | §4.3 | Namespace writes partitioned by stable resource/parent IDs, not tenant-wide counter or parent-row lock | M2 | deferred(M2) | — | — |
+| 4.3-3 | §4.3 | Folder-entry tables hash-bucketed beyond measured size/write-rate threshold | M2 | deferred(M2) | — | — |
+| 4.3-4 | §4.3 | Large subtree operations use bounded resumable batches with durable operation record and explicit parent/child pivot | M2 | deferred(M2) | — | — |
+| 4.3-5 | §4.3 | Move/rename changes parent/name tuple in one resources-domain transaction with one journal/outbox record; descendants not rewritten | M2 | deferred(M2) | — | — |
+| 4.3-6 | §4.3 | Listing cursors identify folder, ordering, filter, last stable key, authz snapshot requirement, expiry; no physical bucket layout | M2 | deferred(M2) | — | — |
+| 4.3-7 | §4.3 | Core owns only spaces; containers are plugin types (Drive drive.folder/drive.file, containable-types extension point) | M5 | deferred(M5) | — | — |
+| 4.3-8 | §4.3 | Move requires permissions on both source and destination; cross-space moves only when types and policies permit | M2 | deferred(M2) | — | — |
+| 4.3-9 | §4.3 | Collections hold references, not ownership | M5 | deferred(M5) | — | — |
+| 4.4-1 | §4.4 | Delete moves resource with subtree to trash; trashed keep permissions; restorable until trash retention (policy default 30 days) | M2 | deferred(M2) | — | — |
+| 4.4-2 | §4.4 | Version retention tenant policy default 30 days, at most 100 versions per resource; apps may request longer | M3 | deferred(M3) | — | — |
+| 4.4-3 | §4.4 | Retention rules and legal holds on spaces/resources; held resources cannot be purged, versions cannot expire | M3 | deferred(M3) | — | — |
+| 4.4-4 | §4.4 | Purge MUST respect snapshots, legal holds, read grace and recovery window | M3 | deferred(M3) | — | — |
+| 4.4-5 | §4.4 | Owning app receives trashed/restored/purged events; core removes resource even if app does not clean up; orphaned app records reported | M5 | deferred(M5) | — | — |
+| 4.5-1 | §4.5 | Resource reference = (URN, optional version, optional anchor) | M5 | deferred(M5) | — | — |
+| 4.5-2 | §4.5 | Core link index answers "what links here" and notifies referencing apps on trash/restore/purge | M5 | deferred(M5) | — | — |
+| 4.5-3 | §4.5 | Following a reference always requires permission on target; a reference never grants access | M5 | deferred(M5) | — | — |
+| 4.6-1 | §4.6 | Every resource change emits typed event (created, updated, moved, renamed, trashed, restored, purged, permissions changed, version published) via resources outbox | M2 | deferred(M2) | cs-db::outbox (M0 mechanism) | — |
+| 5.1-1 | §5.1 | Users belong to one home tenant; guests invited with restricted capabilities (policy) | M1 | deferred(M1) | — | — |
+| 5.1-2 | §5.1 | Groups contain users and groups; nesting allowed, cycles rejected; membership stored in identity domain | M1 | deferred(M1) | — | — |
+| 5.1-3 | §5.1 | Service identities and application identities exist | M1 | deferred(M1) | — | — |
+| 5.1-4 | §5.1 | Tenant policies: password/MFA, session lifetimes, sharing limits, retention, quotas, enabled apps, data residency | M1 | deferred(M1) | — | — |
+| 5.2-1 | §5.2 | Passwords verified with OPAQUE (RFC 9807) ristretto255-SHA512, 3DH, HKDF-SHA-512, HMAC-SHA-512; server never receives password | M1 | deferred(M1) | — | — |
+| 5.2-2 | §5.2 | Argon2id mandatory client-side; defaults 64 MiB, t=3, p=1; params stored per registration, upgraded at next login | M1 | deferred(M1) | — | — |
+| 5.2-3 | §5.2 | OPRF seed and server KE keys versioned, held in KMS, in API node memory only; transparent re-registration to newest version | M1 | deferred(M1) | — | — |
+| 5.2-4 | §5.2 | Unknown accounts get indistinguishable responses | M1 | deferred(M1) | — | — |
+| 5.2-5 | §5.2 | Attempts rate limited per account and per source | M1 | deferred(M1) | — | — |
+| 5.2-6 | §5.2 | OPAQUE export key (client only) unlocks vault key bundle | M9 | deferred(M9) | — | — |
+| 5.3-1 | §5.3 | WebAuthn credentials as second factor or passwordless discoverable passkeys; tenants can require MFA | M1 | deferred(M1) | — | — |
+| 5.3-2 | §5.3 | PRF-derived key may add a vault bundle wrapper, never the only wrapper | M9 | deferred(M9) | — | — |
+| 5.4-1 | §5.4 | OIDC and SAML IdPs per tenant; SSO users unlock vaults by device approval or recovery key | M9 | deferred(M9) | — | — |
+| 5.4-2 | §5.4 | SCIM provisioning syncs users and groups | M9 | deferred(M9) | — | — |
+| 5.5-1 | §5.5 | Sign-in creates a session in identity domain | M1 | deferred(M1) | — | — |
+| 5.5-2 | §5.5 | Access tokens: Ed25519 JWS, default 10 min, carry sid, sub, tenant, authz version, auth strength, cnf.jkt with DPoP | M1 | deferred(M1) | — | — |
+| 5.5-3 | §5.5 | DPoP (RFC 9449) mandatory for third-party OAuth clients, optional for first-party (policy) | M1 | deferred(M1) | — | — |
+| 5.5-4 | §5.5 | Refresh tokens: random 256-bit, stored as SHA-256, single use with rotation | M1 | deferred(M1) | — | — |
+| 5.5-5 | §5.5 | Reuse of a rotated refresh token revokes the whole session | M1 | deferred(M1) | — | — |
+| 5.5-6 | §5.5 | Web refresh tokens in Secure, HttpOnly, SameSite=Strict cookies scoped to refresh endpoint; native clients bind to device key | M1 | deferred(M1) | — | — |
+| 5.5-7 | §5.5 | Session idle lifetime default 14 days, absolute default 90 days | M1 | deferred(M1) | — | — |
+| 5.5-8 | §5.5 | Sensitive operations require auth no older than 5 minutes (policy) | M1 | deferred(M1) | — | — |
+| 5.5-9 | §5.5 | Applications never see refresh tokens or passwords; third parties use OAuth 2.0 with scopes mapped to interfaces | M5 | deferred(M5) | — | — |
+| 5.6-1 | §5.6 | Account recovery restores sign-in, never vault keys | M1 | deferred(M1) | — | — |
+| 5.6-2 | §5.6 | Recovery methods: recovery code (Argon2id-hashed, shown once), device/passkey approval, verified email with waiting period default 24 h cancellable, admin-assisted under same waiting period | M1 | deferred(M1) | — | — |
+| 5.6-3 | §5.6 | Users with MFA must also present second factor or recovery code | M1 | deferred(M1) | — | — |
+| 5.6-4 | §5.6 | Completing recovery sets new OPAQUE registration, revokes all sessions, notifies all devices | M1 | deferred(M1) | — | — |
+| 5.7-1 | §5.7 | Core directory lists users, groups, guests with profile fields and presence | M1 | deferred(M1) | — | — |
+| 5.7-2 | §5.7 | Apps read directory via cs:platform/directory filtered by tenant policy (guests see only collaborators) | M5 | deferred(M5) | — | — |
+| 6.1-1 | §6.1 | Relationship-based (Zanzibar-style) authorization; tuples (resource, relation, subject) incl. group#member and folder#viewer subjects | M2 | deferred(M2) | — | — |
+| 6.1-2 | §6.1 | Resource tuples stored in resources domain with the resource; tuple write + ACL-version bump + journal entry in one local transaction | M2 | deferred(M2) | — | — |
+| 6.1-3 | §6.1 | group#member tuples stored with group in identity domain, one tx with membership version | M1 | deferred(M1) | — | — |
+| 6.1-4 | §6.1 | Schemas, share-role mappings, revocation feed log in authz domain; changed only via outbox events or plugin install; no authz write spans two domains | M2 | deferred(M2) | — | — |
+| 6.1-5 | §6.1 | Authz domain maintains versioned materialized projection recording exact source positions; decisions use one consistent read snapshot | M2 | deferred(M2) | — | — |
+| 6.1-6 | §6.1 | Projection updates idempotent, ordered per source partition, applied with source position in same authz tx; watermark valid only when all partitions contiguous; cluster timestamps never compared | M2 | deferred(M2) | — | — |
+| 6.1-7 | §6.1 | Authorization MUST be checked for every API call, host call, data-plane token issue, realtime join, search result, sync entry | M2 | deferred(M2) | — | — |
+| 6.2-1 | §6.2 | Each resource type has a permission schema validated at install: relations, permission expressions with parent-> inheritance, share-role mapping (Viewer, Commenter, Editor, Manager, Owner) | M2 | deferred(M2) | — | — |
+| 6.2-2 | §6.2 | Core defines the schema for spaces | M2 | deferred(M2) | — | — |
+| 6.2-3 | §6.2 | Plugin references another plugin's types only through exported permissions and only with a declared dependency | M5 | deferred(M5) | — | — |
+| 6.2-4 | §6.2 | Schemas versioned with app; changes require migration plan validated at upgrade | M5 | deferred(M5) | — | — |
+| 6.3-1 | §6.3 | check(resource, permission, principal) walks direct tuples, group membership, parent inheritance up to first inheritance break | M2 | deferred(M2) | — | — |
+| 6.3-2 | §6.3 | lookup(principal, permission, type, within) lists accessible resources | M2 | deferred(M2) | — | — |
+| 6.3-3 | §6.3 | Ancestor chains, ACLs, group closures cached in-process and Valkey keyed by (resource ID, ACL version) and (group ID, membership version) | M2 | deferred(M2) | — | — |
+| 6.4-1 | §6.4 | Single Authorization Decision Service (ADS) is the only component interpreting cross-domain vectors | M2 | deferred(M2) | — | — |
+| 6.4-2 | §6.4 | Authority split: resources (relationships, ACL versions, parents, generations), identity (membership), authz (schemas, mappings, revocation sequencing) | M2 | deferred(M2) | — | — |
+| 6.4-3 | §6.4 | Each authz-affecting write returns a signed, audience-bound consistency context (tenant, issuer, protocol version, source domains+positions, affected versions, epoch, issue time, expiry), no cluster timestamp as causal primitive | M2 | deferred(M2) | cs-crypto::sig context consistency-context/v1 (M0) | qa:signing::* (envelope portion) |
+| 6.4-4 | §6.4 | ADS waits or returns unavailable if required source position not applied; never falls back to older projection; evaluates in one read tx; decision records snapshot ID, vector, epoch, expiry | M2 | deferred(M2) | — | — |
+| 6.4-5 | §6.4 | Signed watermark heartbeat at least every 500 ms even without revocations; consumers report heartbeat, positions, epoch | M2 | deferred(M2) | — | — |
+| 6.4-6 | §6.4 | Consumer stale if heartbeat age > S, applied positions trail by > S, or any gap/epoch mismatch | M2 | deferred(M2) | — | — |
+| 6.4-7 | §6.4 | Check cache keyed by tenant, resource, principal, permission, ACL version, membership version, schema version, epoch; usable only if every component at least as fresh as request; caches never authorities | M2 | deferred(M2) | — | — |
+| 6.4-8 | §6.4 | Public consistency context has strict maximum encoded size; large sets via server-side immutable snapshot handle bound to principal/tenant/audience/expiry | M2 | deferred(M2) | — | — |
+| 6.4-9 | §6.4 | Expired, malformed, unknown-version or oversized contexts rejected, never silently truncated | M2 | deferred(M2) | cs-common::consistency (M0: >64 rejected) | qa:consistency_vector::sixty_five_components_rejected_not_truncated; qa:signing::oversized_envelope_rejected_before_decode |
+| 6.4-10 | §6.4 | ADS issues short-lived signed decision tickets bound to resource/version or channel, principal, session, operation, audience, snapshot, epoch, expiry; not a substitute for revocation | M2 | deferred(M2) | — | — |
+| 6.4-11 | §6.4 | Group closure versioned; mutations invalidate closure generation; cycles rejected at write; depth/cardinality limits; breach returns typed error, never partial allow | M1 | deferred(M1) | — | — |
+| 6.4-12 | §6.4, erratum C8 | Every signed artifact (access tokens, data-plane tokens, consistency contexts, snapshot handles, decision tickets, revocation records, heartbeats, storage receipts, state attestations, signed cursors) uses Ed25519 | M0 | in-progress | cs-crypto::sig | qa:signing::valid_vectors_verify |
+| 6.4-13 | §6.4, erratum C8 | Each signed artifact type has its own domain-separation context in signed bytes; a signature for one type never verifies as another | M0 | in-progress | cs-crypto::sig::Context | qa:signing::cross_context_signature_never_verifies; qa:signing::context_registry_is_closed |
+| 6.4-14 | §6.4, erratum C8 | Signed payloads use one canonical serialization (contract: deterministic CBOR, re-encode check) | M0 | in-progress | cs-crypto::sig | qa:signing::non_canonical_payload_rejected_even_with_valid_signature; qa:signing::negative_vectors_rejected |
+| 6.4-15 | §6.4, erratum C8 | HMAC-protected artifacts (e.g. listing cursors) remain HMAC | M2 | deferred(M2) | — | — |
+| 6.4-16 | §6.4 | Write responses carry the context required by dependent reads; may be omitted only for explicitly eventual reads that make no authz decision and expose no protected data | M2 | deferred(M2) | — | — |
+| 6.5-1 | §6.5 | Sharing is one core service, one API and one shared dialog for all apps | M2 | deferred(M2) | — | — |
+| 6.5-2 | §6.5 | Share grants a standard role to user/group/guest/link; stored as tuples plus metadata (who, when, message, expiry) | M2 | deferred(M2) | — | — |
+| 6.5-3 | §6.5 | Link shares: random 128-bit token bound to role, optional password, expiry, audience; resolves to temporary principal | M2 | deferred(M2) | — | — |
+| 6.5-4 | §6.5 | Sharing outside tenant obeys tenant policy and can require approval | M2 | deferred(M2) | — | — |
+| 6.5-5 | §6.5 | Sharing a container shares subtree by inheritance; inheritance breaks explicit and visible in UI | M2 | deferred(M2) | — | — |
+| 6.5-6 | §6.5 | Share notifications sent through notification service | M4 | deferred(M4) | — | — |
+| 6.5-7 | §6.5 | "Share on send" for references in messages | M5 | deferred(M5) | — | — |
+| 6.6-1 | §6.6 | Revocation: single authoritative sequence per tenant and monotonically increasing global authorization epoch; delivery, application and denial measured separately | M2 | deferred(M2) | — | — |
+| 6.6-2 | §6.6 | Revocation committed in owning domain (resources, identity, plugins) with outbox event in same tx; authz assigns ordered sequence; emission alone is not propagation | M2 | deferred(M2) | — | — |
+| 6.6-3 | §6.6 | Revocation records: affected principal/session/group or subtree, source domain+position, new generation, epoch, event ID; subtree via ancestor generation/tombstone | M2 | deferred(M2) | — | — |
+| 6.6-4 | §6.6 | Every enforcement consumer keeps authenticated applied position and epoch; startup requires verified signed snapshot + contiguous replay to readiness watermark | M2 | deferred(M2) | — | — |
+| 6.6-5 | §6.6 | Feed gaps, checksum failures, epoch regression, unknown schema or loss of durable position make consumer stale immediately | M2 | deferred(M2) | — | — |
+| 6.6-6 | §6.6 | Policy S default 2 s, max 30 s; S is not a polling interval | M0 | in-progress | cs-common::config [policy] (value range); enforcement M2 | qa:config::revocation_staleness_s_range_enforced |
+| 6.6-7 | §6.6 | Heartbeat ≥ every 500 ms; consumers publish heartbeat, positions, feed sequence, epoch; stale rules (age > S, trail > S, gap, epoch mismatch) | M2 | deferred(M2) | — | — |
+| 6.6-8 | §6.6 | Stale API nodes fail closed for every protected request | M2 | deferred(M2) | — | — |
+| 6.6-9 | §6.6 | Stale storage nodes reject all writes and new reads | M3 | deferred(M3) | — | — |
+| 6.6-10 | §6.6 | Stale realtime nodes reject edits, close affected channels, stop protected content | M6 | deferred(M6) | — | — |
+| 6.6-11 | §6.6 | Stale search and sync nodes stop returning protected results, unavailable until current | M7 | deferred(M7) | — | — |
+| 6.6-12 | §6.6 | No role may use a cached allow after becoming stale | M2 | deferred(M2) | — | — |
+| 6.6-13 | §6.6 | Storage revalidates authorization at least every 1 MiB or 1 s and before every range/resume | M3 | deferred(M3) | — | — |
+| 6.6-14 | §6.6 | Realtime gateways revalidate every channel at least once per second and on every revocation event | M6 | deferred(M6) | — | — |
+| 6.6-15 | §6.6 | On revocation: stop new bytes/frames, cancel queued buffers, close stream, reject resume tokens; stop within 1 s checkpoint and close within further 1 s | M3 | deferred(M3) | — | — |
+| 6.6-16 | §6.6 | Read fail-open removed: protected reads/writes/edits/sync/search fail closed when freshness unprovable; public non-sensitive data uses separate cache policy | M2 | deferred(M2) | — | — |
+| 6.6-17 | §6.6 | Data-plane tokens short-lived and bound to extents, generation, principal, session, DPoP key, epoch; storage also enforces revocation state | M3 | deferred(M3) | — | — |
+| 6.6-18 | §6.6 | SLO: propagation 99% within 2 s, 100% within S; unauthorized writes after commit zero; unauthorized reads ≤ S + 1 s + 1 s; breach is a security incident, no error budget | M2 | deferred(M2) | — | — |
+| 6.7-1 | §6.7 | Data-plane tokens Ed25519-signed, audience-bound to one storage node, containing session, subject, tenant, resource, exact version or upload session/chunk indexes, extent IDs, generation, grant ref, epoch, snapshot ID, expiry, unique token ID, optional DPoP thumbprint | M3 | deferred(M3) | cs-crypto::sig data-plane-token/v1 context (M0) | — |
+| 6.7-2 | §6.7 | Default read lifetime 60 s, write 5 min; renewal requires fresh authz; cannot be broadened or replayed at another node | M3 | deferred(M3) | — | — |
+| 6.7-3 | §6.7 | Storage-node checks: signature, issuer, audience, expiry, site epoch, tenant, DPoP, exact binding, generation, revocation epoch, applied-position freshness; stale node denies | M3 | deferred(M3) | — | — |
+| 6.7-4 | §6.7 | Every transfer is a cancellable stateful stream with bounded buffers; recheck every 1 MiB or 1 s, before range continuation and before any additional response body; revocation discards queued bytes | M3 | deferred(M3) | — | — |
+| 6.7-5 | §6.7, erratum C2 | Tokens carry generation + signed ancestry snapshot handle, max depth 256; missing/stale snapshot denies; fallback tokens only for explicitly public data; no weaker form at any supported depth | M3 | deferred(M3) | cs-crypto::sig snapshot-handle/v1 context (M0) | — |
+| 6.8-1 | §6.8 | Admin roles: cluster admin, tenant admin, application admin, auditor, tenant-defined support roles | M2 | deferred(M2) | — | — |
+| 6.8-2 | §6.8 | Administrative actions authorized by the same relationship model on tenant and application resources | M2 | deferred(M2) | — | — |
+| 6.8-3 | §6.8 | Policy hooks can deny but never grant, run under time budget, deny on failure unless configured otherwise | M5 | deferred(M5) | — | — |
+| 7.1-1 | §7.1 | Plugin package may contain declarations, WASM components, services, web UI bundle, live-doc schemas, migrations, translations, assets; extensions use same model | M5 | deferred(M5) | — | — |
+| 7.2-1 | §7.2 | Package is a git repo with plugin.toml at root: identity, compatibility, dependencies, exports, types, schemas, events, routes under /apps/{app-id}/, components/services with limits, UI, storage, requested permissions, network destinations, secrets, migrations with class, export/import formats | M5 | deferred(M5) | — | — |
+| 7.3-1 | §7.3 | Runtime trust classes mandatory. Class U (default for third-party): WASM, capability-only host calls, no ambient FS or raw sockets, bounded fuel/memory, no infrastructure credentials | M5 | deferred(M5) | — | — |
+| 7.3-2 | §7.3 | Class S: WASM service or OCI workload in gVisor; only declared network destinations and platform APIs; no host namespace, privileged device or cluster credentials | M9 | deferred(M9) | — | — |
+| 7.3-3 | §7.3 | Class P: native service in dedicated OS identity and sandbox, cluster-admin approved, pinned digest, narrow RPC, seccomp/namespace restrictions, independent budget | M9 | deferred(M9) | — | — |
+| 7.3-4 | §7.3 | Class X: Firecracker microVM (or equivalent) per execution boundary, ephemeral FS and credentials; notebook kernels and arbitrary user code MUST use class X | M9 | deferred(M9) | — | — |
+| 7.3-5 | §7.3 | Full-mode UI is shell-equivalent, not an ordinary plugin class; needs separate digest approval and user activation (§14.2) | M9 | deferred(M9) | — | — |
+| 7.3-6 | §7.3 | Approval records: trust class, digest, capabilities, network policy, reachable data classes, signer, expiry; any change requires fresh approval; approval never replaces sandboxing | M5 | deferred(M5) | — | — |
+| 7.3-7 | §7.3 | Components: WASI 0.3 on Wasmtime in dedicated worker processes; fresh/reset pooled instance per invocation with memory, CPU (fuel/epoch), wall-clock and I/O limits | M5 | deferred(M5) | — | — |
+| 7.3-8 | §7.3 | Scheduler reserves hard per-tenant and per-plugin budgets; aggregate reservations MUST fit allocatable capacity plus failure/repair/compaction headroom, else enablement refused; plugin-count limits are not capacity guarantees | M5 | deferred(M5) | — | — |
+| 7.3-9 | §7.3 | Components talk to core only through cs:platform/* host API; every call authorized against the invocation capability context | M5 | deferred(M5) | — | — |
+| 7.3-10 | §7.3 | Native services rootless in gVisor by default; user-supplied code MUST run in a microVM and MUST NOT share host-kernel namespace with core services; cgroup limits, read-only image, declared volumes, network policies | M9 | deferred(M9) | — | — |
+| 7.3-11 | §7.3 | Services reach core only via host API gRPC binding with mTLS and app identity; no direct access to metadata store, Valkey or storage nodes | M9 | deferred(M9) | — | — |
+| 7.3-12 | §7.3 | Services declare scaling model (singleton per tenant, sharded, stateless); supervisor uses same leases and fencing as core schedulers | M9 | deferred(M9) | — | — |
+| 7.3-13 | §7.3 | Deployments may disable native services; apps that require them cannot then be installed | M9 | deferred(M9) | — | — |
+| 7.4-1 | §7.4 | App receives exactly the permissions requested and approved; approval covers whole request; updates requesting more need approval again | M5 | deferred(M5) | — | — |
+| 7.4-2 | §7.4 | Permission classes: platform capabilities and high-risk capabilities (as enumerated) | M5 | deferred(M5) | — | — |
+| 7.4-3 | §7.4 | Capability approval versioned and auditable; add/broaden/change meaning needs fresh approval; revocation blocks new host calls, cancels/revalidates queued jobs, terminates instances, invalidates delegated grants; outbound network enforced at network layer | M5 | deferred(M5) | — | — |
+| 7.4-4 | §7.4 | Capability context: acting principal; effective rights = intersection of app grants, principal rights and resources in scope; unforgeable resource handles; authz on every host call | M5 | deferred(M5) | — | — |
+| 7.4-5 | §7.4 | Jobs store delegation (user, scope, expiry); rights and grant rechecked when job runs and before every privileged step | M5 | deferred(M5) | — | — |
+| 7.4-6 | §7.4 | Apps act on other apps' resources only via those apps' interfaces or core APIs with acting principal's permissions | M5 | deferred(M5) | — | — |
+| 7.5-1 | §7.5 | Install from git URL+ref by isolated fetcher (shallow, pinned commit, no hooks/submodules/LFS, HTTPS only, size and resource limits); nothing from the repo executed during install | M5 | deferred(M5) | — | — |
+| 7.5-2 | §7.5 | Resolve plan, check compatibility and permissions for every plugin, show grouped by risk, record commit and all file/image digests and signer; package stored in cluster object storage; images mirrored | M5 | deferred(M5) | — | — |
+| 7.5-3 | §7.5 | Enablement per tenant (optionally per group); enabling enables required deps; disabled apps keep data, UI/routes/handlers unavailable, resources visible read-only (policy: hidden) | M5 | deferred(M5) | — | — |
+| 7.5-4 | §7.5 | Upgrades fetched/validated like install; permission increases need approval; resolver checks dependents' ranges and produces coordinated plans | M5 | deferred(M5) | — | — |
+| 7.5-5 | §7.5 | App migrations follow expand–migrate–contract and MUST keep the previous version operable until the contract step; expand is additive | M5 | deferred(M5) | cs-db migration runner (M0 core portion) | qa:migrations::contract_before_finalized_expand_refused (core runner portion) |
+| 7.5-6 | §7.5 | Contract migrations only after previous version stops being a rollback target (soak period policy default 7 days, plus administrator confirmation) | M5 | deferred(M5) | — | — |
+| 7.5-7 | §7.5 | A migration marked irreversible triggers automatic logical export of the app database before it runs | M5 | deferred(M5) | — | — |
+| 7.5-8 | §7.5 | Rollout staged by tenant cohorts (canary first); error-rate or health regression rolls the cohort back automatically | M5 | deferred(M5) | — | — |
+| 7.5-9 | §7.5 | Previous two package versions retained; rollback reactivates a retained version; derived artifacts keyed by format version | M5 | deferred(M5) | — | — |
+| 7.5-10 | §7.5 | Removal checks dependents first; admin chooses disposition per resource class (App. M); removal saga trashes resources (normal retention), then purges records, object refs, live docs, search entries | M5 | deferred(M5) | — | — |
+| 7.6-1 | §7.6 | Apps declare supported core and host-API versions; host supports current and previous major of each cs:platform interface | M5 | deferred(M5) | — | — |
+| 7.6-2 | §7.6 | Before core upgrade incompatible apps are listed; default: disabled after upgrade with notification; policy may block the upgrade | M5 | deferred(M5) | — | — |
+| 7.6-3 | §7.6 | Interface semver: additive in minor, breaking in new major; providers keep previous major for at least one application release cycle | M5 | deferred(M5) | — | — |
+| 7.7-1 | §7.7 | Isolation boundary is OS process (components) or sandbox (services); apps never share process, Wasmtime engine, instance pool, database, object namespace, cache namespace or web origin | M5 | deferred(M5) | — | — |
+| 7.7-2 | §7.7 | Each app has own DB role and database, Valkey key prefix with ACLs, object namespace and web origin | M5 | deferred(M5) | — | — |
+| 7.7-3 | §7.7 | Apps communicate only through core (broker, events, extension points, references), limited to declared dependencies | M5 | deferred(M5) | — | — |
+| 7.7-4 | §7.7 | Per-tenant budgets (CPU, memory, invocations, storage, events) apply to every app so none can starve others | M5 | deferred(M5) | — | — |
+| 7.8-1 | §7.8 | File and image digests guarantee an installed package cannot change; signer pinned at first install; update signed by another identity needs explicit re-approval | M5 | deferred(M5) | — | — |
+| 7.8-2 | §7.8 | Signatures required for automatic updates by default (policy); config can require signatures for all installs, restrict git hosts, pre-install and lock apps, forbid permissions | M5 | deferred(M5) | — | — |
+| 7.8-3 | §7.8 | Every package in a plan is validated, pinned and signature-checked independently; a trusted plugin does not make its dependencies trusted | M5 | deferred(M5) | — | — |
+| 7.9-1 | §7.9.1 | Dependency kinds: plugin (ID + semver range) and interface (name + range); each required or optional; optional listing of used exports checked against resolved provider | M5 | deferred(M5) | — | — |
+| 7.9-2 | §7.9.2 | Public surface is exactly the manifest exports; restricted to declared dependents by default; everything else internal and unreachable, enforced by core | M5 | deferred(M5) | — | — |
+| 7.9-3 | §7.9.3 | PubGrub-style deterministic solver; explains failures in terms of conflicting ranges; resolves transitive deps | M5 | deferred(M5) | — | — |
+| 7.9-4 | §7.9.3 | Rules: one version per plugin; conflicts reported with dependent chain; interface deps satisfied by enabled provider (admin default when several); optional deps never fail plan; prefer installed then newest; core/host-API compatibility is a constraint | M5 | deferred(M5) | — | — |
+| 7.9-5 | §7.9.3 | Required dependency graph MUST be acyclic; cycle rejected at resolution with cycle reported; optional deps may point both ways | M5 | deferred(M5) | — | — |
+| 7.9-6 | §7.9.3 | Admin approves whole plan; applied in topological order as a saga; failure compensates completed steps; never left half-applied | M5 | deferred(M5) | — | — |
+| 7.9-7 | §7.9.4 | Enabling enables required deps for the same scope; disabling a provider with enabled required dependents refused unless they are disabled in the same operation | M5 | deferred(M5) | — | — |
+| 7.9-8 | §7.9.4 | Unavailable provider: calls fail fast with typed unavailable after deadline; circuit breakers; dependents MUST handle unavailable; events buffered; health shows dependent degraded with cause | M5 | deferred(M5) | — | — |
+| 7.9-9 | §7.9.4 | Missing/disabled optional deps turn related features off; dependents receive dependency lifecycle events | M5 | deferred(M5) | — | — |
+| 7.9-10 | §7.9.5 | Provider upgrade removing interface major, event version, extension-point schema or exported permission only when every dependent declares compatibility; else coordinated plan or refusal with explanation | M5 | deferred(M5) | — | — |
+| 7.9-11 | §7.9.5 | Provider rollback only to a retained version satisfying every enabled dependent, else dependents rolled back in same plan; canary cohorts include the whole plan | M5 | deferred(M5) | — | — |
+| 7.9-12 | §7.9.6 | Removing a provider refused while required dependents remain unless plan removes them; optional dependents notified; retained provider data not accessible to dependents; dependent resources cannot outlive required provider | M5 | deferred(M5) | — | — |
+| 7.9-13 | §7.9.7 | A dependency grants no permissions; consuming another plugin's interface is a declared, approved capability | M5 | deferred(M5) | — | — |
+| 7.9-14 | §7.9.7 | Every inter-plugin call via broker carries caller identity and acting principal; provider authorizes both; authority never grows along a chain (per-hop intersection) | M5 | deferred(M5) | — | — |
+| 7.9-15 | §7.9.7 | Providers MUST treat input from dependents as untrusted | M5 | deferred(M5) | — | — |
+| 7.9-16 | §7.9.7 | Extension-point contributions are declarative data validated against schema; contributed code runs in contributor's runtime and origin, never provider's | M5 | deferred(M5) | — | — |
+| 7.9-17 | §7.9.8 | Photos-on-Drive worked example | — | n/a(illustrative reference-app example; app functional design out of scope per §1.3) | — | — |
+| 8.1-1 | §8.1 | Each datum has exactly one authoritative owner; others hold only references or rebuildable derived copies | M0 | in-progress | cs-db domain separation | review (gate §4) |
+| 8.1-2 | §8.1 | Apps access own data via storage bindings; other data only via core APIs or interfaces | M5 | deferred(M5) | — | — |
+| 8.2-1 | §8.2 | Storage classes (objects, records, live docs, settings, cache, search documents, queues/jobs) are tenant-scoped, quota-accounted, covered by backup and recovery | M5 | deferred(M5) | — | — |
+| 8.2-2 | §8.2 | Cache class (Valkey) is non-authoritative and may be lost at any time | M2 | deferred(M2) | — | — |
+| 8.3-1 | §8.3 | Each app declaring relational storage gets its own YSQL database, role, tablespace placement and pool budget | M5 | deferred(M5) | — | — |
+| 8.3-2 | §8.3 | Every app table MUST have tenant_id as the first primary-key column | M5 | deferred(M5) | — | — |
+| 8.3-3 | §8.3 | Tenant isolation never relies on a session setting that app code can change | M5 | deferred(M5) | — | — |
+| 8.3-4 | §8.3 | Apps hold no DB credentials and cannot open connections; all access via host data interface on host-owned connections | M5 | deferred(M5) | — | — |
+| 8.3-5 | §8.3, erratum C7 | Host accepts only SELECT, INSERT, UPDATE, DELETE and UPSERT (= INSERT … ON CONFLICT) on the app's own tables/views plus a fixed builtin-function allowlist | M5 | deferred(M5) | — | — |
+| 8.3-6 | §8.3 | Rejects SET, RESET, set_config, DO blocks, transaction control, DDL, COPY, non-allowlisted function/procedure calls, other schemas/catalogs and multiple statements; transactions opened/closed by host API | M5 | deferred(M5) | — | — |
+| 8.3-7 | §8.3 | Host binds tenant from authenticated invocation; caller tenant_id ignored or rejected; tenant_id injected on INSERT/UPSERT; UPDATE cannot change tenant_id; connections reset and verified before reuse | M5 | deferred(M5) | — | — |
+| 8.3-8 | §8.3 | Mandatory AST validation with pinned PostgreSQL-compatible parser (no regex): exactly one statement; explicit allowlist; unknown nodes fail closed; CTEs/nested recursively validated; all objects resolve to app migration registry; security-invoker views only; prepared statements validated; parameters typed and bound, never interpolated | M5 | deferred(M5) | — | — |
+| 8.3-9 | §8.3 | RLS second layer created by core runner as a role the app cannot assume; USING and WITH CHECK on tenant_id; app role does not own tables, FORCE RLS on every table, no BYPASSRLS/CREATE/TEMPORARY/role membership | M5 | deferred(M5) | — | — |
+| 8.3-10 | §8.3 | App DDL only via core migration runner, which validates, adds tenant_id and RLS to new tables and rejects anything weakening them | M5 | deferred(M5) | — | — |
+| 8.3-11 | §8.3 | Every app release and core release runs cross-tenant isolation suite against the app schema; core samples production queries for tenant-predicate coverage | M5 | deferred(M5) | — | — |
+| 8.3-12 | §8.3 | Schema size/tablet limits (policy); query time, rows, bytes, memory, temp storage and concurrent tx bounded per app and tenant; workload declaration; budgets reserved before enablement | M5 | deferred(M5) | — | — |
+| 8.3-13 | §8.3 | App transactions stay within app DB; core changes via host API; cross-database consistency via outbox and sagas | M5 | deferred(M5) | — | — |
+| 8.3-14 | §8.3 | Host provides an outbox table per app DB; events in same tx delivered at least once | M5 | deferred(M5) | — | — |
+| 8.3-15 | §8.3 | Partitioned record log (append-only, hash-partitioned, time retention) available via host API | M5 | deferred(M5) | — | — |
+| 8.3.1-1 | §8.3.1 | App DBs have independent pools, query/tablet/storage/compaction budgets and admission control; a noisy app cannot consume capacity reserved for identity, authz, resources, objects, cluster, revocation or audit | M5 | deferred(M5) | — | — |
+| 8.3.1-2 | §8.3.1 | Logical domain separation mandatory; physical separation chosen by measured isolation, never assumed away by DB names | M0 | in-progress | cs-db per-domain connection config (contract §5) | qa:readiness::readyz_503_lists_unreachable_domain_barrier |
+| 8.3.1-3 | §8.3.1 | Critical cluster holds identity, authz, resources, objects, cluster, operations; collab, events, audit, app DBs may be separate; cross-cluster transactions prohibited | M0 | in-progress | cs-db::DomainPool::transaction (single-domain borrow) | review: no cross-domain tx API (gate §4) |
+| 8.3.1-4 | §8.3.1 | Placement, leader balance, compaction pressure, replication lag and pool saturation monitored per domain and app; headroom reserved for revocation, recovery, repair | M8 | deferred(M8) | — | — |
+| 8.4-1 | §8.4 | Every storage class accounted per tenant, per user (owner) and per application | M3 | deferred(M3) | — | — |
+| 8.4-2 | §8.4 | Records and live documents count stored bytes toward owner or tenant as declared per type | M5 | deferred(M5) | — | — |
+| 8.4-3 | §8.4 | Quotas enforced by reservations (conditional updates failing on limit); usage reconciled periodically from authoritative stores | M3 | deferred(M3) | — | — |
+| 8.5-1 | §8.5 | Every application MUST implement per-user and per-tenant export in documented formats via the export interface | M9 | deferred(M9) | — | — |
+| 8.5-2 | §8.5 | Core orchestrates tenant-wide and per-user export and import incl. resources, permissions and versions | M9 | deferred(M9) | — | — |
+| 8.6-1 | §8.6 | Uninstalling retains or deletes app data as chosen (§7.5) | M5 | deferred(M5) | — | — |
+| 8.6-2 | §8.6 | Tenant deletion is a saga: suspension, purge, destroy tenant KEK after recovery window (crypto-shredding), reclamation | M8 | deferred(M8) | — | — |
+| 8.7-1 | §8.7 | Vault resources encrypted by client SDK; server components/services only receive ciphertext and core metadata | M9 | deferred(M9) | — | — |
+| 8.7-2 | §8.7 | Plaintext-needing server features unavailable for vault data unless implemented client-side | M9 | deferred(M9) | — | — |
+| 9.1-1 | §9.1 | Interfaces are named versioned contracts in WIT with JSON Schema mapping for REST bridge, published in interface registry | M5 | deferred(M5) | — | — |
+| 9.1-2 | §9.1 | Plugins declare interfaces provided/consumed; reached via plugin or interface dependency; admin chooses default provider | M5 | deferred(M5) | — | — |
+| 9.1-3 | §9.1 | Core interfaces cs:platform/* cover resources, objects, authorization, sharing, directory, notifications, discussions, activity, search, events, settings, secrets, live documents | M5 | deferred(M5) | — | — |
+| 9.2-1 | §9.2 | Broker resolves provider, checks declared dependency and capability, propagates principal, applies deadlines and per-caller rate limits, records traces | M5 | deferred(M5) | — | — |
+| 9.2-2 | §9.2 | Provider authorizes against acting principal; interface calls never escalate privileges | M5 | deferred(M5) | — | — |
+| 9.2-3 | §9.2 | Calls have deadlines and are retried only if declared idempotent; disabled/unavailable providers return typed unavailable which consumers MUST handle | M5 | deferred(M5) | — | — |
+| 9.3-1 | §9.3 | Apps publish manifest-declared typed events; subscribers limited to permitted types; events carry references and minimal data; details read with permission checks | M5 | deferred(M5) | — | — |
+| 9.4-1 | §9.4 | Attach/link by reference, never copy unless user explicitly copies; referencing apps get events and show unavailable references | M5 | deferred(M5) | — | — |
+| 9.5-1 | §9.5 | Embeds/previews (static preview, live embed, smart chip) via docs.embed/media.preview; live embeds in provider origin sandboxed frames | M5 | deferred(M5) | — | — |
+| 9.6-1 | §9.6 | UI intents routed by shell to user's default handler; declared in manifests; caller need not know the handler | M5 | deferred(M5) | — | — |
+| 9.7-1 | §9.7 | Notifications: in-app, push, email via configured relay independent of any Mail app; user preferences per app and type | M4 | deferred(M4) | — | — |
+| 9.7-2 | §9.7 | Activity feed per resource and per user built from events, filtered by permission | M4 | deferred(M4) | — | — |
+| 9.7-3 | §9.7 | Discussions: anchored comment threads with mentions, assignments, resolution; governed by commenter relation; shared component | M4 | deferred(M4) | — | — |
+| 9.7-4 | §9.7 | Preview/thumbnail framework with registered generators per content type | M5 | deferred(M5) | — | — |
+| 9.7-5 | §9.7 | Shared mentions and assignments model | M4 | deferred(M4) | — | — |
+| 9.8-1 | §9.8 | All dependencies declared, versioned, resolved by core; undeclared calls rejected by broker; internals never reachable | M5 | deferred(M5) | — | — |
+| 9.8-2 | §9.8 | Required deps block install/enable when unsatisfied; plugins must tolerate unavailable, disabled, upgraded, replaced or removed providers | M5 | deferred(M5) | — | — |
+| 10.1-1 | §10.1 | One WebSocket per client to a realtime node, token-authenticated (refreshed in-band), multiplexing channels | M6 | deferred(M6) | — | — |
+| 10.1-2 | §10.1 | Protocol versioned and negotiated at setup; binary frames with channel ID, message type, payload | M6 | deferred(M6) | — | — |
+| 10.1-3 | §10.1 | Joining a channel requires authz check; gateway subscribes to revocation feed and closes revoked channels | M6 | deferred(M6) | — | — |
+| 10.1-4 | §10.1 | Gateways stateless apart from connections; lost gateway only forces reconnect/resync | M6 | deferred(M6) | — | — |
+| 10.1-5 | §10.1 | Per-connection and per-tenant limits on channels, message rate, buffered bytes; slow consumers disconnected | M6 | deferred(M6) | — | — |
+| 10.2-1 | §10.2 | Core CRDT engine is yrs; Yjs-compatible wire protocol (sync step 1/2, updates, awareness) | M6 | deferred(M6) | — | — |
+| 10.2-2 | §10.2 | Each collaboration model MUST declare max state size, partitioning key, concurrent-editor target, snapshot strategy, schema migration, merge/conflict behavior | M6 | deferred(M6) | — | — |
+| 10.2-3 | §10.2 | Yrs types: schema over CRDT structures plus optional validator and server-side derivations | M6 | deferred(M6) | — | — |
+| 10.2-4 | §10.2 | Validators run on host before commit; rejected update returned with error and client rolls back | M6 | deferred(M6) | — | — |
+| 10.2-5 | §10.2 | Host's committed update sequence is the authoritative durable history | M6 | deferred(M6) | — | — |
+| 10.3-1 | §10.3 | Exactly one document host per active live document | M6 | deferred(M6) | — | — |
+| 10.3-2 | §10.3 | Documents map to collaboration partitions by hash, leased with epochs; update-log commit checks partition epoch so stale host cannot commit | M6 | deferred(M6) | — | — |
+| 10.3-3 | §10.3 | Host failure moves partitions; new host loads snapshot+log; clients resync via state vectors | M6 | deferred(M6) | — | — |
+| 10.3-4 | §10.3 | Editing limited per document (policy default 200 concurrent editors); extra users join as viewers; broadcast fan-out trees | M6 | deferred(M6) | — | — |
+| 10.4-1 | §10.4 | Yrs updates batched per document (default up to 50 ms) and appended to collab update log (hash by doc ID, ordered by sequence) | M6 | deferred(M6) | — | — |
+| 10.4-2 | §10.4 | Edit acknowledged only after authoritative local transaction commits (Raft majority) | M6 | deferred(M6) | — | — |
+| 10.4-3 | §10.4 | Compaction at threshold (default 1,000 updates or 4 MiB): snapshot as object, record pointer and sequence; compacted entries retained through recovery window | M6 | deferred(M6) | — | — |
+| 10.4-4 | §10.4 | Each model records snapshot pointer, last committed position, partition epoch, schema version | M6 | deferred(M6) | — | — |
+| 10.5-1 | §10.5 | Join requires view; updates require edit; comment-only users use discussions and cannot change content | M6 | deferred(M6) | — | — |
+| 10.5-2 | §10.5 | Host rechecks edit permission on revocation/ACL change and downgrades or disconnects sessions | M6 | deferred(M6) | — | — |
+| 10.6-1 | §10.6 | Awareness state ephemeral, never persisted; global presence in Valkey with short TTLs | M6 | deferred(M6) | — | — |
+| 10.7-1 | §10.7 | History checkpoints (policy default every 30 min of activity and when last editor leaves) are versions following version retention | M6 | deferred(M6) | — | — |
+| 10.7-2 | §10.7 | Named versions, browse, compare, restore by applying a transforming update | M6 | deferred(M6) | — | — |
+| 10.8-1 | §10.8 | Offline Yrs edits merged by state vector; validators run before durable commit | M6 | deferred(M6) | — | — |
+| 10.8-2 | §10.8 | Non-CRDT models define offline log, version checks, merge and reauthorization; MUST NOT claim CRDT convergence unless provided | M6 | deferred(M6) | — | — |
+| 10.9-1 | §10.9 | Vault live docs: clients encrypt updates; host stores opaque updates, cannot validate or compact; member client compacts | M9 | deferred(M9) | — | — |
+| 10.10-1 | §10.10 | Host/gateway/minority replica failure: no loss of acknowledged edits | M6 | deferred(M6) | — | — |
+| 10.10-2 | §10.10 | Log archiving: closed ranges sealed into object storage (default 60 s or 4 MiB per doc); retained for recovery window; loss without DB bounded by archive interval | M8 | deferred(M8) | — | — |
+| 10.10-3 | §10.10 | Snapshots only shorten replay, never bound loss; restores never fork documents | M8 | deferred(M8) | — | — |
+| 10.11-1 | §10.11 | Media (Meet) provided by an application; core provides signaling, permissions, scheduling interfaces, recording storage | M6 | deferred(M6) | — | — |
+| 11.1-1 | §11.1 | Every event has ID, type, version, source, tenant, subject refs, acting principal, DB-time timestamp, small payload | M4 | deferred(M4) | cs-db outbox row shape (M0) | qa:outbox::outbox_schema_matches_contract |
+| 11.1-2 | §11.1 | Events originate only from transactional outboxes; an event exists iff its change committed | M0 | in-progress | cs-db::Outbox::append (only write path) | qa:outbox::rollback_leaves_no_gap |
+| 11.1-3 | §11.1 | Relays move outbox entries to partitioned event log in events domain keyed by (tenant, partition key), retained policy default 7 days and at least recovery window for core events | M4 | deferred(M4) | — | — |
+| 11.2-1 | §11.2 | At-least-once delivery ordered per partition key (default subject resource ID); no cross-key order | M4 | deferred(M4) | — | — |
+| 11.2-2 | §11.2 | Consumers track offsets per partition and MUST be idempotent, deduplicating by event ID | M4 | deferred(M4) | — | — |
+| 11.2-3 | §11.2 | Failed deliveries retried with backoff, dead-lettered after policy attempts; DLQs visible to consuming app admins | M4 | deferred(M4) | — | — |
+| 11.3-1 | §11.3 | Bus filters events by tenant enablement and subscriber capabilities; core consumers use same mechanism | M4 | deferred(M4) | — | — |
+| 11.4-1 | §11.4 | Outbound webhooks signed with HMAC per-endpoint secret, retried with backoff, subject to network policy | M4 | deferred(M4) | — | — |
+| 11.5-1 | §11.5 | Client push over realtime is best-effort; clients reconcile via sync feeds | M6 | deferred(M6) | — | — |
+| 12.1-1 | §12.1 | Apps publish search documents; core indexes names and metadata of every type automatically | M7 | deferred(M7) | — | — |
+| 12.1-2 | §12.1 | Event-driven indexing with index lag target 5 s (policy) | M7 | deferred(M7) | — | — |
+| 12.1-3 | §12.1 | Text extraction by registered extractor components | M7 | deferred(M7) | — | — |
+| 12.1-4 | §12.1 | Vault content never indexed server-side; only client-chosen non-sensitive metadata | M9 | deferred(M9) | — | — |
+| 12.2-1 | §12.2 | Search nodes embed Tantivy; shards by tenant (and resource hash for large tenants) with replicas; rebuilt from authoritative stores and event log | M7 | deferred(M7) | — | — |
+| 12.3-1 | §12.3 | Search docs store ACL anchor and anchor access set; ACL change updates one anchor's entries | M7 | deferred(M7) | — | — |
+| 12.3-2 | §12.3 | Query filtered by caller principals and group closure, then verified with authorization checks before return | M7 | deferred(M7) | — | — |
+| 12.3-3 | §12.3 | Client consistency tokens force verification against fresh authz data | M7 | deferred(M7) | — | — |
+| 12.3.1-1 | §12.3.1 | Search never an authz authority; every candidate checked at snapshot ≥ query context before any title, snippet, count, facet or existence signal | M7 | deferred(M7) | — | — |
+| 12.3.1-2 | §12.3.1 | Access sets are candidate filters only; groups expanded once per query into bounded handle; large groups use bitmap/segment filters | M7 | deferred(M7) | — | — |
+| 12.3.1-3 | §12.3.1 | Hard limits on candidates, batch size, time, memory, results, fan-out; at limit return explicit incomplete result, never unchecked candidates | M7 | deferred(M7) | — | — |
+| 12.3.1-4 | §12.3.1 | ACL changes invalidate access-set generations via revocation feed; lag may omit but never leak; readiness requires source watermark and epoch | M7 | deferred(M7) | — | — |
+| 12.4-1 | §12.4 | Global search groups by application; scoped app search; federated query handlers merged under time budget | M7 | deferred(M7) | — | — |
+| 13.1-1 | §13.1 | Sync feeds: ordered change streams per space built from resources journal; opaque cursor with space, position, filter | M7 | deferred(M7) | — | — |
+| 13.1-2 | §13.1 | Feed emits additions/removals when caller gains or loses access to a subtree | M7 | deferred(M7) | — | — |
+| 13.1-3 | §13.1 | Cursor lifetime default 30 days; journal+archive retain positions ≥ max(cursor lifetime, recovery window, max snapshot build time); expired cursor requires full resync | M7 | deferred(M7) | — | — |
+| 13.1.1-1 | §13.1.1 | Cursor carries protocol major, feed generation, space ID, shard positions, filter digest, authz epoch, expiry | M7 | deferred(M7) | — | — |
+| 13.1.1-2 | §13.1.1 | Cursor accepted only while protocol/schema supported and journal range contiguous; else cursor_expired or client_upgrade_required with minimum version and full-resync instruction (see OQ-3: codes not in D.2) | M7 | deferred(M7) | — | — |
+| 13.1.1-3 | §13.1.1 | Offline clients never replay a mutation against a different generation or epoch without fresh authz check; revoked content removed from managed caches on next sync | M7 | deferred(M7) | — | — |
+| 13.1.1-4 | §13.1.1 | Migrations preserve a reader for previous offline schema for one compatibility window; unsupported schemas read-only or exported, never silently rewritten or discarded | M7 | deferred(M7) | — | — |
+| 13.2-1 | §13.2 | File sync provided by Drive on core sync feeds and object API | M7 | deferred(M7) | — | — |
+| 13.2-2 | §13.2 | Upload with expected head; conflict when head changed; client saves conflict copy unless type merges | M7 | deferred(M7) | — | — |
+| 13.2-3 | §13.2 | Chunk reuse only from earlier versions of the same resource the caller can read; never matched by hash across resources | M3 | deferred(M3) | — | — |
+| 13.3-1 | §13.3 | Live docs sync via collaboration protocol; apps' offline records follow same cursor and conflict conventions | M7 | deferred(M7) | — | — |
+| 14.1-1 | §14.1 | Web shell is a platform component at main origin providing sign-in, launcher, navigation, account menu, search, notifications, activity, settings, admin | M0 | in-progress | web/apps/shell (skeleton; features M1+) | frontend tests |
+| 14.1-2 | §14.1 | Shell owns URL space: /{app-id}/..., /s/{share-token}, /r/{resource-urn} | M2 | deferred(M2) | — | — |
+| 14.2-1 | §14.2 | Each app UI served from its own origin {app-id}.apps.{domain} | M5 | deferred(M5) | — | — |
+| 14.2-2 | §14.2 | Apps obtain tokens for their origin from shell via authorization-code + PKCE without seeing credentials | M5 | deferred(M5) | — | — |
+| 14.2-3 | §14.2 | Embedded mode: contributed surfaces in sandboxed frames from contributor's origin via message API | M5 | deferred(M5) | — | — |
+| 14.2-4 | §14.2 | Full mode disabled by default; requires tenant-admin approval of exact digest and per-user activation; short-lived grants bound to user, tenant, digest, session; persistent indicator; immediate deactivation | M9 | deferred(M9) | — | — |
+| 14.2-5 | §14.2 | Installation or enablement alone MUST NOT activate full mode | M9 | deferred(M9) | — | — |
+| 14.2-6 | §14.2 | Platform MUST provide a policy to prohibit full mode entirely | M9 | deferred(M9) | — | — |
+| 14.3-1 | §14.3 | TypeScript UI SDK framework-independent (web components + small runtime): API clients, realtime client, CRDT bindings, message API, intents, theme, localization | M0 | in-progress | web/packages/sdk (M0: ApiClient, Problem, RetryPolicy, IdempotencyKey, tokens) | frontend tests |
+| 14.3-2 | §14.3 | Shared components: share dialog, resource/people pickers, comments, version history, activity, upload, preview, notifications, shell header | M2 | deferred(M2) | web/packages/components (M0 base set) | — |
+| 14.3-3 | §14.3 | Design system defines tokens (colors, typography, spacing), accessibility rules, component behavior | M0 | in-progress | web/packages/sdk design tokens | frontend tests |
+| 14.4-1 | §14.4 | Contributed surfaces run in contributor's origin in sandboxed frames with strict CSP; data crosses only via message API within user permissions | M5 | deferred(M5) | — | — |
+| 14.4-2 | §14.4 | Shell resolves open requests to preferred handler, falling back to owning app | M5 | deferred(M5) | — | — |
+| 14.5-1 | §14.5 | Native desktop/mobile clients with sync, offline, push, vault crypto, OS integration; signed and reproducibly built | — | n/a(out of scope until decided, IMPLEMENTATION_PLAN §5) | — | — |
+| 14.6-1 | §14.6 | Core UI and shared components meet WCAG 2.2 AA; apps using design system validated at install | M0 | in-progress | web/packages/components | frontend a11y tests; gate §3 |
+| 14.6-2 | §14.6 | All user-facing strings localized through the SDK; apps ship translations | M0 | in-progress | web/packages/sdk localization fn | frontend tests; gate §3 |
+| 15.1-1 | §15.1 | Trust zones: core fully trusted; apps limited to approved capabilities; users untrusted input; native clients trusted for vault crypto, web clients server-trusting | M0 | in-progress | design rule | review |
+| 15.2-1 | §15.2 | Every core record, app record, object, live doc, event, index entry and cache key carries tenant ID set from authenticated context; apps cannot choose it | M0 | in-progress | App. E conventions; cs-db (M0 outbox/idempotency tables carry tenant_id) | qa:idempotency::schema_matches_contract; qa:outbox::outbox_schema_matches_contract |
+| 15.2-2 | §15.2 | Isolation in depth: RLS, tenant-scoped key prefixes, tenant-bound tokens, per-tenant encryption keys | M5 | deferred(M5) | — | — |
+| 15.2-3 | §15.2 | No resource, chunk or event crosses tenants; external sharing makes users guests of the sharing tenant | M2 | deferred(M2) | — | — |
+| 15.3-1 | §15.3 | App isolation: processes/sandboxes, DBs and roles, cache prefixes, object namespaces, origins; host calls authorized per invocation; no infra credentials; outbound network denied by default | M5 | deferred(M5) | — | — |
+| 15.4-1 | §15.4 | App secrets in core secret store, encrypted under tenant keys, released only to declaring app at use time | M5 | deferred(M5) | — | — |
+| 15.4-2 | §15.4 | Secrets never appear in logs, events, exports or search (M0: Secret<T> redaction, no key/token logging) | M0 | in-progress | cs-common Secret<T>; cs-kms | qa:http_surface::error_responses_never_leak_internals; review |
+| 15.5-1 | §15.5 | Node-to-node mTLS 1.3 with cluster-CA certificates encoding roles; peers enforce roles | M8 | deferred(M8) | — | — |
+| 15.5-2 | §15.5 | External endpoints TLS 1.3; TLS 1.2 only as restricted fallback (ECDHE+AEAD) that can be disabled | M1 | deferred(M1) | — | — |
+| 15.5-3 | §15.5 | Services expose only declared ports; public ports via edge with high-risk approval; egress filtered per manifest | M9 | deferred(M9) | — | — |
+| 15.6-1 | §15.6 | TLS everywhere in transit | M1 | deferred(M1) | — | — |
+| 15.6-2 | §15.6 | At rest: per-chunk content key wrapped by tenant KEK under KMS root; YugabyteDB on encrypted volumes; field-level encryption for sensitive app fields | M3 | deferred(M3) | cs-kms (M0 wrap/unwrap) | — |
+| 15.6-3 | §15.6 | Crypto-shredding: destroying tenant key makes server-encrypted content unreadable; destroying CK makes chunk unreadable | M8 | deferred(M8) | — | — |
+| 15.7-1 | §15.7 | Vault keys: account Ed25519 signing, X25519 agreement, device keys, optional device-only key; epoch-versioned, HPKE-wrapped | M9 | deferred(M9) | — | — |
+| 15.7-2 | §15.7 | Key bundles wrapped by OPAQUE-export key, recovery key, device keys, optional PRF key; device-only bundle only by device keys and recovery key | M9 | deferred(M9) | — | — |
+| 15.7-3 | §15.7 | Device approval uses short authentication string; contacts' signing keys pinned on first use with fingerprint verification | M9 | deferred(M9) | — | — |
+| 15.7-4 | §15.7 | Account recovery never unlocks vaults; vault recovery via recovery key or device approval | M9 | deferred(M9) | — | — |
+| 15.7-5 | §15.7 | Web client server-trusting with reproducible builds, public release log, optional verifier; native-only vaults wrap only to device-only keys | M9 | deferred(M9) | — | — |
+| 15.8-1 | §15.8 | Security-relevant actions recorded in audit domain; apps record via audit interface and cannot modify or delete entries | M4 | deferred(M4) | — | — |
+| 16.1-1 | §16.1 | Reference application platform-usage table | — | n/a(reference-app functional design out of scope per §1.3; minimal Drive tracked as 16.1-2) | — | — |
+| 16.1-2 | §16.1, §4.3 | Minimal Drive plugin: drive.folder container, drive.file object-backed, containable-types extension point, built on the real plugin architecture | M5 | deferred(M5) | — | — |
+| 16.2-1 | §16.2 | Reference dependency graph; Calendar and Meet reference each other only optionally so required graph stays acyclic | — | n/a(reference apps other than minimal Drive out of scope, IMPLEMENTATION_PLAN §5; acyclicity rule tracked in 7.9-5) | — | — |
+| 16.2-2 | §16.2 | Every application replaceable by another plugin exporting compatible interfaces and extension points | M5 | deferred(M5) | — | — |
+| 17.1-1 | §17.1 | Data model: object version (resources), chunk/seal/extent (objects), upload session (resources) with the listed key fields and states | M3 | deferred(M3) | — | — |
+| 17.1-2 | §17.1 | Chunk ID and extent ID are 128-bit random, server-assigned (contract: UUIDv4 layout, not v7) | M0 | in-progress | cs-common::id ChunkId, ExtentId | qa:ids::chunk_and_extent_ids_are_random_v4 |
+| 17.1-3 | §17.1 | Chunk content and encryption depend only on chunk ID and seal ID; chunk referenceable by any versions of any resources in same tenant; chunks never cross tenants | M3 | deferred(M3) | — | — |
+| 17.1-4 | §17.1 | Manifest entry = (chunk ID, seal ID at commit, plaintext offset, length, plaintext BLAKE3); version integrity from manifest | M3 | deferred(M3) | — | — |
+| 17.1-5 | §17.1 | Extent IDs never reused; every write attempt incl. retry to same node gets new extent ID | M3 | deferred(M3) | — | — |
+| 17.1-6 | §17.1 | Owning resource is only a placement/reconstruction hint; correctness never depends on it | M3 | deferred(M3) | — | — |
+| 17.1-7 | §17.1 | Default chunk size 4 MiB (policy); content below 4 KiB stored inline with version, encrypted the same way | M3 | deferred(M3) | — | — |
+| 17.2-1 | §17.2 | Key hierarchy: KMS root → tenant KEK (versioned, rotated) → CK (256-bit random per chunk, wrapped in chunk row and sidecar) → SK = HKDF-SHA-256(CK, "cs/v2/seal", tenant ‖ chunk ‖ seal ‖ salt ‖ alg), salt 128 random bits per seal | M3 | deferred(M3) | cs-kms (M0 KEK wrap) | — |
+| 17.2-2 | §17.2 | API nodes hold unwrapped tenant KEKs in locked memory for bounded time (policy default 1 hour) | M3 | deferred(M3) | — | — |
+| 17.2-3 | §17.2 | Randomness from OS CSPRNG via audited library; entropy failure fails the operation; no timestamp/PRNG/counter fallback | M0 | in-progress | cs-crypto::rand | review (no fallback path; gate §4) |
+| 17.2-4 | §17.2 | A nonce MUST NOT repeat under the same AEAD key; retries resend identical sealed bytes or new seal; uncertain key/nonce state requires fresh SK and seal ID | M3 | deferred(M3) | — | — |
+| 17.2-5 | §17.2, erratum C10 | Sealed format v1 is non-production-stable; MUST NOT be represented as production-ready until independent review has no unresolved critical/high findings; test vectors and fuzzing required | M3 | deferred(M3) | — | — |
+| 17.2-6 | §17.2 | Header canonical, fixed 144 bytes, big-endian, exact field layout (magic CSSL, version 1, alg ID, compression ID, flags, segment size, IDs, salt, L, P, N, commitment) | M3 | deferred(M3) | — | — |
+| 17.2-7 | §17.2 | Algorithm IDs 1 AES-256-GCM, 2 ChaCha20-Poly1305, 3 XChaCha20-Poly1305 (vaults only); compression IDs 0 none, 1 LZ4, 2 Zstd, 3 xz | M3 | deferred(M3) | — | — |
+| 17.2-8 | §17.2 | Segment size default 65,536, range 4,096 to 1,048,576; N = max(1, ceil(P/S)) | M3 | deferred(M3) | — | — |
+| 17.2-9 | §17.2 | Payload is whole plaintext compressed as one frame; decompression MUST produce exactly L bytes else chunk damaged; explicit output, ratio, CPU, memory limits; authenticated metadata validated before allocation/decompression | M3 | deferred(M3) | — | — |
+| 17.2-10 | §17.2 | Header parsing rejects unknown flag bits, unsupported alg/compression, noncanonical lengths, overflow, impossible segment counts, inconsistent lengths | M3 | deferred(M3) | — | — |
+| 17.2-11 | §17.2 | Commitments compared in constant time; key material zeroized and never logged; algorithm allowlisted by tenant policy, downgrade rejected | M3 | deferred(M3) | — | — |
+| 17.2-12 | §17.2 | Nonces alg 1/2: 0x000000 ‖ i (8) ‖ f (1) with f=1 on last segment; alg 3: random 192-bit nonce per segment | M3 | deferred(M3) | — | — |
+| 17.2-13 | §17.2 | AD_i = BLAKE3-256(header) ‖ i ‖ f for every segment | M3 | deferred(M3) | — | — |
+| 17.2-14 | §17.2 | Key commitment = HKDF-SHA-256(CK, "cs/v2/commit", chunk ‖ seal ‖ salt, 32); vault: HKDF(vault chunk key, "cs/v2/vault-commit", chunk ‖ vault ID); readers MUST verify before decrypting | M3 | deferred(M3) | — | — |
+| 17.2-15 | §17.2 | Ciphertext BLAKE3 over complete sealed object as stored | M3 | deferred(M3) | — | — |
+| 17.2-16 | §17.2 | Algorithm policy: AES-256-GCM with AES acceleration, else ChaCha20-Poly1305 | M3 | deferred(M3) | — | — |
+| 17.2-17 | §17.2 | Client sealing default: API node creates chunk ID, seal ID, salt, CK and gives client SK over TLS bound to session; CK never leaves server; client sealing is not E2EE | M3 | deferred(M3) | — | — |
+| 17.2-18 | §17.2 | Proxy sealing for clients that cannot seal | M3 | deferred(M3) | — | — |
+| 17.2-19 | §17.2 | Downloads: API node gives SK per readable seal with read plan; client verifies commitment and tags | M3 | deferred(M3) | — | — |
+| 17.2-20 | §17.2 | Storage nodes never hold CK or SK; replication, repair, transcoding, scrubbing work on ciphertext | M3 | deferred(M3) | — | — |
+| 17.2-21 | §17.2 | Client-supplied plaintext hashes verified on first server decrypt; mismatch marks version damaged and notifies uploader | M3 | deferred(M3) | — | — |
+| 17.2-22 | §17.2 | KEK rotation re-wraps CKs in background: KEK version per chunk row, CAS per chunk, new sidecar version, resumable cursor, both versions readable; old KEK retired only when unreferenced and destroyed after recovery window | M8 | deferred(M8) | cs-kms rotate (M0 portion) | — |
+| 17.2-23 | §17.2 | CK rotation creates new seal swapped in by publication; interruption leaves old seal current | M8 | deferred(M8) | — | — |
+| 17.2-24 | §17.2 | Tenant manifest-key rotation follows KEK rotation procedure | M8 | deferred(M8) | — | — |
+| 17.2-25 | §17.2 | On reclaim, wrapped CK destroyed after recovery window; tenant deletion destroys KEK after recovery window | M8 | deferred(M8) | — | — |
+| 17.2-26 | §17.2 | Vault chunks: random vault chunk key wrapped by vault epoch key; algorithm 3, vault flag and ID; commitment mandatory and client-verified; server verifies only ciphertext BLAKE3 | M9 | deferred(M9) | — | — |
+| 17.3-1 | §17.3, erratum C4 | Exactly four tiers: Hot, Standard, Cold, Archive | M3 | deferred(M3) | — | — |
+| 17.3-2 | §17.3, erratum C3 | Hot/Standard: R replicas (default 3); publication requires R durable receipts from R distinct failure domains; W ≡ R, no W=min(2,R) shortcut | M3 | deferred(M3) | — | — |
+| 17.3-3 | §17.3 | Cold/Archive LRC reached only by transcoding with all fragments durable and parity verified before switch | M8 | deferred(M8) | — | — |
+| 17.3-4 | §17.3 | Degraded-publication mode only for non-durable staging data; never publishes a version, returns durable success or counts as committed | M3 | deferred(M3) | — | — |
+| 17.3-5 | §17.3 | After publication repair maintains R domains; below R object marked degraded, repair prioritized, console shows exact remaining tolerance; never claims more than actual placement tolerates | M8 | deferred(M8) | — | — |
+| 17.3-6 | §17.3 | LRC coefficients MUST be maximally recoverable; build-time enumeration verifies every claimed erasure pattern; only measured effective tolerance advertised | M8 | deferred(M8) | — | — |
+| 17.3-7 | §17.3 | Chunks below LRC minimum (default 1 MiB) remain replicated in every tier | M8 | deferred(M8) | — | — |
+| 17.3.1-1 | §17.3.1 | Durability and availability reported separately based on actual placement, not nominal settings | M3 | deferred(M3) | — | — |
+| 17.3.1-2 | §17.3.1 | Hot object acknowledged published only after R durable receipts across R distinct domains; if placement cannot satisfy, publication unavailable; W never lowered silently | M3 | deferred(M3) | — | — |
+| 17.3.1-3 | §17.3.1 | Single host protects only against independent disk failures; UI/API label "single-host durability" and show last verified off-host backup | M3 | deferred(M3) | — | — |
+| 17.3.1-4 | §17.3.1 | Metadata (RF3) guarantees independent of object-storage guarantees | M8 | deferred(M8) | — | — |
+| 17.3.1-5 | §17.3.1 | Every object reports effective tolerance by disk/node/rack/zone/site; cluster guarantee = minimum across published objects | M3 | deferred(M3) | — | — |
+| 17.3.1-6 | §17.3.1 | Degraded object never reported as fully protected during repair | M8 | deferred(M8) | — | — |
+| 17.3.2-1 | §17.3.2 | LRC requires ≥ n+1 failure domains at placement level; validator enforces: < 11 domains replication R=3 (LRC prohibited); 11–16 LRC(6,2,2); ≥ 17 LRC(12,2,2) | M8 | deferred(M8) | — | — |
+| 17.3.2-2 | §17.3.2 | Placement level is highest level with enough domains; disk-level LRC never used | M8 | deferred(M8) | — | — |
+| 17.3.2-3 | §17.3.2 | Report theoretical (d−1) and effective tolerance per level; SLOs use effective | M8 | deferred(M8) | — | — |
+| 17.3.2-4 | §17.3.2 | Degraded placement rules: pause transcoding; reuse domain only for different local group keeping node tolerance ≥ 1; else transcode back to replication | M8 | deferred(M8) | — | — |
+| 17.3.2-5 | §17.3.2 | Below LRC threshold longer than policy (default 7 days): transcode back and alert | M8 | deferred(M8) | — | — |
+| 17.3.2-6 | §17.3.2 | Two fragments of same local group MUST NOT share a correlated failure domain; representation below tier minimum never published | M8 | deferred(M8) | — | — |
+| 17.3.2-7 | §17.3.2, erratum C4 | Compression before sealing: LZ4 Hot, Zstandard Standard and Cold, Zstd max or LZMA Archive; adaptive skipping; algorithm and level recorded in seal header | M3 | deferred(M3) | — | — |
+| 17.4-1 | §17.4 | Every representation change uses one protocol; step 1: new seal extents written staged with delete_after = job expiry + grace | M3 | deferred(M3) | — | — |
+| 17.4-2 | §17.4 | Step 2: receipt signed only after fdatasync covering the record | M3 | deferred(M3) | — | — |
+| 17.4-3 | §17.4 | Step 3 (LRC): parity recomputed from verified data fragments and compared; partial stripes never published | M8 | deferred(M8) | — | — |
+| 17.4-4 | §17.4 | Step 4: one objects-domain CAS sets current seal, marks new extents committed, old extents retiring with delete_after = now + max(read grace, recovery window + max replication lag) | M3 | deferred(M3) | — | — |
+| 17.4-5 | §17.4 | Step 5: failure at any step leaves old seal current; staged extents reclaimed only after owning op terminal and unprotected; retry always safe | M3 | deferred(M3) | — | — |
+| 17.4-6 | §17.4 | Step 6: CAS is sole publication point verifying expected old seal, chunk generation, all R receipts (or LRC fragments + parity), incarnations, durability and domain constraints; unknown result resolved by reading authoritative state, never assumed failed | M3 | deferred(M3) | — | — |
+| 17.4-7 | §17.4, erratum C1 | Durable state model: extent staged → committed → retiring → deleted; chunk live → retiring → reclaimed; seal staged → current → retired ("superseded" only a compatibility synonym); CAS with monotonic generations | M3 | deferred(M3) | — | — |
+| 17.4-8 | §17.4 | Committed extent unreferenced only while protected; retiring/reclaimed chunk never resurrected by refcount increment | M3 | deferred(M3) | — | — |
+| 17.4-9 | §17.4 | New data always published replicated first; LRC only by transcoding | M3 | deferred(M3) | — | — |
+| 17.5-1 | §17.5 step 1a | Session created in resources domain in state reserving keyed by (caller, Idempotency-Key) with target, expected head, size, expiry; repeat returns existing session and state | M3 | deferred(M3) | cs-db idempotency (M0 mechanism) | — |
+| 17.5-2 | §17.5 step 1b | Accounting reserves declared size keyed by session ID; conditional update fails if usage + reservations exceed quota; reservation expires at session expiry + grace (default 1 hour) | M3 | deferred(M3) | — | — |
+| 17.5-3 | §17.5 step 1c | Session reserving → open by CAS; on reservation failure → aborted and client gets quota_exceeded | M3 | deferred(M3) | — | — |
+| 17.5-4 | §17.5 step 1 | Release idempotent keyed by session ID; reserving > 60 s aborted by reconciler releasing reservation; aborted/expired sessions release; periodic reconciliation never touches reservations converted to usage | M3 | deferred(M3) | — | — |
+| 17.5-5 | §17.5 step 2 | Chunk plan: assign chunk ID, seal ID, salt, SK, placement, new extent ID per target, write tokens; reuse only same-resource readable chunks by plaintext hash | M3 | deferred(M3) | — | — |
+| 17.5-6 | §17.5 step 3 | Resumable per-chunk transfer; offset mismatch returns 409 with current offset; primary forwards; node verifies ciphertext BLAKE3 before append; signed receipt after fdatasync with listed fields | M3 | deferred(M3) | — | — |
+| 17.5-7 | §17.5 step 4, erratum C3 | With fewer than R receipts (W ≡ R) client requests new placement and resends same sealed bytes; superseded staged extents expire | M3 | deferred(M3) | — | — |
+| 17.5-8 | §17.5 step 5 | Receipts signed with CA-issued node keys bound to session and extent ID; finalize rejects other-session, unknown-incarnation, duplicate-extent receipts and dedups by extent ID | M3 | deferred(M3) | cs-crypto::sig storage-receipt/v1 (M0) | — |
+| 17.5-9 | §17.5 step 6a | Finalize prepare (objects): verify receipts/seal/checksum/placement/durability; register committed-unreferenced extents; provisional refs; publication-ready definition; idempotent | M3 | deferred(M3) | — | — |
+| 17.5-10 | §17.5 step 6b | Pivot (resources): one tx CAS head (or create under parent+name uniqueness), insert version + manifest, session finalized, outbox; only publication-ready chunks | M3 | deferred(M3) | — | — |
+| 17.5-11 | §17.5 step 6c | Complete (objects): consume outbox, convert provisional to permanent refs idempotently; accounting converts reservation via own idempotent consumer | M3 | deferred(M3) | — | — |
+| 17.5-12 | §17.5 step 6d | API may ack after pivot; reads verify manifest and extent state; delayed completion repaired forward and MUST NOT make referenced data reclaimable | M3 | deferred(M3) | — | — |
+| 17.5-13 | §17.5 step 7 | Commit unknown: retry finalize with same session ID returns recorded version; head moved returns 409 with current head | M3 | deferred(M3) | — | — |
+| 17.5-14 | §17.5 step 8 | Staged extents reclaimed only when session aborted/expired; committed-unreferenced protected while finalize unresolved; clients MUST NOT create replacement session on finalize timeout; provisional refs released only on proof pivot did not commit or terminal session | M3 | deferred(M3) | — | — |
+| 17.6-1 | §17.6 | Read: API authorizes, resolves head/version, returns version ID, ETag, manifest, extent locations, SKs (vault: ciphertext only), read tokens | M3 | deferred(M3) | — | — |
+| 17.6-2 | §17.6 | Replicated chunks from any replica; LRC via reconstructing node (token audience) | M3 | deferred(M3) | — | — |
+| 17.6-3 | §17.6 | Reads refer to immutable version; ranges/resume use If-Match on ETag | M3 | deferred(M3) | — | — |
+| 17.6-4 | §17.6 | Read grace mandatory: superseded version not purged before superseded_at + read grace; retiring extents delete_after ≥ retirement + read grace; read grace ≥ max read-token lifetime + ε (default 10 min) | M3 | deferred(M3) | — | — |
+| 17.6-5 | §17.6 | Read leases: hash-partitioned row, 15 min, renewable up to 24 h, swept; purge checks active leases | M3 | deferred(M3) | — | — |
+| 17.6-6 | §17.6 | Data gateways route /n/{node-id}/... over mTLS; never verify or alter tokens; storage node verifies | M3 | deferred(M3) | — | — |
+| 17.6.1-1 | §17.6.1 | Read lease not one-time grant; revalidate snapshot and epoch every 1 MiB or 1 s and before each range continuation | M3 | deferred(M3) | — | — |
+| 17.6.1-2 | §17.6.1 | Revoked/stale transfer cancelled at next checkpoint; queued bytes discarded; connection closed; resume needs new token after fresh authz | M3 | deferred(M3) | — | — |
+| 17.6.1-3 | §17.6.1 | Read tokens 60 s default; renewals reauthorize; node unable to reach required revocation position denies continuation even with valid token | M3 | deferred(M3) | — | — |
+| 17.7-1 | §17.7 | Extents in append-only volume files, one storage I/O thread per volume (compio + io_uring, thread per core, fallback driver) | M3 | deferred(M3) | — | — |
+| 17.7-2 | §17.7 | Record = self-describing header (listed fields) + payload + trailer with BLAKE3 and commit marker; sidecar per seal with wrapped CK and commitment | M3 | deferred(M3) | — | — |
+| 17.7-3 | §17.7 | Each committed version writes a sealed manifest record under tenant manifest key for reconstruction | M3 | deferred(M3) | — | — |
+| 17.7-4 | §17.7 | Group commit (default up to 1 ms) shares one fdatasync; receipt only after covering fdatasync succeeded | M3 | deferred(M3) | — | — |
+| 17.7-5 | §17.7 | Failed fsync/fdatasync seals volume read-only, never retried; in-flight unreceipted writes fail; writer opens new volume | M3 | deferred(M3) | — | — |
+| 17.7-6 | §17.7 | Disks MUST have power-loss protection or disabled volatile cache; startup check refuses writes otherwise unless explicitly overridden | M3 | deferred(M3) | — | — |
+| 17.7-7 | §17.7 | Index checkpoints via temp file, fsync, rename, dir fsync; derived and rebuildable | M3 | deferred(M3) | — | — |
+| 17.7-8 | §17.7 | Startup recovery: verify mirrored superblocks, load checkpoint, scan, truncate invalid tail, mark corrupt earlier records for repair, report inventory | M3 | deferred(M3) | — | — |
+| 17.7-9 | §17.7 | Compaction copies live records, makes durable, switches index; old volume deleted only after read pins drain | M3 | deferred(M3) | — | — |
+| 17.8-1 | §17.8 | End-to-end checksum chain incl. verify-after-seal (policy default on), node verifies before append, record checksum, reader verifies commitment, tags and plaintext BLAKE3 | M3 | deferred(M3) | — | — |
+| 17.8-2 | §17.8 | Record scrub (policy default full pass every 30 days per disk, throttled); error triggers region scrub and raised priority | M8 | deferred(M8) | — | — |
+| 17.8-3 | §17.8 | LRC parity scrub (policy default every 90 days) | M8 | deferred(M8) | — | — |
+| 17.8-4 | §17.8 | Periodic inventory vs objects-domain extent cross-checks | M8 | deferred(M8) | — | — |
+| 17.8-5 | §17.8 | Repair prioritized by remaining tolerance then age; sources hash-verified; LRC local repair; repaired data published via §17.4 | M8 | deferred(M8) | — | — |
+| 17.8-6 | §17.8 | Checksum errors over threshold or SMART predictive failure put disk into read-only drain and evacuation | M8 | deferred(M8) | — | — |
+| 17.8-7 | §17.8 | Unrecoverable chunk marked lost, versions damaged, reads return explicit data-loss error (never unverified bytes), alerts, audit incident | M3 | deferred(M3) | — | — |
+| 17.9-1 | §17.9 | References = versions and provisional refs; counts in objects domain change only via idempotent outbox-driven ops or in-tx provisional refs | M3 | deferred(M3) | — | — |
+| 17.9-2 | §17.9 | Chunk → retiring only by CAS requiring refcount 0, no provisional refs, state live; adding a ref requires live | M3 | deferred(M3) | — | — |
+| 17.9-3 | §17.9 | One purge executor in resources domain checks in order: retention/hold, snapshots, read grace, read leases; only then emits dereference events | M3 | deferred(M3) | — | — |
+| 17.9-4 | §17.9 | Retiring extents delete_after ≥ max(retirement + read grace, retirement + recovery window + max replication lag) | M3 | deferred(M3) | — | — |
+| 17.9-5 | §17.9 | Destructive storage commands clock-independent (§20.3); compaction frees space after deletion | M3 | deferred(M3) | — | — |
+| 17.9-6 | §17.9 | Mark-and-sweep audit recomputes refcounts and compares inventories; reports drift; never deletes by itself | M8 | deferred(M8) | — | — |
+| 17.10-1 | §17.10 | Logical usage charged to owner at full size even when chunks shared; reserved = open sessions; physical = bytes × overhead charged once per chunk | M3 | deferred(M3) | — | — |
+| 17.10-2 | §17.10 | Deletes count against capacity until physical deletion after recovery window; API and UI state this | M3 | deferred(M3) | — | — |
+| 18.1-1 | §18.1 | YugabyteDB YSQL is the authoritative metadata technology; one logical database per domain (identity, resources, authz, objects, cluster, operations, collab, events, accounting, plugins, audit, app_<id>) | M0 | in-progress | cs-db (contract §5: cs_<domain> DBs) | qa:readiness::readyz_503_lists_unreachable_domain_barrier |
+| 18.1-2 | §18.1 | No transaction spans domains or clusters | M0 | in-progress | cs-db::DomainPool::transaction | review: DomainPool API borrows one pool (gate §4) |
+| 18.1-3 | §18.1 | Each placement class has independent pools, budgets, limits and alerts; critical domains have reserved capacity | M0 | in-progress | cs-db per-domain pool config | qa:config::unknown_nested_key_rejected (config shape); review |
+| 18.1-4 | §18.1 | Co-location only when deployment profile states shared failure/resource domain; never changes authority, tx boundaries or SLOs | M8 | deferred(M8) | — | — |
+| 18.1-5 | §18.1 | Moving a domain between clusters preserves domain ID via fenced migration with watermarks; no cross-cluster timestamp comparison | M8 | deferred(M8) | — | — |
+| 18.2-1 | §18.2 | Default isolation READ COMMITTED; invariants protected by CAS on version/state column or row lock | M0 | in-progress | cs-db | qa:sagas::cas_rejects_stale_version |
+| 18.2-2 | §18.2 | SERIALIZABLE isolation not used (no API) | M0 | in-progress | cs-db (no SERIALIZABLE API) | review (gate §4) |
+| 18.2-3 | §18.2 | SQLSTATE 40001 and 40P01 retried with exponential backoff and jitter up to a bound (contract: 10 attempts or 5 s); retried operations idempotent | M0 | in-progress | cs-db retry | qa:db_retry::retries_40001_until_success; qa:db_retry::retries_40p01; qa:db_retry::retry_bounded; qa:db_retry::non_retryable_sqlstate_not_retried |
+| 18.2-4 | §18.2 | Client requests carry idempotency keys stored with their results | M0 | in-progress | cs-db idempotency_records | qa:idempotency::replay_returns_identical_response |
+| 18.2-5 | §18.2 | Transactions never wait on network calls to storage nodes, app runtimes or external systems | M0 | in-progress | cs-db (tx closure receives only tx handle; contract §5 lint test) | review + engineer lint test (gate §4) |
+| 18.3-1 | §18.3 | Primary keys hash-distributed on random high-cardinality IDs; no table keyed by tenant alone | M0 | in-progress | cs-db migrations (M0 tables) | qa:outbox::outbox_schema_matches_contract; qa:idempotency::schema_matches_contract |
+| 18.3-2 | §18.3 | Rows of one resource share resource ID as leading hash key; chunks/seals/extents share chunk ID | M3 | deferred(M3) | — | — |
+| 18.3-3 | §18.3 | Folder entries keyed (parent HASH, bucket ASC, sort key ASC, entry ID) | M2 | deferred(M2) | — | — |
+| 18.3-4 | §18.3 | Hot tables pre-split, auto tablet splitting on; load tests show balanced leaders before release | M8 | deferred(M8) | — | — |
+| 18.4-1 | §18.4 | Multi-domain workflow is a durable saga; operation record created before any externally visible side effect, stored in operations domain with protocol version, tenant, actor, idempotency key, digest, deadline, pivot, steps, positions, compensation, retry policy, outbox IDs, result | M0 | in-progress | cs-ops sagas table (contract §5.4) | qa:sagas::happy_path_reaches_completed; qa:sagas::saga_schema_matches_contract |
+| 18.4-2 | §18.4 | Every step is exactly one local transaction plus outbox write in the same tx; no network call inside a tx | M0 | in-progress | cs-ops::SagaDefinition | qa:sagas::crash_after_each_pre_pivot_step_converges |
+| 18.4-3 | §18.4 | Step has stable idempotency key; duplicate delivery returns original result | M0 | in-progress | cs-ops | qa:sagas::duplicate_step_delivery_is_idempotent |
+| 18.4-4 | §18.4 | States created → running_pre_pivot → pivot_committed → completing → completed; plus compensating, compensated, blocked_for_operator | M0 | in-progress | cs-ops (CHECK constraint) | qa:sagas::state_check_constraint_rejects_unknown_state; qa:sagas::happy_path_reaches_completed |
+| 18.4-5 | §18.4 | Before pivot, permanent failure may compensate in reverse dependency order | M0 | in-progress | cs-ops | qa:sagas::failure_before_pivot_compensates_in_reverse |
+| 18.4-6 | §18.4 | After pivot compensation forbidden; remaining steps retry forward or enter blocked_for_operator preserving committed result | M0 | in-progress | cs-ops | qa:sagas::no_compensation_after_pivot; qa:sagas::crash_after_pivot_converges_forward |
+| 18.4-7 | §18.4 | Pivot is a named tx and conditional write in authoritative domain; API distinguishes accepted, committed, completed | M0 | in-progress | cs-ops (framework); API M3 | qa:sagas::happy_path_reaches_completed |
+| 18.4-8 | §18.4 | Unknown outcomes resolved by querying pivot idempotency record and authoritative state; timeouts never interpreted as failure | M0 | in-progress | cs-ops reconciler | qa:sagas::reconciler_does_not_infer_failure_from_deadline |
+| 18.4-9 | §18.4 | Level-triggered reconciliation predicate from authoritative state without event delivery; reconcilers continuous, after recovery, idempotent, record applied vector, expose age/attempts/divergence | M0 | in-progress | cs-ops reconcile() | qa:sagas::crash_after_each_pre_pivot_step_converges |
+| 18.4-10 | §18.4 | Outbox at least once, ordered within source partition; consumer dedup key (cluster ID, domain ID, partition, sequence) | M0 | in-progress | cs-db outbox (M0: contiguous sequences); consumers M4 | qa:outbox::concurrent_writers_contiguous_sequences |
+| 18.4-11 | §18.4 | Dedup records and source outboxes retained ≥ recovery window + max replication lag | M4 | deferred(M4) | — | — |
+| 18.4-12 | §18.4 | Causal dependencies carried as signed bounded vectors of (cluster ID, domain ID, partition, position); large vectors use immutable handles; HLC/wall clock never establish causality | M0 | in-progress | cs-common::consistency (type); signing M2 | qa:consistency_vector::* |
+| 18.4-13 | §18.4 | Pre-pivot compensation only after authoritative proof pivot did not commit; post-pivot completed forward; never infer outcome from missing events, expired leases, disconnects or deadlines | M0 | in-progress | cs-ops | qa:sagas::reconciler_does_not_infer_failure_from_deadline; qa:sagas::crash_after_pivot_converges_forward |
+| 18.4-14 | §18.4 | Every saga specifies trigger, idempotency scope, domains, pivot, compensations, forward steps, timeout/unknown behavior, retention, intermediate states and fault-injection tests before implementation | M0 | in-progress | cs-ops::SagaDefinition (test saga M0; real sagas M3) | qa:sagas::* (QA test saga) |
+| 18.5-1 | §18.5 | Valkey holds cache/ephemeral state only | M2 | deferred(M2) | — | — |
+| 18.5-2 | §18.5 | Losing Valkey costs performance only; rate limiting falls back to local buckets at limit/N per node, never unlimited | M1 | deferred(M1) | — | — |
+| 19.1-1 | §19.1 | Every resources-domain mutation writes journal entry in same tx (tenant, shard, sequence, resource ID, operation, before/after image) | M2 | deferred(M2) | — | — |
+| 19.1-2 | §19.1 | J shards per tenant (default 64); resource uses hash(resource ID) mod J | M2 | deferred(M2) | — | — |
+| 19.1-3 | §19.1 | Online shard split when lock-wait p99 > 5 ms for 5 min or rate exceeds budget; epoch-fenced; signed routing generation; cursor translation map | M8 | deferred(M8) | — | — |
+| 19.1-4 | §19.1 | Per-shard counter row incremented under row lock in same tx; contiguous sequences; gap is always detectable loss | M2 | deferred(M2) | — | — |
+| 19.1-5 | §19.1 | Every resource row stores its last journal position | M2 | deferred(M2) | — | — |
+| 19.1-6 | §19.1 | Retention ≥ max(recovery window, cursor lifetime, max snapshot build time); low watermark recorded | M2 | deferred(M2) | — | — |
+| 19.1-7 | §19.1 | Closed ranges archived as sealed journal segments (default every 60 s) | M8 | deferred(M8) | — | — |
+| 19.2-1 | §19.2 | Snapshot defined by journal cut vector; created in one short tx locking all tenant shard counters FOR SHARE in ascending order | M3 | deferred(M3) | — | — |
+| 19.2-2 | §19.2 | Build: parallel READ COMMITTED scan, per-shard REPEATABLE READ journal read verifying contiguity and low watermark; gap/expired range restarts with new cut | M3 | deferred(M3) | cs-db REPEATABLE READ helper (M0) | — |
+| 19.2-3 | §19.2 | Reconstruction rules (before image of earliest post-cut entry; creation excludes; left-scope via journal); scope via ancestors at cut | M3 | deferred(M3) | — | — |
+| 19.2-4 | §19.2 | Output snapshot manifest as sealed objects with version refs and ACL versions at cut | M3 | deferred(M3) | — | — |
+| 19.2-5 | §19.2 | Purge executor MUST NOT purge a version listed in a complete snapshot or visible at the cut of any building snapshot | M3 | deferred(M3) | — | — |
+| 19.2-6 | §19.2 | Snapshot, mutation and purge paths lock shard counters in identical global order; purge decision in one resources tx; deadlocks retried | M3 | deferred(M3) | — | — |
+| 19.2-7 | §19.2 | Building snapshot protection persists until complete or terminal failed with partial objects accounted; lease expiry cannot release it | M3 | deferred(M3) | — | — |
+| 19.2-8 | §19.2 | Purge requires version superseded/trashed ≥ read grace (≥ 10 min) | M3 | deferred(M3) | — | — |
+| 19.2-9 | §19.2 | Limits: active snapshots per tenant default 256; max build time default 24 h, never more than journal retention; snapshots read-only; restore publishes new versions | M3 | deferred(M3) | — | — |
+| 19.3-1 | §19.3 | Folder entries bucket=0 below threshold (policy default 100,000), else hash(entry ID) mod B with merged streams; online re-bucketing | M2 | deferred(M2) | — | — |
+| 19.3-2 | §19.3 | Cursors opaque HMAC-protected (folder, sort, last key, last entry, filters, snapshot ID, authz handle, schema version, expiry); no bucket layout | M2 | deferred(M2) | — | — |
+| 19.3-3 | §19.3 | Bulk moves/imports chunked, resumable, explicit pivots and per-batch progress | M2 | deferred(M2) | — | — |
+| 19.3-4 | §19.3 | Live listing: each page READ COMMITTED, strictly after cursor (sort key, entry ID); every stable entry exactly once in order; never twice under same key; changed-key and created/moved entries at most once each | M2 | deferred(M2) | — | — |
+| 19.3-5 | §19.3 | Listing keyed by folder ID; trashed/deleted folder next page resource_trashed or not_found; lost view returns permission_denied | M2 | deferred(M2) | — | — |
+| 19.3-6 | §19.3 | Snapshot listings: exactly the entries at cut, sorted, no duplicates/omissions; shown when caller has view on scope root now and had view on entry at cut | M3 | deferred(M3) | — | — |
+| 19.3-7 | §19.3 | Other sort orders via secondary indexes with same cursor rules; every listing permission-filtered | M2 | deferred(M2) | — | — |
+| 20.1-1 | §20.1 | Nodes join with single-use join tokens; role-bound CA certificates (24 h, auto renewal, revocation list) | M8 | deferred(M8) | — | — |
+| 20.1-2 | §20.1 | Membership lease renewed every 5 s, 15 s lifetime in DB time; incarnation incremented each start and carried in receipts, inventories, commands | M8 | deferred(M8) | — | — |
+| 20.1-3 | §20.1 | Nodes unavailable beyond policy period declared failed; data repaired, partitions reassigned | M8 | deferred(M8) | — | — |
+| 20.2-1 | §20.2 | Scheduler partitions (default 1,024) and collaboration partitions with lease rows (holder, epoch, expiry in DB time) in operations domain | M4 | deferred(M4) | — | — |
+| 20.2-2 | §20.2 | Acquisition increments epoch by CAS; new holder MUST NOT issue commands before old expiry + G (G ≥ 2ε) and MUST push epoch before destructive commands | M4 | deferred(M4) | — | — |
+| 20.2-3 | §20.2 | Every holder state change fenced by confirming holder and epoch in the transaction | M4 | deferred(M4) | — | — |
+| 20.3-1 | §20.3 | Correctness never depends on clocks or leases | M3 | deferred(M3) | — | — |
+| 20.3-2 | §20.3 | Destructive commands only for terminal-state extents with delete_after passed, verified against objects domain (control node or signed state attestation) immediately before acting | M3 | deferred(M3) | cs-crypto::sig state-attestation/v1 (M0) | — |
+| 20.3-3 | §20.3 | Constructive commands only create staged extents, visible solely via fenced CAS; duplicates harmless | M3 | deferred(M3) | — | — |
+| 20.3-4 | §20.3 | Storage nodes durably store highest epoch per partition, reject lower; per-partition serial queue makes check-and-act atomic | M8 | deferred(M8) | — | — |
+| 20.3-5 | §20.3 | Commands carry valid_until; rejected when estimated DB time + uncertainty reaches it | M8 | deferred(M8) | — | — |
+| 20.4-1 | §20.4 | ε MUST be ≥ YugabyteDB max_clock_skew_usec (default 500 ms) | M8 | deferred(M8) | — | — |
+| 20.4-2 | §20.4 | DB time estimated via min-RTT samples; uncertainty = RTT_min/2 + ε + drift × age; no sample newer than 60 s (policy) → unbounded, reject time-qualified commands | M8 | deferred(M8) | — | — |
+| 20.4-3 | §20.4 | Derived: G ≥ 2ε; read grace ≥ max read-token lifetime + ε; revocation does not depend on wall-clock comparison | M3 | deferred(M3) | — | — |
+| 20.5-1 | §20.5 | API nodes that cannot reach the metadata store return 503 for operations needing it | M0 | in-progress | cs-api (unavailable code); readiness | qa:readiness::readyz_503_lists_unreachable_domain_barrier |
+| 20.5-2 | §20.5 | Cut-off storage nodes stale after S; reject reads/writes/continuation; no deletions without verifiable state; no time-qualified commands with unbounded uncertainty | M3 | deferred(M3) | — | — |
+| 20.5-3 | §20.5 | Realtime nodes losing partition lease stop committing | M6 | deferred(M6) | — | — |
+| 21.1-1 | §21.1 | Edge, API, gateway, worker, search stateless or partition-assigned and horizontally scalable | M8 | deferred(M8) | — | — |
+| 21.2-1 | §21.2 | Priority classes P0–P4; P0 never shed; repair guaranteed minimum share (policy default 20% of background capacity); shedding order P4 → P3 (to floor) → P2 → P1 | M8 | deferred(M8) | — | — |
+| 21.2-2 | §21.2 | Adaptive concurrency limits per pool from wait time, p99 and DB conflict/restart rate; YugabyteDB admission control stays enabled | M8 | deferred(M8) | — | — |
+| 21.3-1 | §21.3 | Every queue, pool, cache and buffer has a bound and documented overflow behavior; every queued item has a deadline | M0 | in-progress | cs-db pools (bounded, timeouts); all later components | review (gate §4) |
+| 21.3-2 | §21.3 | 429 with Retry-After for quotas/rate limits; 503 with Retry-After for overload; 507 for storage admission refusal | M0 | in-progress | cs-common::error (status/Retry-After mapping); triggers M1/M3 | qa:error_model::problem_retry_after_header_iff_retry_after_ms |
+| 21.3-3 | §21.3 | Clients MUST back off exponentially with jitter | M0 | in-progress | web/packages/sdk RetryPolicy | frontend tests (RetryPolicy) |
+| 21.3-4 | §21.3 | Realtime shedding order: presence dropped, viewer broadcasts coalesced, edits throttled last | M6 | deferred(M6) | — | — |
+| 21.4-1 | §21.4 | Per-tenant/per-app budgets (rates, bandwidth, uploads, invocations, services, events, indexing, storage); weighted fair queuing by tenant | M8 | deferred(M8) | — | — |
+| 21.5-1 | §21.5 | One primary site; recovery site receives async replication of all domains, app DBs, objects, KMS; no active-active writes | M8 | deferred(M8) | — | — |
+| 22-1 | §22 | Capacity identity raw = live + staged + retiring + compaction garbage + reserve + repair headroom + free; live = Σ logical × overhead | M8 | deferred(M8) | — | — |
+| 22-2 | §22 | Repair headroom mandatory: survivors can re-protect largest failure domain plus compaction reserve; placement/admission never consume it | M8 | deferred(M8) | — | — |
+| 22-3 | §22 | Compaction reserve ≥ one max-size volume per disk + policy percentage (default 5%) | M3 | deferred(M3) | — | — |
+| 22-4 | §22 | Admission: at 80% non-reserved capacity alert and prioritize compaction/transcoding; at 95% refuse uploads with 507; deletes always accepted; repair, compaction, metadata writes never refused for capacity | M3 | deferred(M3) | — | — |
+| 22-5 | §22 | Repair time objective (policy default 24 h per failed node); required bandwidth computed and alerted | M8 | deferred(M8) | — | — |
+| 22-6 | §22 | Same capacity model for metadata store, search indexes and live-doc logs with own thresholds | M8 | deferred(M8) | — | — |
+| 23.1-1 | §23.1 | PITR for every domain and app DB with common window (default 7 days) plus periodic full backups to independent storage | M8 | deferred(M8) | — | — |
+| 23.1-2 | §23.1 | No atomic multi-database restore assumed; recovery selects causally closed vector; hybrid timestamps never a common restore time | M8 | deferred(M8) | — | — |
+| 23.1-3 | §23.1 | Physical deletion delayed ≥ recovery window + max replication lag; outbox, journal, event log, live-doc logs retained ≥ recovery window | M3 | deferred(M3) | — | — |
+| 23.2-1 | §23.2 step 1 | Quiesce: stop cross-domain ops, schedulers, deletion, publication; classify in-flight ops; services withdraw readiness | M8 | deferred(M8) | — | — |
+| 23.2-2 | §23.2 step 2 | Select authenticated signed recovery vector with listed per-component positions; causally closed dependency graph; HLCs never compared | M8 | deferred(M8) | — | — |
+| 23.2-3 | §23.2 step 3 | Restore each DB at or before its component; verify identity, continuity, schema, chain, commit position; never substitute newer incompatible timestamp | M8 | deferred(M8) | — | — |
+| 23.2-4 | §23.2 step 4 | Restore object metadata/inventories to publication watermark; unknown extents quarantined never deleted; missing repaired or marked lost | M8 | deferred(M8) | — | — |
+| 23.2-5 | §23.2 step 5 | Restore KMS and signing keys from independent backups; verify before issuing tokens or commands; else services stay offline | M8 | deferred(M8) | — | — |
+| 23.2-6 | §23.2 step 6 | Mandatory cross-domain reconciler: compensate only when pivot proven absent; complete forward post-pivot; unknown resolved by idempotency key; idempotent replay | M8 | deferred(M8) | cs-ops reconciler (M0 core) | — |
+| 23.2-7 | §23.2 step 7 | Rebuild derived state recording source vector and epoch; search/sync unavailable until authz-safe | M8 | deferred(M8) | — | — |
+| 23.2-8 | §23.2 step 8 | Validate checkpoints, journals, manifests, references, accounting, protections, plugin graph, audit chain, revocation sequence, site epoch, placement, headroom | M8 | deferred(M8) | — | — |
+| 23.2-9 | §23.2 step 9 | Readiness barrier per service: dominates required vector, sagas reconciled, revocation current, keys available, dependencies passed; unresolved apps disabled or read-only | M8 | deferred(M8) | cs-api /readyz barrier list (M0 shape) | qa:readiness::readyz_503_lists_unreachable_domain_barrier |
+| 23.2-10 | §23.2 step 10 | Resume writes in dependency order; physical deletion re-enabled last | M8 | deferred(M8) | — | — |
+| 23.2-11 | §23.2 | Signed recovery manifest retained; service unable to prove readiness MUST remain unavailable; override only via audited exception, never bypassing crypto validation or site fencing; RPO from manifest | M8 | deferred(M8) | — | — |
+| 23.3-1 | §23.3 | Reconstruction limited to listed data classes per domain (objects, accounting, resources namespace set, collab, search/caches; identity/authz/plugins/events restore only; audit not reconstructible; app DBs restore) | M8 | deferred(M8) | — | — |
+| 23.3-2 | §23.3 | Namespace checkpoints per tenant at a journal cut as sealed objects (default weekly + after migrations); only enumerated recovery set | M8 | deferred(M8) | — | — |
+| 23.3-3 | §23.3 | Journal archive retained until next checkpoint covers it + recovery window; recovery replays with contiguity verification; loss bounded by archive interval | M8 | deferred(M8) | — | — |
+| 23.4-1 | §23.4 | Primary sole writer; recovery site receives async replication of every listed class | M8 | deferred(M8) | — | — |
+| 23.4-2 | §23.4 | Promotion requires quorum-backed monotonic site epoch and fencing certificate; without fencing automatic promotion prohibited | M8 | deferred(M8) | — | — |
+| 23.4-3 | §23.4 | Every write-capable service, token and command carries site epoch and fencing generation; older rejected; returning nodes quarantined | M8 | deferred(M8) | — | — |
+| 23.4-4 | §23.4 | Formal promotion readiness predicate (as listed) | M8 | deferred(M8) | — | — |
+| 23.4-5 | §23.4 | Site-loss RPO = oldest lag among required components; console shows per-domain/partition/inventory lag | M8 | deferred(M8) | — | — |
+| 23.4-6 | §23.4 | Failback = full resync + new promotion + new site epoch; split-brain failback prohibited | M8 | deferred(M8) | — | — |
+| 23.5-1 | §23.5 | KMS backups (root, KEKs, OPAQUE keys, signing keys, audit key, CA) encrypted under offline key split by Shamir (default 3 of 5), stored in ≥ 2 places separate from data | M8 | deferred(M8) | — | — |
+| 23.5-2 | §23.5 | Automated restore drills at least quarterly in isolation incl. key restoration (App. K) | M8 | deferred(M8) | — | — |
+| 23.5-3 | §23.5 | Targets: published data RPO 0 within site; metadata RPO ≤ 1 min; site-loss RPO = lag (target ≤ 15 min); full restore ≤ 4 h at reference size | M8 | deferred(M8) | — | — |
+| 24-1 | §24 | Adjacent core versions interoperate; internal RPC, receipts, tokens, commands, realtime versions negotiated | M8 | deferred(M8) | — | — |
+| 24-2 | §24 | Finalized cluster version recorded; new formats only after finalization; rollback possible until then | M0 | in-progress | cs-db finalized-release table (M0 migration gate); cluster M8 | qa:migrations::contract_before_finalized_expand_refused |
+| 24-3 | §24 | Rolling upgrade order: schema expansion → control → storage → API/edge → realtime → workers/search → finalization → contraction | M8 | deferred(M8) | — | — |
+| 24-4 | §24 | Database migrations follow expand–migrate–contract and run online | M0 | in-progress | cs-db migration runner | qa:migrations::* |
+| 24-5 | §24 | Public API additive within major; deprecations kept ≥ 12 months; minimum client versions published | M1 | deferred(M1) | — | — |
+| 24-6 | §24 | Every release passes upgrade compatibility suite (App. L) before publication | M8 | deferred(M8) | — | — |
+| 24-7 | §24 | Host API and plugin exports semver; host serves current and previous major | M5 | deferred(M5) | — | — |
+| 24-8 | §24 | Live-doc schemas migrated lazily on load; old versions readable until unused | M6 | deferred(M6) | — | — |
+| 24-9 | §24 | Every persistent format is active, legacy or retired; retired only when no data anywhere, backups expired, not written, two majors passed; vault formats readable while used | M3 | deferred(M3) | — | — |
+| 25.1-1 | §25.1 | OpenTelemetry metrics, traces, logs; W3C trace context propagated through interface calls, events, jobs | M0 | in-progress | cs-common telemetry | qa:http_surface::every_response_has_request_id (correlation portion); engineer tests |
+| 25.1-2 | §25.1 | Prometheus-compatible metrics (contract: separate admin listener) and structured JSON logs | M0 | in-progress | cs-common telemetry; cs binary | gate §2 manual check |
+| 25.2-1 | §25.2, erratum C3 | Durability metrics: chunks below R (W ≡ R), redundancy states, zero-tolerance chunks, repair queue/RTO, scrub, lost chunks | M3 | deferred(M3) | — | — |
+| 25.2-2 | §25.2 | Storage metrics: fdatasync latency, group-commit sizes, capacity/headroom per domain | M3 | deferred(M3) | — | — |
+| 25.2-3 | §25.2 | Coordination metrics: partition ownership/epochs, fenced rejections, clock uncertainty, saga states | M4 | deferred(M4) | — | — |
+| 25.2-4 | §25.2 | Authorization metrics: check latency, cache hit, read-throughs, revocation lag per consumer, token rejections by reason | M2 | deferred(M2) | — | — |
+| 25.2-5 | §25.2 | Collaboration metrics | M6 | deferred(M6) | — | — |
+| 25.2-6 | §25.2 | Events and search metrics: lag per consumer, dead letters, index lag, query latency | M7 | deferred(M7) | — | — |
+| 25.2-7 | §25.2 | Application metrics per tenant | M5 | deferred(M5) | — | — |
+| 25.2-8 | §25.2 | Metadata store metrics: latency per domain/app DB, conflicts, pool saturation, tablet hotspots | M0 | in-progress | cs-db metrics | engineer tests; gate §2 |
+| 25.3-1 | §25.3 | Audit events produced through the audited change's outbox; ingestion record proves source event ID, position and payload digest; at-least-once idempotent | M4 | deferred(M4) | — | — |
+| 25.3-2 | §25.3 | Audit append-only, partitioned by tenant and time; sealed immutable hash-chained segments; Merkle roots anchored by signed external checkpoint | M4 | deferred(M4) | — | — |
+| 25.3-3 | §25.3 | Single CAS on one global shard head prohibited; fenced partitions split without rewrite; sealing/checkpointing idempotent | M4 | deferred(M4) | — | — |
+| 25.3-4 | §25.3 | Distinguish source commit, ingestion commit, external anchoring; lag visible; synchronous-audit operations report completion only after ingestion durable | M4 | deferred(M4) | — | — |
+| 25.3-5 | §25.3 | Audit retention per tenant/policy; expiry removes only complete segments when checkpoints and holds permit; never reconstructed from app events | M4 | deferred(M4) | — | — |
+| 25.4-1 | §25.4 | Liveness and readiness per node and per application service | M0 | in-progress | cs-api /healthz, /readyz | qa:readiness::*; qa:http_surface::healthz_is_liveness_only |
+| 25.4-2 | §25.4 | Cluster health view: metadata store, KMS, membership, redundancy, capacity, revocation feed, app health | M8 | deferred(M8) | — | — |
+| 26-1 | §26 | Research decisions R1–R14 may choose parameters but never weaken guarantees; each invariant R1–R14 is binding | M0 | in-progress | review rule | review |
+| 26-2 | §26 R4 | No custom persistent cryptographic format production-stable before independent review with no unresolved critical/high findings | M3 | deferred(M3) | — | — |
+| 26-3 | §26 R7 | No single parent counter or tenant-wide sequence is a global write bottleneck | M2 | deferred(M2) | — | — |
+| 26-4 | §26 R11 | No global serialized audit hash-chain head | M4 | deferred(M4) | — | — |
+| 26-5 | §26 R14 | No protected transfer continues indefinitely on a token issued before revocation | M3 | deferred(M3) | — | — |
+| 27-1 | §27 | Design principles 1–18 (summary of normative rules tracked in their own rows) | M0 | in-progress | review rule | review |
+| A.1-1 | App. A.1 | Asset inventory (content, metadata, credentials and keys, availability/integrity) drives protections; each asset class has an owner row elsewhere | M0 | in-progress | threat-model review | review |
+| A.2-1 | App. A.2 | Client ↔ edge over untrusted network with TLS 1.3 | M1 | deferred(M1) | — | — |
+| A.2-2 | App. A.2 | Edge/API ↔ core services mutually authenticated TLS with cluster certificates | M8 | deferred(M8) | — | — |
+| A.2-3 | App. A.2 | Storage nodes hold ciphertext only; trusted for availability, not confidentiality | M3 | deferred(M3) | — | — |
+| A.2-4 | App. A.2 | Core nodes hold unwrapped keys only in memory for the duration of use (M0: zeroizing buffers in LocalSoftwareKms) | M0 | in-progress | cs-kms | review; engineer tests |
+| A.3-1 | App. A.3 | Network attacker: TLS 1.3, HSTS, DPoP-bound tokens, OPAQUE, signed data-plane tokens | M1 | deferred(M1) | — | — |
+| A.3-2 | App. A.3 | External account attacker: OPAQUE+Argon2id, rate limits, passkeys, refresh reuse detection, session revocation | M1 | deferred(M1) | — | — |
+| A.3-3 | App. A.3 | Malicious tenant user: per-call authz, tenant-scoped data access, problem-details errors that do not leak existence, quotas, rate limits | M2 | deferred(M2) | cs-common::error (M0 codes) | qa:http_surface::error_responses_never_leak_internals |
+| A.3-4 | App. A.3 | Cross-tenant attacker: tenant_id in every key, RLS + SQL allowlist, per-tenant KEKs, cross-tenant suite | M2 | deferred(M2) | — | — |
+| A.3-5 | App. A.3 | Malicious application: sandboxing, per-app origin and DB, capability-scoped calls, broker, resource limits | M5 | deferred(M5) | — | — |
+| A.3-6 | App. A.3 | Compromised storage node: ciphertext only, per-chunk keys, commitment, BLAKE3, audience-bound tokens, epochs, terminal-state checks | M3 | deferred(M3) | — | — |
+| A.3-7 | App. A.3 | Compromised core node: short-lived tokens, KEKs in KMS, audit log | M1 | deferred(M1) | — | — |
+| A.3-8 | App. A.3 | Malicious operator: hash-chained audit with external sink, Shamir-split key backups, separated tenant/cluster roles | M4 | deferred(M4) | — | — |
+| A.3-9 | App. A.3 | Backup thief: content encrypted, KEKs not in data backups, split key backups; backups encrypted (policy default on) | M8 | deferred(M8) | — | — |
+| A.3-10 | App. A.3 | Stolen device: device and session revocation, vault device keys, local encryption | M9 | deferred(M9) | — | — |
+| A.4-1 | App. A.4 | Server-side encryption default; client sealing is server-side encryption; E2EE only for vaults; plaintext features unavailable for vaults | M3 | deferred(M3) | — | — |
+| A.5-1 | App. A.5 | Out of scope: physical/side-channel attacks, KMS compromise, volumetric DoS beyond rate limiting, non-vault confidentiality against compromised core, plugin intent | — | n/a(explicitly out of scope of the threat model, App. A.5) | — | — |
+| B-1 | App. B | Disk failure: detect via I/O/checksum/SMART; reads from replicas/LRC; RPO 0; repair starts ≤ 5 min | M8 | deferred(M8) | — | — |
+| B-2 | App. B | fsync error: volume sealed read-only, no receipts for unsynced data; RPO 0; immediate write failover; publication still needs R distinct domains | M3 | deferred(M3) | — | — |
+| B-3 | App. B | Storage node crash: heartbeat 10 s; reads from survivors; declared dead after 15 min (policy); traffic RTO ≤ 30 s | M8 | deferred(M8) | — | — |
+| B-4 | App. B | Rack/zone loss: reads from surviving placements; publication needs R eligible distinct domains; RPO 0 | M8 | deferred(M8) | — | — |
+| B-5 | App. B | API/edge node crash: requests retried elsewhere; stateless; RTO ≤ 10 s | M8 | deferred(M8) | — | — |
+| B-6 | App. B | Document host crash: lease expiry; edits paused; new host replays log; RPO 0, RTO ≤ 10 s | M6 | deferred(M6) | — | — |
+| B-7 | App. B | Application runtime crash: calls fail with dependency_unavailable; restart with backoff; RTO ≤ 30 s | M5 | deferred(M5) | — | — |
+| B-8 | App. B | YugabyteDB tablet leader loss RTO ≤ 3 s; minority loss no effect | M8 | deferred(M8) | — | — |
+| B-9 | App. B | YugabyteDB majority loss for a tablet: affected domain unavailable (503) | M0 | in-progress | cs-api readiness + unavailable mapping | qa:readiness::readyz_503_lists_unreachable_domain_barrier |
+| B-10 | App. B | Valkey loss: cache misses; rate limits fall back to local limits; no data loss | M1 | deferred(M1) | — | — |
+| B-11 | App. B | KMS unavailable: cached KEKs serve until TTL (policy 1 h); new keys cannot be created; no data loss | M3 | deferred(M3) | — | — |
+| B-12 | App. B | Revocation feed stale (lag > S): fail-closed rules; consumers catch up from snapshots; RTO S | M2 | deferred(M2) | — | — |
+| B-13 | App. B | Clock uncertainty unbounded (no sample < 60 s): node treats itself stale, rejects time-qualified commands | M8 | deferred(M8) | — | — |
+| B-14 | App. B | Network partition: minority read-only or unavailable per §20.5; heal and reconcile | M8 | deferred(M8) | — | — |
+| B-15 | App. B | Loss of one domain database: domain unavailable; recovery or reconstruction; RTO ≤ 4 h | M8 | deferred(M8) | — | — |
+| B-16 | App. B | Loss of whole cluster: restore from backups and key backups; RTO ≤ 4 h at reference size | M8 | deferred(M8) | — | — |
+| B-17 | App. B | Site loss with recovery site: failover; RPO lag (≤ 15 min); RTO ≤ 1 h | M8 | deferred(M8) | — | — |
+| B-18 | App. B | Single-node host loss: restore from off-host backup; operator-driven | M8 | deferred(M8) | — | — |
+| C.1-1 | App. C.1 | Each fact has exactly one authoritative domain per the authority table; derived copies never authoritative by availability | M0 | in-progress | cs-db domain list (contract §5) | review |
+| C.2-1 | App. C rule C1 | A transaction touches exactly one domain; cross-domain changes are durable sagas | M0 | in-progress | cs-db::DomainPool::transaction; cs-ops | review (gate §4); qa:sagas::* |
+| C.2-2 | App. C rule C2 | Every authoritative mutation another domain depends on writes an outbox event in the same transaction | M0 | in-progress | cs-db::Outbox::append(&mut DomainTx) | qa:outbox::rollback_leaves_no_gap |
+| C.2-3 | App. C rule C3 | Every saga has durable record, idempotency key, explicit pivot, pre-pivot compensation, post-pivot forward recovery, level-triggered reconciler | M0 | in-progress | cs-ops | qa:sagas::* |
+| C.2-4 | App. C rule C4 | Every public request starting a saga supplies idempotency key and request digest; reuse with different digest is conflict (contract: idempotency_mismatch 422) | M0 | in-progress | cs-db idempotency; cs-ops sagas UNIQUE | qa:idempotency::different_digest_is_idempotency_mismatch_422; qa:sagas::same_key_different_digest_is_mismatch; see OQ-4 |
+| C.2-5 | App. C rule C5 | Visibility follows dependency order: object readiness before version publication; resource before derived indexing; revocation commits before relying operations | M3 | deferred(M3) | — | — |
+| C.2-6 | App. C rule C6 | Physical deletion only by terminal objects-domain state after reference, lease, snapshot, retention, hold and recovery-window checks | M3 | deferred(M3) | — | — |
+| C.2-7 | App. C rule C7 | Dependent read carries signed context or snapshot handle; unsatisfiable → unavailable; stale allow forbidden | M2 | deferred(M2) | — | — |
+| C.2-8 | App. C rule C8 | Derived copies lag only where lag cannot grant access or reveal protected metadata; search/sync may omit new, never return revoked | M7 | deferred(M7) | — | — |
+| C.2-9 | App. C rule C9 | Every saga and derived copy has continuous reconciler recording applied vector | M0 | in-progress | cs-ops reconciler (sagas); derived copies M2+ | qa:sagas::crash_after_each_pre_pivot_step_converges |
+| C.2-10 | App. C rule C10 | Causality is a vector of (cluster ID, domain ID, partition, committed position); HLCs and wall clocks never establish causality | M0 | in-progress | cs-common::consistency | qa:consistency_vector::prop_dominance_matches_reference_model; qa:consistency_vector::vector_has_no_time_fields |
+| C.2-11 | App. C rule C11 | Published version references only publication-ready chunks with durable refs; all R replicas or verified LRC fragments; weaker W never reported durable | M3 | deferred(M3) | — | — |
+| C.2-12 | App. C rule C12 | Storage transfers continuously reauthorized at bounded checkpoints; token validity never overrides revocation | M3 | deferred(M3) | — | — |
+| C.2-13 | App. C rule C13 | Recovery selects causally closed vector across pivots, outboxes, offsets, generations, watermarks, keys, epochs, audit checkpoints | M8 | deferred(M8) | — | — |
+| C.2-14 | App. C rule C14 | Service ready only when state dominates required vector and dependencies pass barriers | M0 | in-progress | cs-api /readyz (M0 barriers: domains reachable, migrations at expected version) | qa:readiness::readyz_503_lists_unreachable_domain_barrier; qa:readiness::readyz_200_when_all_domains_reachable_and_migrated |
+| C.2-15 | App. C rule C15 | Namespace checkpoints reconstruct only enumerated recovery set; every other table has its own contract | M8 | deferred(M8) | — | — |
+| C.2-16 | App. C rule C16 | Apps follow these rules in own DB and never directly mutate core tables | M5 | deferred(M5) | — | — |
+| C.3-1 | App. C.3 | Invariant: every published version references a complete, verified, publication-ready seal | M3 | deferred(M3) | — | — |
+| C.3-2 | App. C.3 | Invariant: every live referenced chunk meets placement target or is marked degraded/lost | M3 | deferred(M3) | — | — |
+| C.3-3 | App. C.3 | Invariant: permanent and provisional refcounts match manifests and active operations | M3 | deferred(M3) | — | — |
+| C.3-4 | App. C.3 | Invariant: accounting = live logical usage + valid reservations; no terminal session retains a reservation | M3 | deferred(M3) | — | — |
+| C.3-5 | App. C.3 | Invariant: authz projection records source positions and never grants beyond authoritative state | M2 | deferred(M2) | — | — |
+| C.3-6 | App. C.3 | Invariant: every revocation consumer contiguous, current, at required epoch before readiness | M2 | deferred(M2) | — | — |
+| C.3-7 | App. C.3 | Invariant: every journal shard contiguous from low watermark to head (M0 analogue: outbox partitions contiguous) | M2 | deferred(M2) | cs-db outbox gap detection (M0 analogue) | qa:outbox::gap_detected_after_row_deletion (analogue) |
+| C.3-8 | App. C.3 | Invariant: every saga completed, safely aborted or blocked for operator; no unknown outcome guessed | M0 | in-progress | cs-ops | qa:sagas::reconciler_does_not_infer_failure_from_deadline; qa:sagas::crash_after_pivot_converges_forward |
+| C.3-9 | App. C.3 | Invariant: every enabled plugin has compatible required deps and approved digest/trust class | M5 | deferred(M5) | — | — |
+| C.3-10 | App. C.3 | Invariant: every recovery-site readiness predicate satisfied before promotion | M8 | deferred(M8) | — | — |
+| D.1-1 | App. D.1 | One error model for HTTP API, realtime protocol and host interface; HTTP uses RFC 9457 application/problem+json | M0 | in-progress | cs-common::error; cs-api | qa:http_surface::unknown_route_returns_404_problem; qa:error_model::problem_required_fields_present |
+| D.1-2 | App. D.1 | type = URI https://errors.<deployment>/v1/<code> | M0 | in-progress | cs-common::error | qa:error_model::problem_type_uri_format |
+| D.1-3 | App. D.1 | title short, stable, human-readable | M0 | in-progress | cs-common::error | qa:error_model::problem_title_stable_per_code |
+| D.1-4 | App. D.1 | status = HTTP status; code = stable machine code from D.2 | M0 | in-progress | cs-common::error | qa:error_model::problem_status_retryable_derived_from_code |
+| D.1-5 | App. D.1 | detail localized and never contains data the caller may not see (contract: internal errors use generic detail, cause to logs by request_id) | M0 | in-progress | cs-common::error | qa:error_model::internal_error_detail_is_generic; qa:http_surface::error_responses_never_leak_internals; qa:readiness::readyz_does_not_leak_connection_strings |
+| D.1-6 | App. D.1 | instance = request path | M0 | in-progress | cs-api | qa:http_surface::unknown_route_returns_404_problem |
+| D.1-7 | App. D.1 | request_id correlates with logs and traces (contract: X-Request-Id on every response) | M0 | in-progress | cs-api | qa:http_surface::every_response_has_request_id |
+| D.1-8 | App. D.1 | retryable true when the same request may succeed later without change | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.1-9 | App. D.1 | retry_after_ms present when server knows a minimum delay; also sent as Retry-After header (contract: seconds rounded up, iff present) | M0 | in-progress | cs-common::error; cs-api | qa:error_model::problem_retry_after_header_iff_retry_after_ms; qa:error_model::retry_after_rounds_up_to_seconds; qa:http_surface::retry_after_header_consistent_on_all_errors |
+| D.1-10 | App. D.1 | errors[] optional field errors (pointer, code, detail) for validation failures | M0 | in-progress | cs-common::error | qa:error_model::field_errors_shape |
+| D.1-11 | App. D.1 | consistency_token present when error depends on state the client may wait for | M2 | deferred(M2) | cs-common::error (field exists M0) | — |
+| D.1-12 | App. D.1 | Realtime error frames carry the same fields; host interface returns same code set as WIT variant | M5 | deferred(M5) | — | — |
+| D.2-1 | App. D.2 | invalid_request → 400, not retryable | M0 | in-progress | cs-common::error::ErrorCode | qa:error_model::d2_status_and_retryable_table; qa:http_surface::malformed_json_body_returns_400_problem |
+| D.2-2 | App. D.2 | unauthenticated → 401, not retryable; client refreshes and retries once (hook M0, wired M1) | M0 | in-progress | cs-common::error; web/packages/sdk | qa:error_model::d2_status_and_retryable_table |
+| D.2-3 | App. D.2 | permission_denied → 403, not retryable; only on resources the caller can see | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-4 | App. D.2 | not_found → 404, not retryable; covers existence hiding | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table; qa:http_surface::unknown_route_returns_404_problem |
+| D.2-5 | App. D.2 | method_not_allowed → 405, not retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table; qa:http_surface::wrong_method_returns_405_problem |
+| D.2-6 | App. D.2 | conflict → 409, not retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table; qa:idempotency::in_progress_duplicate_is_conflict_not_retryable |
+| D.2-7 | App. D.2 | resource_trashed → 409, not retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-8 | App. D.2 | precondition_failed → 412, not retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-9 | App. D.2 | payload_too_large → 413, not retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-10 | App. D.2 | unsupported_media_type → 415, not retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-11 | App. D.2 | idempotency_mismatch → 422, not retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table; qa:idempotency::different_digest_is_idempotency_mismatch_422 |
+| D.2-12 | App. D.2 | locked → 423, not retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-13 | App. D.2 | rate_limited → 429, retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-14 | App. D.2 | quota_exceeded → 507, not retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-15 | App. D.2 | internal → 500, retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table; qa:error_model::internal_error_detail_is_generic |
+| D.2-16 | App. D.2 | dependency_unavailable → 503, retryable | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-17 | App. D.2 | unavailable → 503, retryable (overload, maintenance, stale revocation feed, unreachable domain) | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table; qa:readiness::readyz_503_lists_unreachable_domain_barrier |
+| D.2-18 | App. D.2 | timeout → 504, retryable; outcome may be unknown | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-19 | App. D.2 | outcome_unknown → 504, retryable; retry with same idempotency key | M0 | in-progress | cs-common::error | qa:error_model::d2_status_and_retryable_table |
+| D.2-20 | App. D.2, contract §2 | Code set is exactly table D.2 (no extra core codes); wire values are the snake_case strings | M0 | in-progress | cs-common::error::ErrorCode; web/packages/sdk ErrorCode union | qa:error_model::d2_code_set_is_exact; qa:error_model::d2_wire_strings_roundtrip; qa:error_model::d2_unknown_code_string_rejected; frontend tests |
+| D.3-1 | App. D.3 | Existence hiding: without view permission every error about a resource is not_found; permission_denied only when caller can view but not act | M2 | deferred(M2) | — | — |
+| D.3-2 | App. D.3 | Writes accept Idempotency-Key; retry with same key returns original result for 24 hours (policy) | M0 | in-progress | cs-db idempotency_records (expires_at now()+24 h) | qa:idempotency::replay_returns_identical_response; qa:idempotency::expired_record_not_replayed |
+| D.3-3 | App. D.3 | Every retryable write error is safe to retry with the same key | M0 | in-progress | cs-db idempotency | qa:idempotency::concurrent_identical_requests_single_effect |
+| D.3-4 | App. D.3 | Clients retry retryable errors with exponential backoff and full jitter, initial 200 ms, maximum 30 s, honoring retry_after_ms (contract: bounded attempts default 5; writes only with same key) | M0 | in-progress | web/packages/sdk RetryPolicy | frontend tests (gate §3) |
+| D.3-5 | App. D.3 | App codes app.<application ID>.<code> mapped to a D.2 HTTP status; may not reuse core codes with different meaning | M0 | in-progress | cs-common::error (type supports app codes) | qa:error_model::app_codes_namespace_and_status_mapping; qa:error_model::app_codes_cannot_shadow_core_codes |
+| D.3-6 | App. D.3 | Error codes are part of API contract; never removed or repurposed within a major version | M0 | in-progress | cs-common::error | qa:error_model::d2_code_set_is_exact (pinned list) |
+| E-1 | App. E | IDs are UUIDv7 stored as uuid; tenant-scoped tables have tenant_id first in PK; no DB sequences for identifiers | M0 | in-progress | cs-common::id; cs-db migrations | qa:ids::typed_ids_are_uuidv7; qa:outbox::event_ids_are_uuidv7; qa:migrations::core_tables_follow_appendix_e |
+| E-2 | App. E | HASH sharding on leading keys by default; range only for ordered scans, prefixed by hash column | M0 | in-progress | cs-db migrations | qa:outbox::outbox_schema_matches_contract |
+| E-3 | App. E | Every mutable row has version (bigint) or state column used for CAS; updates conditional | M0 | in-progress | cs-db; cs-ops sagas.version | qa:sagas::cas_rejects_stale_version |
+| E-4 | App. E | Timestamps timestamptz set by DB (now()); app-supplied times stored separately and labelled | M0 | in-progress | cs-db migrations | qa:migrations::core_tables_follow_appendix_e |
+| E-5 | App. E | Lifecycle states are text with CHECK constraint; transitions follow App. F | M0 | in-progress | cs-db migrations (idempotency_records.state, sagas.state) | qa:sagas::state_check_constraint_rejects_unknown_state; qa:idempotency::schema_matches_contract |
+| E-6 | App. E | Foreign keys within a domain only; cross-domain references are plain IDs validated by sagas/reconcilers | M0 | in-progress | cs-db migrations | qa:migrations::core_tables_follow_appendix_e |
+| E-7 | App. E | Rows other domains or journal may reference are tombstoned before removal; physical removal after recovery window | M2 | deferred(M2) | — | — |
+| E-8 | App. E | Each domain has an outbox table written in the same transaction as the change | M0 | in-progress | cs-db outbox (contract §5.2) | qa:outbox::outbox_schema_matches_contract; qa:outbox::rollback_leaves_no_gap |
+| E-9 | App. E | Every query path indexed with matching leading columns; listings use covering indexes; unbounded scans forbidden in request paths | M0 | in-progress | cs-db | review (gate §4) |
+| E-10 | App. E | Rows ≤ 64 KiB, larger values to object storage; JSONB only for extension data/settings, never joins or authz | M0 | in-progress | cs-db (outbox payload, idempotency response ≤ 64 KiB) | qa:outbox::oversized_payload_rejected; qa:idempotency::oversized_response_stored_by_reference |
+| E-11 | App. E | Naming: snake_case, plural tables, indexes <table>_<columns>_idx | M0 | in-progress | cs-db migrations | qa:migrations::core_tables_follow_appendix_e |
+| E-12 | App. E | Migrations expand–migrate–contract; destructive changes require completed expansion in earlier release | M0 | in-progress | cs-db migration runner | qa:migrations::contract_before_finalized_expand_refused; qa:migrations::contract_after_finalized_expand_applies |
+| E-13 | App. E | Migrations are idempotent and resumable | M0 | in-progress | cs-db migration runner | qa:migrations::rerun_is_noop; qa:migrations::interrupted_migration_resumes |
+| E-14 | App. E, contract §5.1 | Checksum mismatch on applied migration is a hard error; runtime DDL outside runner forbidden | M0 | in-progress | cs-db migration runner | qa:migrations::checksum_tamper_is_hard_error |
+| E-15 | App. E | App DBs additionally: no runtime DDL, tables by runner, RLS by schema-owner role | M5 | deferred(M5) | — | — |
+| F-1 | App. F | Terminal states never change; transitions not listed are rejected with conflict | M0 | in-progress | cs-ops saga state machine (M0); resources M2; objects M3 | qa:sagas::illegal_transitions_rejected |
+| F.1-1 | App. F.1 | Resource creating → active on creation saga completion | M2 | deferred(M2) | — | — |
+| F.1-2 | App. F.1 | Resource creating → purged on creation saga compensation | M2 | deferred(M2) | — | — |
+| F.1-3 | App. F.1 | Resource active → trashed by user/app/policy when caller authorized and no lock | M2 | deferred(M2) | — | — |
+| F.1-4 | App. F.1 | Resource trashed → active on restore when parent active or restored to new parent | M2 | deferred(M2) | — | — |
+| F.1-5 | App. F.1 | Resource trashed → purging on retention expiry or explicit purge, no retention or legal hold | M3 | deferred(M3) | — | — |
+| F.1-6 | App. F.1 | Resource purging → purged (terminal) when purge saga completes and versions purged per §17.9 | M3 | deferred(M3) | — | — |
+| F.1-7 | App. F.1 | Trashing a folder marks only the folder; descendants keep state and are hidden via trashed ancestor; restore reveals them | M2 | deferred(M2) | — | — |
+| F.1-8 | App. F.1 | Moves and renames do not change lifecycle state | M2 | deferred(M2) | — | — |
+| F.2-1 | App. F.2 | Version (none) → current by finalize pivot inserting new head | M3 | deferred(M3) | — | — |
+| F.2-2 | App. F.2 | Version current → superseded when newer version published | M3 | deferred(M3) | — | — |
+| F.2-3 | App. F.2 | Version superseded → purging by retention/version limits after §17.9 checks | M3 | deferred(M3) | — | — |
+| F.2-4 | App. F.2 | Version current or superseded → purging on resource purge after §17.9 checks | M3 | deferred(M3) | — | — |
+| F.2-5 | App. F.2 | Version purging → purged (terminal) after chunk dereference events processed | M3 | deferred(M3) | — | — |
+| F.2-6 | App. F.2 | Restoring old version publishes new current referencing same chunks; restored stays superseded; held versions cannot enter purging | M3 | deferred(M3) | — | — |
+| F.3-1 | App. F.3 | Upload session reserving → open when quota reserved | M3 | deferred(M3) | — | — |
+| F.3-2 | App. F.3 | Upload session reserving → aborted (terminal) on quota refusal or reserving > 60 s | M3 | deferred(M3) | — | — |
+| F.3-3 | App. F.3 | Upload session open → finalizing on finalize request | M3 | deferred(M3) | — | — |
+| F.3-4 | App. F.3 | Upload session open → aborted (terminal) on abort request | M3 | deferred(M3) | — | — |
+| F.3-5 | App. F.3 | Upload session open → expired (terminal) when expiry passes | M3 | deferred(M3) | — | — |
+| F.3-6 | App. F.3 | Upload session finalizing → finalized (terminal) when version published | M3 | deferred(M3) | — | — |
+| F.3-7 | App. F.3 | Upload session finalizing → open when finalize failed retryably before pivot | M3 | deferred(M3) | — | — |
+| F.3-8 | App. F.3, erratum C6 | Expiry does not apply in finalizing; leaves only via pivot (finalized) or authoritative proof pivot did not commit (back to open, expiry applies again) | M3 | deferred(M3) | — | — |
+| F.4-1 | App. F.4 | Chunk live → retiring → reclaimed; live → lost; retiring, reclaimed, lost irreversible | M3 | deferred(M3) | — | — |
+| F.4-2 | App. F.4, erratum C1 | Seal staged → current → retired; retired irreversible (superseded = compatibility synonym only) | M3 | deferred(M3) | — | — |
+| F.4-3 | App. F.4 | Extent staged → committed → retiring → deleted; staged → deleted when session aborted/expired or job abandoned; retiring, deleted irreversible | M3 | deferred(M3) | — | — |
+| F.4-4 | App. F.4 | Chunk enters retiring only with refcount 0 and no provisional refs; adding a ref requires live; only §20.3 states authorize physical deletion | M3 | deferred(M3) | — | — |
+| F.5-1 | App. F.5, erratum C5 | Plugin installed → enabled; enabled → disabled; disabled → enabled | M5 | deferred(M5) | — | — |
+| F.5-2 | App. F.5, erratum C5 | Plugin disabled → removing → removed (terminal) | M5 | deferred(M5) | — | — |
+| F.5-3 | App. F.5, erratum C5 | Plugin installed → removing for a plugin never enabled | M5 | deferred(M5) | — | — |
+| F.5-4 | App. F.5 | Enabling requires a resolution plan whose required dependencies are enabled | M5 | deferred(M5) | — | — |
+| F.5-5 | App. F.5, erratum C5 | Plugin usable only in enabled with completed install/upgrade saga; plugin whose install saga has not completed is not installed and never usable | M5 | deferred(M5) | — | — |
+| F.5-6 | App. F.5, erratum C5 | Installation saga: created → fetching → validating → awaiting_approval → registering (pivot: registry row committed installed) → completed; pre-pivot failure → compensating → failed (nothing registered or usable) | M5 | deferred(M5) | — | — |
+| F.5-7 | App. F.5, erratum C5 | Upgrade saga: created → fetching → validating → awaiting_approval → migrating_expand → activating (pivot: active version switched) → completed; pre-pivot failure → compensating → failed (previous version stays active) | M5 | deferred(M5) | — | — |
+| F.5-8 | App. F.5, erratum C5 | Rollback saga: created → activating (pivot: retained version reactivated) → completed | M5 | deferred(M5) | — | — |
+| F.5-9 | App. F.5 | After a pivot these sagas complete forward or enter blocked_for_operator; never compensate | M5 | deferred(M5) | — | — |
+| G.1-1 | App. G.1 | Rust SDK crate with WIT bindings, typed helpers and test harness; WIT packages are source of truth | M5 | deferred(M5) | — | — |
+| G.1-2 | App. G.1 | TypeScript UI SDK as platform component | M0 | in-progress | web/packages/sdk | frontend tests |
+| G.1-3 | App. G.1 | cs-plugin CLI: new, build, test, package, sign, validate, run; published manifest JSON Schema | M5 | deferred(M5) | — | — |
+| G.2-1 | App. G.2 | cs-plugin run starts single-node dev platform with test tenants and hot reload; mock host with configurable denials/failures/latency; fixtures | M5 | deferred(M5) | — | — |
+| G.3-1 | App. G.3 | cs-plugin validate and installer run identical checks: manifest, permissions, interfaces, dependency resolution, migrations vs App. E, component limits | M5 | deferred(M5) | — | — |
+| G.4-1 | App. G.4 | Exported interfaces ship contract tests; provider failing own contract tests cannot be packaged; tool reports consumers broken by removal | M5 | deferred(M5) | — | — |
+| G.5-1 | App. G.5 | Per release publish host interface reference, event catalogue, permission catalogue, error codes, manifest reference, UI SDK reference, reference app sources | M5 | deferred(M5) | — | — |
+| H.1-1 | App. H.1 | Reference configurations (single node, reference cluster) for measurements | M8 | deferred(M8) | — | — |
+| H.1-2 | App. H.1 | Benchmark reports record full environment, workload, percentiles, errors, utilization; throughput counts acknowledged durable completion only | M8 | deferred(M8) | — | — |
+| H.2-1 | App. H.2 | Authorization check (cached) p50 0.2 ms, p99 2 ms | M2 | deferred(M2) | — | — |
+| H.2-2 | App. H.2 | Metadata read p50 5 ms, p99 25 ms | M2 | deferred(M2) | — | — |
+| H.2-3 | App. H.2 | Metadata write (rename, move, share) p50 15 ms, p99 60 ms | M2 | deferred(M2) | — | — |
+| H.2-4 | App. H.2 | Folder listing page (100 entries) p50 15 ms, p99 80 ms | M2 | deferred(M2) | — | — |
+| H.2-5 | App. H.2 | Upload session creation p50 20 ms, p99 100 ms | M3 | deferred(M3) | — | — |
+| H.2-6 | App. H.2 | Small file upload (≤ 64 KiB end to end) p50 40 ms, p99 200 ms | M3 | deferred(M3) | — | — |
+| H.2-7 | App. H.2 | First byte of download p50 20 ms, p99 100 ms hot / 500 ms cold | M3 | deferred(M3) | — | — |
+| H.2-8 | App. H.2 | Search query p50 50 ms, p99 300 ms (≤ 10 M docs per tenant) | M7 | deferred(M7) | — | — |
+| H.2-9 | App. H.2 | Live-doc edit commit p50 10 ms, p99 50 ms; edit to other clients p50 50 ms, p99 200 ms | M6 | deferred(M6) | — | — |
+| H.2-10 | App. H.2 | Revocation propagation to all consumers p50 0.5 s, p99 2 s | M2 | deferred(M2) | — | — |
+| H.3-1 | App. H.3 | Storage node ≥ 1 GB/s writes, ≥ 2 GB/s reads (large objects) | M8 | deferred(M8) | — | — |
+| H.3-2 | App. H.3 | ≥ 5,000 small uploads/s per reference cluster | M8 | deferred(M8) | — | — |
+| H.3-3 | App. H.3 | ≥ 20,000 metadata writes/s per cluster, ≥ 80% linear scaling | M8 | deferred(M8) | — | — |
+| H.3-4 | App. H.3 | ≥ 100,000 open docs and ≥ 50,000 edits/s per two-node realtime cluster | M8 | deferred(M8) | — | — |
+| H.3.1-1 | App. H.3.1, erratum C3 | Upload throughput counts only publication after full durability (never fewer than R receipts); declared workload distributions and full reports | M8 | deferred(M8) | — | — |
+| H.3.1-2 | App. H.3.1 | Tests cover skew, hot folders, nested groups, mass revocation, bulk import, large downloads, slow clients, concurrent repair, degraded domains, recovery replay; reserves never disabled for throughput | M8 | deferred(M8) | — | — |
+| H.4-1 | App. H.4 | Repair of failed 16 TB disk within 12 h on reference cluster without exceeding H.2 by more than 2×; repair rate limited (policy) | M8 | deferred(M8) | — | — |
+| H.5-1 | App. H.5 | 100,000 tenants per cluster | M8 | deferred(M8) | — | — |
+| H.5-2 | App. H.5 | 1,000,000 users per tenant | M8 | deferred(M8) | — | — |
+| H.5-3 | App. H.5 | 10,000,000,000 resources per tenant | M8 | deferred(M8) | — | — |
+| H.5-4 | App. H.5 | 10,000,000 entries per folder (bucketed) | M8 | deferred(M8) | — | — |
+| H.5-5 | App. H.5, erratum C2 | Resource depth 256 with signed ancestry snapshot handle | M3 | deferred(M3) | — | — |
+| H.5-6 | App. H.5 | File size 5 TiB | M3 | deferred(M3) | — | — |
+| H.5-7 | App. H.5 | 1,000 storage nodes and 100 PB raw per cluster | M8 | deferred(M8) | — | — |
+| H.5-8 | App. H.5 | 200 enabled plugins per tenant | M5 | deferred(M5) | — | — |
+| H.5-9 | App. H.5 | 200 concurrent editors per live document | M6 | deferred(M6) | — | — |
+| H.5-10 | App. H.5 | A release documents any lowered limit; limits verified by scale suite | M8 | deferred(M8) | — | — |
+| I.1-1 | App. I.1 | SLIs measured at edge (user ops) or component (internal) over rolling 30 days; bad = retryable error or over latency threshold; non-retryable client errors excluded | M4 | deferred(M4) | — | — |
+| I.1-2 | App. I.1 | Single-node deployments publish same SLIs without availability objectives | M4 | deferred(M4) | — | — |
+| I.2-1 | App. I.2 | API availability 99.9% (bad = 5xx or > 1 s for metadata ops) | M8 | deferred(M8) | — | — |
+| I.2-2 | App. I.2 | Data-plane availability 99.9% (bad = failed or > 2 s first byte hot) | M8 | deferred(M8) | — | — |
+| I.2-3 | App. I.2 | Realtime availability 99.9% (bad = edit not committed within 1 s) | M8 | deferred(M8) | — | — |
+| I.2-4 | App. I.2 | Latency SLO = p99 targets of H.2 per class | M8 | deferred(M8) | — | — |
+| I.2-5 | App. I.2 | Revocation feed delivery and application: 99% within 2 s, 100% within S | M2 | deferred(M2) | — | — |
+| I.2-6 | App. I.2 | Unauthorized read exposure ≤ S + 2 s; unauthorized write/edit exposure 0 after commit; realtime enforcement ≤ S + 2 s | M2 | deferred(M2) | — | — |
+| I.2-7 | App. I.2 | Upload durability before publication 100%: no durable success until all R replicas or LRC fragments fdatasynced | M3 | deferred(M3) | — | — |
+| I.2-8 | App. I.2 | Object durability: no loss of acknowledged data within effective tolerance | M3 | deferred(M3) | — | — |
+| I.2-9 | App. I.2 | Repair start 99% within 5 min of declared failure | M8 | deferred(M8) | — | — |
+| I.2-10 | App. I.2 | Backup freshness: PITR for full window and latest full backup ≤ 7 days old | M8 | deferred(M8) | — | — |
+| I.2-11 | App. I.2 | Restore drill success 100% of scheduled drills | M8 | deferred(M8) | — | — |
+| I.3-1 | App. I.3 | Exhausted availability budget: pause non-urgent rollouts, run repair/compaction at minimum | M8 | deferred(M8) | — | — |
+| I.3-2 | App. I.3 | Durability, revocation and restore objectives have no budget; every violation is an incident | M2 | deferred(M2) | — | — |
+| J.1-1 | App. J.1 | Linux kernel ≥ 6.1, x86_64 or aarch64 | M3 | deferred(M3) | — | — |
+| J.1-2 | App. J.1 | Data volumes XFS or ext4, one filesystem per disk; write caches without PLP must be disabled | M3 | deferred(M3) | — | — |
+| J.1-3 | App. J.1 | chrony/NTP/PTP on every node; unsynchronized node does not join | M8 | deferred(M8) | — | — |
+| J.1-4 | App. J.1 | Routable private network; metadata nodes within 2 ms RTT in a site | M8 | deferred(M8) | — | — |
+| J.2-1 | App. J.2 | One statically linked binary with roles, OCI images, distro packages with systemd units | M0 | in-progress | crates/cs (binary with roles; packaging M8) | qa:config::unimplemented_role_refused_by_binary |
+| J.2-2 | App. J.2 | YugabyteDB and Valkey deployed from pinned versions or operator-provided; Kubernetes uses OCI images and local PVs for storage | M8 | deferred(M8) | dev/docker-compose.yml (pinned dev versions) | — |
+| J.3-1 | App. J.3 | Minimum sizes: single node 2 disks (R=2) or 3 (R=3); small cluster 3 nodes; replicated ≥ 3+3; LRC ≥ 11 domains; two-node clusters unsupported (see plan §6 open item: dev host has one disk) | M3 | deferred(M3) | — | — |
+| J.4-1 | App. J.4 step 1 | cs init generates cluster ID, CA, token-signing keys, root key (KMS/HSM or local software KMS for single node) and key-backup shares | M8 | deferred(M8) | cs-kms LocalSoftwareKms (M0: 0600 file, warning) | — |
+| J.4-2 | App. J.4 | Local software KMS acceptable only for single-node deployments (contract: logs a warning) | M0 | in-progress | cs-kms::LocalSoftwareKms | engineer tests; review |
+| J.4-3 | App. J.4 steps 2–5 | Join with one-time tokens; installer creates domain DBs, runs migrations, validates role placement; first admin via one-time setup link; health check and restore-drill self-test before success | M8 | deferred(M8) | — | — |
+| J.4-4 | App. J.4 | Configuration is a declarative file validated before it is applied (contract: in full; unknown keys error) | M0 | in-progress | cs-common::config | qa:config::unknown_top_level_key_rejected; qa:config::unknown_nested_key_rejected; qa:config::invalid_config_does_not_start_listener |
+| J.4-5 | App. J.4 | Configuration can lock settings so tenants cannot change them ([locks]) | M0 | in-progress | cs-common::config [locks] | qa:config::locks_section_accepted |
+| K.1-1 | App. K.1 | PITR coverage per database spans recovery window; gaps alert | M8 | deferred(M8) | — | — |
+| K.1-2 | App. K.1 | Full backups verified after writing (checksums, manifest, catalog, key metadata, chain) | M8 | deferred(M8) | — | — |
+| K.1-3 | App. K.1 | Every object covered by full ciphertext scrub over its lifetime; sampling never claimed as proof | M8 | deferred(M8) | — | — |
+| K.1-4 | App. K.1 | Plaintext verification stratified; full campaign over every server-decryptable object at least every 90 days; no plaintext claim for vaults | M8 | deferred(M8) | — | — |
+| K.1-5 | App. K.1 | Journal archive and namespace checkpoints verified for contiguity daily | M8 | deferred(M8) | — | — |
+| K.1-6 | App. K.1 | Key backup shares attested quarterly; KMS confirms every active KEK version has a backup | M8 | deferred(M8) | — | — |
+| K.2-1 | App. K.2 | Drills at least quarterly (policy default monthly) in isolated environment with no path to production | M8 | deferred(M8) | — | — |
+| K.2-2 | App. K.2 | Drill restores all domains to causally closed vector, keys from shares, full reference graph, object sample (default 0.1% of chunks, ≥ 10,000, stratified); one tenant namespace rebuilt from checkpoint+journal | M8 | deferred(M8) | — | — |
+| K.2-3 | App. K.2 | Drill verification: reconciler no divergence; C.3 holds; sampled objects decrypt and hash; sampled users authenticate and list; time and loss within targets | M8 | deferred(M8) | — | — |
+| K.2-4 | App. K.2 | Results recorded in audit log and console; failed drill is a severity-1 incident | M8 | deferred(M8) | — | — |
+| K.3-1 | App. K.3 | Single-node console shows last verified off-host backup and last drill time; warns when over policy age | M8 | deferred(M8) | — | — |
+| L-1 | App. L | A release is published only when the App. L suite passes | M8 | deferred(M8) | — | — |
+| L.1-1 | App. L.1 | Mixed-version cluster: adjacent versions in every role run functional suite during and after rolling upgrade | M8 | deferred(M8) | — | — |
+| L.1-2 | App. L.1 | Rollback to N−1 before finalization: no data loss or unreadable state | M8 | deferred(M8) | — | — |
+| L.1-3 | App. L.1 | Protocol negotiation tested both directions (RPC, tokens, receipts, commands, realtime) | M8 | deferred(M8) | — | — |
+| L.2-1 | App. L.2 | Golden files for sealed objects, sidecars, manifests, journal segments, checkpoints, live-doc snapshots from every supported version | M3 | deferred(M3) | — | — |
+| L.2-2 | App. L.2 | Published sealed-format test vectors (header, nonces, AD, commitments) checked against independent implementations | M3 | deferred(M3) | — | — |
+| L.2-3 | App. L.2, erratum C8 | (M0 analogue) Signing-envelope test vectors produced by an independent implementation | M0 | in-progress | crates/cs-crypto/tests/vectors | qa:signing::valid_vectors_verify; qa:signing::signer_produces_identical_bytes; vectors: crates/cs-qa-tests/vectors/gen/gen_sig_vectors.py |
+| L.3-1 | App. L.3 | Every migration runs online under load against a DB populated by previous version with previous nodes running | M8 | deferred(M8) | — | — |
+| L.3-2 | App. L.3 | Contractions tested only after expansion finalized in previous release | M0 | in-progress | cs-db migration runner | qa:migrations::contract_before_finalized_expand_refused; qa:migrations::contract_after_finalized_expand_applies |
+| L.4-1 | App. L.4 | Recorded previous-major requests replay with identical responses except documented additions; error codes conform to App. D | M1 | deferred(M1) | — | qa:error_model::* (App. D conformance from M0) |
+| L.4-2 | App. L.4 | N−1 reference apps and SDK test plugins run unchanged on N; exported interface contract tests pass across upgrade | M5 | deferred(M5) | — | — |
+| L.5-1 | App. L.5 | Cross-tenant tests for every host call, endpoint and SQL path (read, list, search, share, subscribe; crafted SQL, cursors, consistency tokens, data-plane tokens); all fail with not_found or permission_denied | M2 | deferred(M2) | — | — |
+| L.5-2 | App. L.5 | Revocation tests: each revocation type denied at every enforcement point within bound, incl. stale feed and unbounded clock uncertainty | M2 | deferred(M2) | — | — |
+| L.5-3 | App. L.5 | Plugin sandbox tests: every undeclared capability attempt fails | M5 | deferred(M5) | — | — |
+| L.5-4 | App. L.5 | Capability lifecycle tests: fresh approval after expansion, immediate host-call revocation, queued job cancellation/revalidation, per-step reauthorization | M5 | deferred(M5) | — | — |
+| L.5-5 | App. L.5 | Full-mode UI tests: exact-digest approval, per-user activation, short-lived session binding, persistent indicator, immediate deactivation | M9 | deferred(M9) | — | — |
+| L.6-1 | App. L.6 | Crash, partition, disk error and clock skew injection during upgrade, finalize, recovery; C.3 invariants hold | M8 | deferred(M8) | — | — |
+| L.6-2 | App. L.6 | Scale tests verify H.5 limits and H.2/H.3 targets on reference configuration | M8 | deferred(M8) | — | — |
+| L.6-3 | App. L.6 | Saga fault injection: crash or lost ack after every local step and pivot; verify idempotency, pre-pivot compensation, post-pivot forward recovery, duplicate outbox delivery, reconciliation convergence | M0 | in-progress | cs-ops (framework + test saga) | qa:sagas::crash_after_each_pre_pivot_step_converges; qa:sagas::crash_after_pivot_converges_forward; qa:sagas::failure_before_pivot_compensates_in_reverse; qa:sagas::duplicate_step_delivery_is_idempotent; qa:sagas::lost_ack_after_step_is_idempotent |
+| L.6-4 | App. L.6 | Revocation tests: startup barriers, stale/corrupt snapshots, feed gaps, epoch changes, clock uncertainty, nested-group removal, simultaneous read/revoke; measure last unauthorized read/write/realtime action incl. large transfers, ranges, slow clients, buffered frames, resumes | M2 | deferred(M2) | — | — |
+| L.6-5 | App. L.6 | Recovery tests: remove one domain at a time, restore to vector, inject missing outboxes and unknown saga outcomes; readiness stays closed until dependents dominate vector | M8 | deferred(M8) | — | — |
+| L.6-6 | App. L.6 | Storage publication tests: no version acknowledged while any replica/fragment receipt missing, incl. node loss, partition, retry, unknown CAS outcome | M3 | deferred(M3) | — | — |
+| L.6-7 | App. L.6 | Plugin isolation tests: all trust classes, FS/network escape, microVM boundary, exhaustion, digest change, capability expansion | M9 | deferred(M9) | — | — |
+| L.6-8 | App. L.6 | Search tests: large nested groups, broad spaces, ACL churn, stale access sets; no title/snippet/count/facet leak before authorization | M7 | deferred(M7) | — | — |
+| L.6-9 | App. L.6 | Folder tests: 10-million-entry folders, bucket split/merge, concurrent rename/move/import, cursor continuation, snapshot exactness | M8 | deferred(M8) | — | — |
+| L.6-10 | App. L.6 | Offline tests: beyond cursor expiry, schema migration, revoked access, old formats, conflict replay without silent loss | M7 | deferred(M7) | — | — |
+| L.6-11 | App. L.6 | Object lifecycle tests: receipt validation, precommit, pivot, reference and quota conversion, reseal, concurrent reuse, dereference, retirement, deletion, inventory reconciliation; all converge | M3 | deferred(M3) | — | — |
+| L.6-12 | App. L.6 | SQL isolation tests: tenant spoofing, tenant_id mutation, nested CTEs, view expansion, function shadowing, search_path, catalog reads, cross-schema, prepared-statement reuse across tenants, pooled-connection contamination, RLS bypass, unknown AST nodes against shipped parser/DB versions | M5 | deferred(M5) | — | — |
+| L.6-13 | App. L.6 | Crypto format golden files and vectors: boundary payloads, segments, algorithms, compression, malformed/truncated/reordered/duplicated data, wrong keys/identities, modified tags, commitments, nonce reuse, vault recipient mismatch, cross-implementation interop | M3 | deferred(M3) | — | — |
+| L.6-14 | App. L.6, erratum C8 | (M0 analogue) Signing envelope negative vectors: wrong context, non-canonical CBOR, truncated, oversized, wrong key_id, bit-flipped signature | M0 | in-progress | cs-crypto::sig | qa:signing::negative_vectors_rejected; qa:signing::oversized_envelope_rejected_before_decode |
+| L.6-15 | App. L.6, erratum C10 | Independent review of key hierarchy, domain separation, nonces, authenticated headers, limits, rotation, recovery, shredding, downgrade; format not production-stable until review clean, fuzzing and negative vectors pass, migration/recovery tested | M3 | deferred(M3) | — | — |
+| L.6-16 | App. L.6 | Nonces from OS CSPRNG; uncertain key/nonce state requires fresh seal key and seal ID | M3 | deferred(M3) | — | — |
+| L.6-17 | App. L.6 | Capacity tests verify hard reservations (runtime, DB, network, storage, repair, compaction); benchmarks include degraded and repair profiles; throughput counts only durable completion | M8 | deferred(M8) | — | — |
+| M.1-1 | App. M.1 | Core owns identity, placement, lifecycle, ACLs, links, retention, references; app owns type schema, semantics, validators, records, export/import; object bytes owned by core storage | M5 | deferred(M5) | — | — |
+| M.1-2 | App. M.1 | Type declares visibility, owning app, required provider interfaces, export format; placement in provider container does not transfer ownership | M5 | deferred(M5) | — | — |
+| M.2-1 | App. M.2 | Disabling stops new writes and jobs, keeps resources and ownership; read-only and export remain where possible | M5 | deferred(M5) | — | — |
+| M.2-2 | App. M.2 | Uninstall requires explicit disposition for every owned resource class; silent deletion prohibited | M5 | deferred(M5) | — | — |
+| M.2-3 | App. M.2 | Removing required provider blocked until dependent resources migrated, exported or retained disabled with recovery path | M5 | deferred(M5) | — | — |
+| M.2-4 | App. M.2 | Replacement provider adopts resources only via versioned migration saga with single ownership-transfer pivot; never two authoritative owners | M9 | deferred(M9) | — | — |
+| M.2-5 | App. M.2 | Application export tested independently of app runtime; documented per user and tenant | M9 | deferred(M9) | — | — |
+| M.3-1 | App. M.3 | Native clients declare protocol/schema versions; minimum versions and cursor validity published; expired cursor requires full resync, server never guesses continuation | M7 | deferred(M7) | — | — |
+| M.3-2 | App. M.3 | Local edits remain in durable client outbox until pivot acknowledged; crash or lost response causes idempotent retry, never duplicate mutation | M7 | deferred(M7) | — | — |
+| M.3-3 | App. M.3 | Platform guarantees revocation of future access and managed-client reconciliation, not remote erasure of exported plaintext | M7 | deferred(M7) | — | — |
+
+## M0 contract obligations (docs/contracts/M0-foundations.md, "design" detail)
+
+These rows trace design decisions the frozen M0 contract adds where the spec leaves details open. They are verified at the M0 gate in addition to the spec rows above.
+
+| ID | Spec ref | Requirement | Milestone | Status | Code | Tests |
+|---|---|---|---|---|---|---|
+| CT.M0-1 | contract §1 | Typed ID newtypes in cs-common::id (TenantId … RequestId) are not implicitly convertible; text form lowercase hyphenated; 16 big-endian bytes in binary | M0 | in-progress | cs-common::id | qa:ids::typed_ids_are_uuidv7; qa:ids::id_text_form_lowercase_hyphenated |
+| CT.M0-2 | contract §1 | URN type segment matches ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$; spaces use core.space; parsing strict (no whitespace, lowercase only, no extra segments) | M0 | in-progress | cs-common Urn::parse | qa:ids::urn_parse_strict; qa:ids::urn_roundtrip |
+| CT.M0-3 | contract §1, §17.2 | All randomness via cs-crypto::rand from OS CSPRNG; failure fails the operation | M0 | in-progress | cs-crypto::rand | review (gate §4) |
+| CT.M0-4 | contract §2 | status and retryable derived from the code and never settable independently | M0 | in-progress | cs-common::error | qa:error_model::problem_status_retryable_derived_from_code |
+| CT.M0-5 | contract §2 | TypeScript ErrorCode union in @cs/sdk mirrors D.2 exactly | M0 | in-progress | web/packages/sdk | frontend tests; gate §3 cross-check |
+| CT.M0-6 | contract §3 | Envelope signed_bytes = "cs-sig/v1" 0x00 context 0x00 payload; wire = CBOR [1, context, key_id, payload_bstr, signature_bstr]; base64url without padding on text transports | M0 | in-progress | cs-crypto::sig | qa:signing::valid_vectors_verify; qa:signing::signer_produces_identical_bytes; qa:signing::base64url_text_form_unpadded |
+| CT.M0-7 | contract §3 | Context registry is closed: consistency-context/v1, snapshot-handle/v1, decision-ticket/v1, revocation-record/v1, watermark-heartbeat/v1, storage-receipt/v1, data-plane-token/v1, state-attestation/v1, test/v1 | M0 | in-progress | cs-crypto::sig::Context | qa:signing::context_registry_is_closed |
+| CT.M0-8 | contract §3 | Payload deterministic CBOR (RFC 8949 §4.2.1): preferred ints, definite lengths, bytewise-sorted keys, no floats, no unspecified tags; verifier re-encodes and rejects on mismatch | M0 | in-progress | cs-crypto::sig | qa:signing::negative_vectors_rejected; qa:signing::non_canonical_payload_rejected_even_with_valid_signature |
+| CT.M0-9 | contract §3 | key_id resolved through KeyResolver trait (multi-issuer, rotation); never a single global key | M0 | in-progress | cs-crypto::sig::KeyResolver | qa:signing::negative_vectors_rejected (unknown_key_id, wrong_key_for_key_id); qa:signing::rotated_keys_both_resolve |
+| CT.M0-10 | contract §3 | Signature verified before any payload field is used; size limit (16 KiB) checked before decoding | M0 | in-progress | cs-crypto::sig | qa:signing::oversized_envelope_rejected_before_decode |
+| CT.M0-11 | contract §4 | VectorComponent = {cluster_id, domain_id, partition u32, position u64}; vector sorted, deduplicated, max 64, error above (never truncated); per-component dominates; no time fields | M0 | in-progress | cs-common::consistency | qa:consistency_vector::* |
+| CT.M0-12 | contract §4 | DomainId enum = the eleven §18.1 domains plus App(application_id) | M0 | in-progress | cs-common::consistency::DomainId | qa:consistency_vector::domain_ids_match_spec_18_1 |
+| CT.M0-13 | contract §5 | One YSQL database per domain (cs_identity … cs_audit), each with own URL, pool size and timeouts; DomainPool bound to exactly one domain | M0 | in-progress | cs-db::DomainPool | qa:readiness::readyz_503_lists_unreachable_domain_barrier |
+| CT.M0-14 | contract §5 | Retry bound default 10 attempts or 5 s; closure must be re-runnable | M0 | in-progress | cs-db | qa:db_retry::retry_bounded |
+| CT.M0-15 | contract §5 | REPEATABLE READ helper exists only for journal reads; no SERIALIZABLE API | M0 | in-progress | cs-db | review (gate §4) |
+| CT.M0-16 | contract §5.1 | Migration files crates/<crate>/migrations/<domain>/<NNNN>_<name>.<class>.sql; schema_migrations(version, name, class CHECK, checksum, applied_at) | M0 | in-progress | cs-db::migrate | qa:migrations::applies_in_order_and_records_checksums; qa:migrations::invalid_filename_or_class_rejected; qa:migrations::schema_migrations_class_check_constraint |
+| CT.M0-17 | contract §5.1 | contract-class migration refused unless matching expand applied in an earlier finalized release (requires_finalized header vs finalized-release table) | M0 | in-progress | cs-db::migrate | qa:migrations::contract_before_finalized_expand_refused; qa:migrations::contract_after_finalized_expand_applies |
+| CT.M0-18 | contract §5.2 | outbox + outbox_counters schema exactly as frozen; sequence allocated in-transaction under row lock; only write path Outbox::append(&mut DomainTx, …); payload ≤ 64 KiB | M0 | in-progress | cs-db::Outbox | qa:outbox::* |
+| CT.M0-19 | contract §5.2 | partition = hash(partition key) mod P, P fixed per domain at creation | M0 | in-progress | cs-db::Outbox | qa:outbox::same_partition_key_same_partition |
+| CT.M0-20 | contract §5.3 | idempotency_records schema as frozen; key 1..255 visible ASCII; digest = BLAKE3 of canonical (method, route template, path params, body); expires now()+24 h | M0 | in-progress | cs-db idempotency | qa:idempotency::* |
+| CT.M0-21 | contract §5.3 | Semantics: completed same digest → stored response; different digest → idempotency_mismatch 422; in progress → conflict (retryable false) or outcome_unknown (504) when possibly committed; record in same tx as effect | M0 | in-progress | cs-db idempotency | qa:idempotency::replay_returns_identical_response; qa:idempotency::different_digest_is_idempotency_mismatch_422; qa:idempotency::in_progress_duplicate_is_conflict_not_retryable; qa:idempotency::record_written_in_same_transaction_as_effect |
+| CT.M0-22 | contract §5.4 | sagas table as frozen (states CHECK, UNIQUE (tenant_id, saga_type, idempotency_key), version CAS); compensating only from pre-pivot states; after pivot_committed only forward or blocked_for_operator | M0 | in-progress | cs-ops | qa:sagas::* |
+| CT.M0-23 | contract §5.4 | M0 test saga spans two test domains with crash injection after every step | M0 | in-progress | cs-ops (engineer test saga); QA saga in cs-qa-tests | qa:sagas::crash_after_each_pre_pivot_step_converges |
+| CT.M0-24 | contract §6 | One declarative TOML config validated in full before anything applied; unknown keys error; sections node, domains.<name>, kms, api, telemetry, policy, locks | M0 | in-progress | cs-common::config | qa:config::* |
+| CT.M0-25 | contract §6 | Binary refuses roles whose milestone is not implemented with a clear message; never starts them as silent no-ops | M0 | in-progress | crates/cs | qa:config::unimplemented_role_refused_by_binary; qa:config::unknown_role_rejected |
+| CT.M0-26 | contract §7 | GET /healthz liveness (process only); GET /readyz 200 only when all configured domains reachable and migrations at expected version, else 503 problem listing failing barriers | M0 | in-progress | cs-api | qa:readiness::*; qa:http_surface::healthz_is_liveness_only |
+| CT.M0-27 | contract §7 | Every response carries X-Request-Id; every error is problem+json incl. 404/405 on unknown routes and body-parse failures | M0 | in-progress | cs-api | qa:http_surface::* |
+| CT.M0-28 | contract §8 | W3C trace context; JSON logs; Prometheus /metrics on separate admin listener; secrets/tokens/keys never logged; Secret<T> has no Debug/Display of contents | M0 | in-progress | cs-common telemetry, Secret<T> | engineer tests; gate §2 manual check |
+| CT.M0-29 | contract §9 | trait Kms (generate_key, wrap, unwrap, sign, public_key, rotate); versioned key IDs; LocalSoftwareKms root key file 0600 and single-node warning; zeroizing buffers | M0 | in-progress | cs-kms | engineer tests; qa:signing::rotated_keys_both_resolve |
+| CT.M0-30 | contract §10 | @cs/sdk ApiClient (no hard-coded backend internals), Problem + ErrorCode, RetryPolicy, IdempotencyKey (crypto.randomUUID), design tokens as CSS custom properties | M0 | in-progress | web/packages/sdk | frontend tests; gate §3 |
+| CT.M0-31 | contract §10 | @cs/components base set cs-button, cs-text-field, cs-dialog, cs-error-banner (localized title, request_id, never raw internals), cs-spinner; WCAG 2.2 AA; all strings localized | M0 | in-progress | web/packages/components | frontend tests; gate §3 |
+| CT.M0-32 | contract §2 | unauthenticated triggers one token refresh and one retry (hook exists in M0, wired M1); writes retried only with same Idempotency-Key | M0 | in-progress | web/packages/sdk | frontend tests |
+
+## Coverage notes
+
+Every section of the specification v2.4.1 was read in full and reviewed for normative content by the QA Engineer on 2026-11-19. "Rows" lists the ID prefixes used; "none" means the section is purely descriptive or introductory and contains no independently testable requirement (its content is covered by the rows named).
+
+| Section | Reviewed | Rows / note |
+|---|---|---|
+| 1.1 Purpose | yes | 1.1-1 |
+| 1.2 Goals | yes | 1.2-* |
+| 1.3 Scope | yes | 1.3-* |
+| 1.4 Normative language | yes | 1.4-* |
+| 1.5 Terminology | yes | none (definitions only; used throughout) |
+| 2.1 Layers | yes | 2.1-* |
+| 2.2 Node roles | yes | 2.2-* |
+| 2.3 Architecture diagram | yes | none (diagram; flows covered by 2.4, 6.7, 15.5, 17.6) |
+| 2.4 Request lifecycle | yes | 2.4-* |
+| 2.5 Deployment shapes | yes | 2.5-* |
+| 2.6 Platform-wide correctness contracts | yes | 2.6-1 … 2.6-15 |
+| 3.1–3.5 Core responsibilities and boundaries | yes | 3.1-*, 3.3-*, 3.4-*, 3.5-*; 3.2 (what apps own) is descriptive, enforced via 3.3-* and M.1-* |
+| 4.1–4.6 Resource model | yes | 4.1-* … 4.6-* |
+| 5.1–5.7 Identity | yes | 5.1-* … 5.7-* |
+| 6.1–6.8 Authorization and sharing | yes | 6.1-* … 6.8-* |
+| 7.1–7.9 (incl. 7.9.1–7.9.8) Applications | yes | 7.1-* … 7.9-* |
+| 8.1–8.7 (incl. 8.3.1) Data ownership | yes | 8.1-* … 8.7-*, 8.3.1-* |
+| 9.1–9.8 Cross-application integration | yes | 9.1-* … 9.8-* |
+| 10.1–10.11 Real-time collaboration | yes | 10.1-* … 10.11-* |
+| 11.1–11.5 Events | yes | 11.1-* … 11.5-* |
+| 12.1–12.4 (incl. 12.3.1) Search | yes | 12.1-* … 12.4-*, 12.3.1-* |
+| 13.1–13.3 (incl. 13.1.1) Synchronization | yes | 13.1-*, 13.1.1-*, 13.2-*, 13.3-* |
+| 14.1–14.6 UI | yes | 14.1-* … 14.6-*; 14.5 n/a (native clients out of scope until decided) |
+| 15.1–15.8 Security boundaries | yes | 15.1-* … 15.8-* |
+| 16.1–16.2 Reference applications | yes | 16.1-*, 16.2-* (reference-app design n/a per §1.3; minimal Drive deferred M5) |
+| 17.1–17.10 (incl. 17.3.1, 17.3.2, 17.6.1) Object storage | yes | 17.1-* … 17.10-* |
+| 18.1–18.5 Metadata store | yes | 18.1-* … 18.5-* |
+| 19.1–19.3 Journal, snapshots, listings | yes | 19.1-* … 19.3-* |
+| 20.1–20.5 Cluster, fencing, time | yes | 20.1-* … 20.5-* |
+| 21.1–21.5 Scalability | yes | 21.1-* … 21.5-* |
+| 22 Capacity and repair headroom | yes | 22-* |
+| 23.1–23.5 Disaster recovery | yes | 23.1-* … 23.5-* |
+| 24 Upgrades and compatibility | yes | 24-* |
+| 25.1–25.4 Observability and audit | yes | 25.1-* … 25.4-* |
+| 26 Research decisions R1–R14 | yes | 26-* (each R invariant binding; R1, R2, R3, R5, R6, R8, R9, R10, R12, R13 invariants are covered by 8.3.1-1, 2.6-8/6.4-*, 17.3-2, 17.2-9, 17.3-6, 10.2-2, 12.3.1-1, 18.4-10, 13.1.1-4, 23.4-2 respectively) |
+| 27 Design principles | yes | 27-1 (each principle is restated by a normative row elsewhere) |
+| App. A Threat model (A.1–A.5) | yes | A.1-* … A.5-* |
+| App. B Failure and recovery matrix | yes | B-1 … B-18 (one row per failure line) |
+| App. C (C.1–C.3) Consistency rules | yes | C.1-1, C.2-1 … C.2-16 (rules C1–C16), C.3-1 … C.3-10 |
+| App. D (D.1–D.3) API errors | yes | D.1-*, D.2-1 … D.2-20 (one row per code), D.3-* |
+| App. E Schema conventions | yes | E-1 … E-15 |
+| App. F (F.1–F.5) State machines | yes | F-1, F.1-*, F.2-*, F.3-*, F.4-*, F.5-* (one row per transition) |
+| App. G (G.1–G.5) Plugin SDK | yes | G.1-* … G.5-* |
+| App. H (H.1–H.5, H.3.1) Targets | yes | H.1-* … H.5-* |
+| App. I (I.1–I.3) SLOs | yes | I.1-* … I.3-* |
+| App. J (J.1–J.4) Deployment | yes | J.1-* … J.4-* |
+| App. K (K.1–K.3) Backup verification | yes | K.1-* … K.3-* |
+| App. L (L.1–L.6) Upgrade test suite | yes | L-1, L.1-* … L.6-* |
+| App. M (M.1–M.3) Ownership and replacement | yes | M.1-* … M.3-* |
+| Errata C1–C10 | yes | C1: 17.4-7, F.4-2 · C2: 6.7-5, H.5-5 · C3: 17.3-2, 17.5-7, 25.2-1, H.3.1-1 · C4: 17.3-1, 17.3.2-7 · C5: F.5-* · C6: F.3-8 · C7: 8.3-5 · C8: 6.4-12 … 6.4-15, L.2-3, L.6-14 · C9: document footers only (no requirement) · C10: 17.2-5, L.6-15 |
+| docs/contracts/M0-foundations.md | yes | CT.M0-1 … CT.M0-32 |
+
+## Open questions for Team Leader
+
+Raised by QA while building this matrix. QA has not resolved any of them; where a test needs an interpretation, the test names the OQ and the interpretation is stated here.
+
+- **OQ-1 (naming collision).** The approved errata are named C1–C10 and the spec's Appendix C rules are named C1–C16. CLAUDE.md ("App. C, C1"), the plan ("C10 of App. C") and the contract headings ("(App. E, C2)", "(D.3, C4)", "(§18.4, C3)", "(App. C, C10; …)") mix both. Proposal: rename the errata to E1–E10 (or ERR-C1 …) in docs/SPEC_ERRATA.md. This matrix writes "erratum Cn" and "App. C rule Cn".
+- **OQ-2 (App. C rule C4 vs D.2).** Rule C4 says reuse of an idempotency key with a different digest "is conflict". D.2 and the contract §5.3 use `idempotency_mismatch` (422). QA tests 422 and reads "conflict" in C4 as a generic word. Please confirm.
+- **OQ-3 (codes missing from D.2).** §13.1.1 requires `cursor_expired` and `client_upgrade_required`, which are not in table D.2. The contract §2 says the code set is exactly D.2. An erratum is needed before M7 (add the codes, or map them to existing codes with a field such as `errors[]`).
+- **OQ-4 (in-progress idempotency semantics).** (a) The contract returns `conflict` (409, not retryable) for a duplicate while the original is in progress. But D.3 says every retryable write error is safe to retry, and the client has no signal that a later retry would succeed. (b) When is "the original's outcome may already be committed" decided, which yields `outcome_unknown`? (c) For single-domain operations the record is written in the same transaction as the effect, so `in_progress` is never visible. Concurrent duplicates then collide on the primary key. Is the loser's response a replay (after waiting) or `conflict`? QA accepts either "identical replay" or "conflict, retryable=false" for concurrent duplicates and asserts exactly one effect.
+- **OQ-5 (request digest canonicalization).** "BLAKE3 of canonical (method, route template, path params, body)". Is the JSON body canonicalized (for example RFC 8785 JCS), or hashed as raw bytes? The answer decides whether `{"a":1,"b":2}` and `{"b":2,"a":1}` under the same key are a replay or a mismatch. QA asserts only that differences in method, route, params and body *values* change the digest. The key-order case is reported, not asserted.
+- **OQ-6 (policy safe ranges).** Contract §6 requires every policy to carry "its default and safe range from the spec". The spec gives an explicit range only for S (max 30 s) and the segment size (4 KiB–1 MiB). Most policies give only a default (trash retention 30 d, version retention 30 d/100, sessions 14 d/90 d, step-up 5 min, idempotency 24 h, journal shards 64, read grace 10 min, and so on). Who defines the missing ranges, and should they be recorded as errata? Also, S has no minimum. An S below the 500 ms heartbeat interval would make every consumer permanently stale. Suggest a minimum S of at least 1 s. QA asserts 30 s accepted, 31 s and 0 rejected.
+- **OQ-7 (no JSON route in M0).** Contract §7 requires problem+json for body-parse failures, but all `/api/v2` routes are frozen from M1 onward, so M0 has no JSON-accepting route to test black-box. QA binds the test through `JSON_POST_ROUTE` in `crates/cs-qa-tests/tests/support/contract.rs`. Please either name an M0 route that accepts JSON (for example an internal echo route that exists only in test builds) or defer that test to M1.
+- **OQ-8 (signing envelope details).** The contract does not say: (a) whether the envelope array itself must be deterministic CBOR; (b) whether trailing bytes after the array are rejected; (c) the CBOR type of `key_id` (text or bytes); (d) whether the 16 KiB limit applies to the binary or the base64url form. QA's interpretation is: canonical envelope required, trailing bytes rejected, `key_id` is a text string, and the limit applies to binary bytes with the base64 form limited to ⌈16384·4/3⌉ chars. The vectors for (a) and (b) are tagged `oq8` so a failure is clearly attributable.
+- **OQ-9 (consistency vector dedup).** "Sorted, deduplicated list". What happens to two components with the same (cluster_id, domain_id, partition) but different positions? Are they merged to the max, or is that an error? Does the 64 limit apply before or after dedup? QA asserts exact-duplicate dedup and the 64/65 boundary on distinct keys. It does not assert the conflicting-duplicate case.
+- **OQ-10 (snapshot milestone).** §19.2 snapshots are not assigned to a milestone in the plan. M2 lists journal shards and live listings, but the M3 purge executor must respect snapshots (§4.4, §17.9). QA provisionally assigned §19.2 and snapshot listings to M3.
+- **OQ-11 (single-node disk minimum).** J.3 requires at least 2 disks (R = 2) for a single node, and the dev host has one NVMe (plan §6 open item). This is restated here because it blocks honest M3 gate criteria 17.3.1-2 and J.3-1.
+- **OQ-12 (readiness "expected migration version").** Does `cs` apply migrations at startup, or does an installer apply them (J.4 step 3)? With the second model, a fresh DB makes `/readyz` 503 until an operator migrates. QA's positive readiness test applies migrations through the adapter first.
+- **OQ-13 (problem `instance`).** D.1 says `instance` is the "request path". Does it include the query string? Query parameters can carry data the caller sent but that should not be echoed into logs or caches. QA asserts that `instance` equals the path without the query string.
+- **OQ-14 (40001 retry exhaustion code).** Which Appendix D code is returned when the bounded 40001/40P01 retry is exhausted? QA expects a retryable code (`unavailable` 503) and does not accept `conflict` (409), because the request did not conflict with state.
+- **OQ-15 (ChunkId entropy).** §17.1 says "128-bit random". The contract says "UUIDv4 layout", which has 122 random bits (6 bits are version and variant). Please confirm that this is acceptable as "128-bit random".
+- **OQ-16 (outbox primary key vs App. E).** App. E says tenant-scoped tables have tenant_id first and lists outbox columns as (tenant_id, sequence, event type, payload, created_at). The contract keys the outbox `((partition) HASH, sequence)` and asserts that "App. E permits this for logs keyed by a hash-sharded column", but App. E contains no such exception. This is reasonable, but it is an interpretation and should be recorded as an erratum.
+- **OQ-17 (saga transition table).** App. F says transitions not listed are rejected with conflict. §18.4 and contract §5.4 list the saga states but give no full transition table for compensating, compensated and blocked_for_operator. For example: can blocked_for_operator return to completing after operator action? Can compensating go to blocked_for_operator? QA tests only the transitions the text fixes.
+- **OQ-18 (role list mismatch).** §2.2 lists seven roles including `edge`. J.2 lists six (control, storage, api, realtime, worker, search) without edge. The contract §6 includes edge. Please confirm `edge` is a role.
+- **OQ-19 (idempotency response > 64 KiB).** Contract §5.3: "larger results store a reference". In M0 there is no object storage (M3) to reference. Where is it stored? QA's test only asserts that the replay is byte-identical.
+- **OQ-20 (binary CLI).** The contract does not specify how `cs` receives its config file. QA assumes `cs --config <path>`, bound in one place in the adapter.
+- **OQ-21 (idempotency expiry).** After the 24 h retention a key may be reused, and QA assumes it is treated as a new request. Please confirm. The alternative is that keys are never reusable, which would need the records to be kept indefinitely.
