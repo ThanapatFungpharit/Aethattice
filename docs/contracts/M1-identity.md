@@ -177,7 +177,9 @@ These ranges are not in the spec. They are recorded here for owner review togeth
 
 - The QA negative-test list in `docs/qa/M0-gate.md` §6.1.
 - `qa:http_surface::malformed_json_body_returns_400_problem`, moved from M0.
+- An automated scan of all log output emitted during the M1 suites: no access token, refresh token, setup link, recovery code or grant, OPAQUE message, DPoP proof or key material may appear (carried over from M0 row CT.M0-28, which is `implemented` but not `tested`).
 
 ## Changelog
 - 2026-11-19: draft.
 - 2026-11-20: draft rev 2: resolves QA review M1-R1 … M1-R14. Pending owner decision: §0 (no HTTP admin API in M1) and §8 policy ranges.
+- 2026-11-20: §9: log-secret scan added to the M1 gate (M0 carry-over CT.M0-28).

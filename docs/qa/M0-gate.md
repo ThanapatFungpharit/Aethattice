@@ -354,4 +354,35 @@ The orphans have a measurable cost: DROP latency and the 5 s retry budget (F-2) 
 
 Expected outcome once item 1 is done: a conditional **PASS**, subject to items 2–5. F-2 and F-3 are tracked for M1.
 
-**Gate decision:** `PASS` / `FAIL` — Team Leader: ______ Date: ______
+### 7.6 Team Leader closure (2026-11-21)
+
+The QA engineer was unavailable (usage limit). At the owner's instruction ("skip QA for now if possible") the Team Leader ran the remaining gate steps on the merged `milestone/m0-foundations` tree (m0/backend 69f85a8 + m0/qa-gate b7b4baa). QA may re-verify when available.
+
+- **F-4:** resolved. The owner approved recreating the `yb-data` volume, and the cluster is healthy.
+- **2.2 GitHub Actions:** PASS (run 44722983908 on c856e14; the remote was added by the owner).
+- **F-1, F-2, F-3:** fixed by the backend engineer (da30fd0) and reviewed by the TL.
+  - F-1: the engineer harness fails a test when a database leaks, and serializes DDL.
+  - F-2: contract rev 4 retry budgets, with connection acquisition excluded; migrations have their own budget.
+  - F-3: `trace::incoming_traceparent_is_continued_in_span_and_logs`.
+  - Two flake fixes: 7880683 and ce76435.
+- **TL test fix (69f85a8):** `readiness_with_real_domains_requires_reachable_and_migrated` failed once. A cold connection to a just-created database took longer than the 2 s barrier timeout. The test now uses 30 s, since it checks barrier semantics and the timeout itself has its own test.
+- **TL fix to the QA harness (`support/db.rs::drop_database_unlocked`):** on the healthy cluster, DROP aborted with 40001 while parallel tests ran DDL.
+  - With 5 attempts and about 3 s of backoff, the harness gave up, and 5 idempotency tests failed in cleanup only.
+  - Now 30 attempts, with capped exponential backoff de-synchronized per database.
+  - No test assertion changed.
+- **§2.1** `scripts/ci.sh --with-db`: 3 of 3 green (vitest 246/246), with 0 `cs_test_*` databases after each run.
+- **§3.3:** 117 passed, 0 failed, 1 ignored (`malformed_json_body_returns_400_problem`, moved to M1 §9). No SKIP. Run with `--no-fail-fast`.
+- **§3.4:** 3 of 3 green (32/32 each).
+- **§3.5:** 0 `qa_*` and 0 `cs_test_*` databases afterwards.
+- **§7.3 carry-over decisions** (docs/traceability.md):
+  - Review-rule rows (plus 21.3-1 and E-9): `implemented`, with this review as evidence.
+  - Frontend rows covered by named vitest suites: `tested`.
+  - Partially verifiable rows: `deferred(Mn)` to the milestone that completes them, with the M0 portion noted. Milestones M4–M8 are provisional.
+  - CT.M0-28: `implemented`, not `tested`, because emitted logs are not yet scanned for secrets. The scan is added to the M1 gate (M1 contract §9).
+  - No M0 row remains `in-progress`.
+- **Still open:**
+  - Owner review and freeze of `docs/contracts/M1-identity.md` draft rev 2 (§0 admin API, §8 policy ranges).
+  - Owner decisions OQ-2, OQ-3, OQ-6, OQ-10, OQ-11, errata C11 and C12, and the single-disk profile before M3.
+  - M1 implementation does not start until the M1 contract is frozen.
+
+**Gate decision:** `PASS`. The code and test gate passed. M1 starts only after the owner freezes the M1 contract. Team Leader, 2026-11-21. QA re-verification is pending.

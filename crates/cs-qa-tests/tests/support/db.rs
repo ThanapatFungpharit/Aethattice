@@ -237,15 +237,24 @@ async fn drop_attempt(admin: &str, name: &str) -> Result<bool, String> {
 }
 
 async fn drop_database_unlocked(admin: &str, name: &str) {
+    // On a healthy cluster DROP is fast but often aborts with 40001 ("could not serialize
+    // access due to concurrent update") while parallel tests run catalog DDL. Retry with a
+    // capped exponential backoff, de-synchronized per database so concurrent drops do not
+    // collide again in lockstep (5 attempts / ~3 s was not enough: TL gate rerun 2026-11-21).
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    let spread = h.finish() % 250;
     let mut last = String::new();
-    for attempt in 0..5u64 {
+    for attempt in 0..30u64 {
         match tokio::time::timeout(Duration::from_secs(180), drop_attempt(admin, name)).await {
             Ok(Ok(true)) => return,
             Ok(Ok(false)) => last = "still present".into(),
             Ok(Err(e)) => last = e,
             Err(_) => last = "drop attempt timed out after 180 s".into(),
         }
-        tokio::time::sleep(Duration::from_millis(200 * (attempt + 1))).await;
+        let backoff = (250u64 << attempt.min(5)).min(5_000) + (spread * (attempt + 1)) % 500;
+        tokio::time::sleep(Duration::from_millis(backoff)).await;
     }
     eprintln!("QA HARNESS LEAK: could not drop test database {name}: {last}");
     LEAKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
