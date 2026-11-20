@@ -3,15 +3,24 @@ on: [push, pull_request]
 jobs:
   ci:
     runs-on: ubuntu-latest
-    services:
-      yugabyte:
-        image: yugabytedb/yugabyte:2026.1.2.0-b137
-        options: --entrypoint "bin/yugabyted start --background=false"
-        ports: ["5433:5433"]
+    timeout-minutes: 60
+    env:
+      # Same toolchain as the dev host, so rustfmt/clippy output matches. Overrides rust-toolchain.toml.
+      RUSTUP_TOOLCHAIN: "1.99.1"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: "rustfmt, clippy" }
+      - name: Start YugabyteDB (same image as dev/docker-compose.yml)
+        run: |
+          docker run -d --name yb -p 5433:5433 yugabytedb/yugabyte:2026.1.2.0-b137 \
+            bin/yugabyted start --background=false --tserver_flags=ysql_max_connections=300
+          for i in $(seq 1 120); do
+            docker exec yb bash -c 'bin/ysqlsh -h $(hostname) -U yugabyte -c "select 1"' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs yb | tail -50; exit 1
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.99.1", components: "rustfmt, clippy" }
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - run: scripts/ci.sh --with-db

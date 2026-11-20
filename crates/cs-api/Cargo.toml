@@ -6,6 +6,29 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+axum.workspace = true
+cs-common.workspace = true
+cs-db.workspace = true
+futures.workspace = true
+http.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+opentelemetry.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+
+[dev-dependencies]
+cs-crypto = { workspace = true, features = ["fault-injection"] }
+cs-db = { workspace = true, features = ["testing"] }
+http-body-util.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
