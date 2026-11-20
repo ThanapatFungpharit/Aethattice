@@ -701,7 +701,8 @@ policy = ["idempotency_retention_hours"]
                 .contains("max_connections")
         );
         // node id must be UUIDv7
-        let v4 = crate::id::ChunkId::generate().unwrap().to_string();
+        // a fixed UUIDv4; a random 128-bit value would be a valid v7 one time in 64
+        let v4 = "1b4e28ba-2fa1-41d2-883f-0016d3cca427";
         let t = g.replacen("id = \"", &format!("id = \"{v4}\"\n#"), 1);
         assert!(invalid(&t).contains("node.id"));
         // multiple errors reported together

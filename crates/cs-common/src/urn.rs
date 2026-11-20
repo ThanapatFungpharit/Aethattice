@@ -239,19 +239,14 @@ mod tests {
             format!("cs:{t}:drive.folder:{r}:extra"),
             format!("cs:{t}:drive.folder"),
             format!("xs:{t}:drive.folder:{r}"),
-            format!("cs:{}:drive.folder:{r}", t.to_string().to_uppercase()),
-            format!("cs:{t}:drive.folder:{}", ChunkIdLike::v4()),
+            // fixed v7 tenant with hex letters, upper-cased
+            format!("cs:01890A5D-AC96-774B-BCCE-B302099A8057:drive.folder:{r}"),
+            // a fixed UUIDv4 (not v7); a random 128-bit ChunkId would be a valid v7 1 time in 64
+            format!("cs:{t}:drive.folder:1b4e28ba-2fa1-41d2-883f-0016d3cca427"),
             format!("cs:{t}:{}:{r}", "a.".repeat(70) + "b"),
         ];
         for b in bad {
             assert!(Urn::parse(&b).is_err(), "{b:?}");
-        }
-    }
-
-    struct ChunkIdLike;
-    impl ChunkIdLike {
-        fn v4() -> String {
-            crate::id::ChunkId::generate().unwrap().to_string()
         }
     }
 
