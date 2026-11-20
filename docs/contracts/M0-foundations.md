@@ -23,7 +23,7 @@
 - `detail` must never contain data the caller may not see. Internal errors use a generic detail; the cause goes to logs, correlated by `request_id`.
 - Existence hiding (D.3) is enforced by the authorization layer in M2. The M0 error type only provides the codes.
 - Application codes `app.{application_id}.{code}`: the type must already support them (each maps to a D.2 HTTP status) even though no plugins exist until M5.
-- Client retry policy (`@cs/sdk`, D.3): retry only when `retryable` is true. Exponential backoff with full jitter, starting at 200 ms, capped at 30 s, honouring `retry_after_ms`. Bounded attempts (default 5). Writes are retried only with the same `Idempotency-Key`. `unauthenticated` triggers one token refresh and one retry; the hook exists in M0 and is wired up in M1.
+- Client retry policy (`@cs/sdk`, D.3): retry only when `retryable` is true. Exponential backoff with full jitter, starting at 200 ms, capped at 30 s, honouring `retry_after_ms`. Bounded attempts (default 5). Writes are retried only with the same `Idempotency-Key`. `unauthenticated` triggers one token refresh and one retry; the hook exists in M0 and is wired up in M1. (rev 5) The hook does not refresh when `errors[]` contains `code: step_up_required` (M1 §2.3); refreshing cannot satisfy step-up.
 
 ## 3. Signing envelope (C8, design)
 
@@ -223,3 +223,4 @@ OpenTelemetry tracing with W3C trace context propagation, structured JSON logs, 
 - 2026-11-19 rev 2 (from QA open questions): ChunkId/ExtentId use full 128 random bits; idempotency in-progress, digest, expiry and size rules; outbox and sagas primary keys lead with tenant_id (App. E); explicit saga transition table; the framework guarantees step idempotency through step receipts; envelope encoding, trailing-byte, key_id and size details; vector duplicates merge to the maximum position; problem `instance` excludes the query string; retry exhaustion returns `unavailable`; migrations only via `cs migrate`; malformed-body test moved to M1. Naming: "C1–C10" means spec errata. Appendix C rules are always written "App. C rule Cn".
 - 2026-11-20 rev 3: idempotency concurrent-duplicate semantics aligned with the single-transaction design (block, then stored result; `outcome_unknown` only for separately committed in-progress records). Minimum Rust version raised to 1.94 (sqlx 0.9).
 - 2026-11-20 rev 4 (QA gate F-2): 40001/40P01 retry budget excludes connection acquisition; migrations get a separate, longer budget.
+- 2026-11-20 rev 5 (M1 review M1-R2): SDK refresh hook skips `step_up_required`. No change to problem fields.
