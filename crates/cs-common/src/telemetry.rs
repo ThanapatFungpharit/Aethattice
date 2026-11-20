@@ -60,7 +60,7 @@ impl Drop for Telemetry {
 pub fn init(cfg: &TelemetryConfig) -> Result<Telemetry, TelemetryError> {
     let filter =
         EnvFilter::try_new(&cfg.log_level).map_err(|e| TelemetryError::Filter(e.to_string()))?;
-    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    install_propagator();
     let provider = SdkTracerProvider::builder()
         .with_resource(
             Resource::builder()
@@ -87,6 +87,11 @@ pub fn init(cfg: &TelemetryConfig) -> Result<Telemetry, TelemetryError> {
         .install_recorder()
         .map_err(|e| TelemetryError::AlreadyInitialised(e.to_string()))?;
     Ok(Telemetry { provider, metrics })
+}
+
+/// Install the W3C Trace Context propagator (`traceparent` / `tracestate`) globally.
+pub fn install_propagator() {
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 }
 
 /// A metrics handle without installing global logging (tests and embedded use).

@@ -1259,3 +1259,223 @@ async fn idempotency_execute_helper_and_oversized_response_is_internal() {
     );
     t.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Retry budgets (contract §5 rev 4, QA gate F-2)
+// ---------------------------------------------------------------------------------------------
+
+/// A second pool on the test database with its own size and retry policy.
+fn side_pool(t: &TestDomains, max_connections: u32, retry: RetryPolicy) -> DomainPool {
+    let base = t.admin_url().rsplit_once('/').unwrap().0.to_owned();
+    let cfg = cs_common::config::DomainConfig {
+        url: cs_common::Secret::new(format!("{base}/{}", t.database_name(&D))),
+        pool: cs_common::config::PoolConfig {
+            max_connections,
+            acquire_timeout_ms: 60_000,
+            idle_timeout_ms: 1_000,
+            ..Default::default()
+        },
+    };
+    DomainPool::connect_lazy(D, &cfg, retry).unwrap()
+}
+
+#[tokio::test]
+async fn retry_budget_excludes_connection_acquisition() {
+    let Some(t) = setup().await else { return };
+    // 1 s budget, generous attempts. Every retry has to wait ~600 ms for a connection held by
+    // another task, so acquisition alone exceeds the budget; only attempt + backoff time counts.
+    let policy = RetryPolicy {
+        max_attempts: 50,
+        max_elapsed: Duration::from_secs(1),
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
+    let pool = side_pool(&t, 1, policy);
+    let attempts = Arc::new(AtomicU32::new(0));
+    let holders = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let started = std::time::Instant::now();
+    let (a, h, p) = (attempts.clone(), holders.clone(), pool.clone());
+    let n = pool
+        .transaction(move |tx| {
+            let n = a.fetch_add(1, Ordering::SeqCst) + 1;
+            if n <= 3 {
+                // Queue a competitor for the only connection; it gets it as soon as this
+                // attempt rolls back and holds it for 600 ms.
+                let p2 = p.clone();
+                h.lock().unwrap().push(tokio::spawn(async move {
+                    p2.transaction(|_tx| {
+                        Box::pin(async move {
+                            tokio::time::sleep(Duration::from_millis(600)).await;
+                            Ok(())
+                        })
+                    })
+                    .await
+                }));
+            }
+            Box::pin(async move {
+                if n <= 3 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    sqlx::raw_sql(RAISE_40001).execute(tx.conn()).await?;
+                }
+                Ok(n)
+            })
+        })
+        .await
+        .unwrap();
+    let total = started.elapsed();
+    assert_eq!(n, 4, "three conflicts, then success");
+    assert!(
+        total >= Duration::from_millis(1500),
+        "acquisition waits did happen ({total:?}) yet did not exhaust the 1 s budget"
+    );
+    let handles: Vec<_> = std::mem::take(&mut *holders.lock().unwrap());
+    for hd in handles {
+        hd.await.unwrap().unwrap();
+    }
+    pool.close().await;
+    t.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_budget_is_separate_and_configurable() {
+    let Some(t) = setup().await else { return };
+    let pool = t.pool(&D).clone();
+    // defaults: transactions 10 attempts / 5 s, migrations 30 attempts / 120 s
+    assert_eq!(pool.retry_policy().max_attempts, 10);
+    assert_eq!(pool.retry_policy().max_elapsed, Duration::from_secs(5));
+    assert_eq!(
+        pool.migration_retry_policy(),
+        RetryPolicy::migrations_default()
+    );
+    assert_eq!(pool.migration_retry_policy().max_attempts, 30);
+    assert_eq!(
+        pool.migration_retry_policy().max_elapsed,
+        Duration::from_secs(120)
+    );
+    let always_conflicting = with_common(&[(
+        "0100_conflict.expand.sql",
+        "DO $$ BEGIN RAISE EXCEPTION 'injected' USING ERRCODE = '40001'; END $$;",
+    )]);
+    // A configured migration budget (12 attempts) applies, not the transaction budget (10).
+    let fast = RetryPolicy {
+        max_attempts: 12,
+        max_elapsed: Duration::from_secs(60),
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
+    let err = Migrator::run(
+        &pool.clone().with_migration_retry(fast),
+        &always_conflicting,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DbError::RetryExhausted { attempts: 12, ref last_sqlstate } if last_sqlstate == "40001"),
+        "{err:?}"
+    );
+    // The elapsed bound of the migration budget applies too.
+    let short = RetryPolicy {
+        max_attempts: 100_000,
+        max_elapsed: Duration::from_millis(300),
+        base_delay: Duration::from_millis(20),
+        max_delay: Duration::from_millis(50),
+    };
+    let err = Migrator::run(
+        &pool.clone().with_migration_retry(short),
+        &always_conflicting,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, DbError::RetryExhausted { attempts, .. } if attempts < 100_000),
+        "{err:?}"
+    );
+    // Nothing was recorded for the failing migration; the transaction budget is unchanged.
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM schema_migrations WHERE version = 100"
+        )
+        .await,
+        0
+    );
+    let tx_attempts = Arc::new(AtomicU32::new(0));
+    let a = tx_attempts.clone();
+    let err = pool
+        .transaction(move |tx| {
+            a.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                sqlx::raw_sql(RAISE_40001).execute(tx.conn()).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DbError::RetryExhausted { attempts: 10, .. }),
+        "{err:?}"
+    );
+    assert_eq!(tx_attempts.load(Ordering::SeqCst), 10);
+    t.cleanup().await;
+}
+
+#[test]
+fn migration_budget_comes_from_policy() {
+    let toml = format!(
+        "[node]\nid = \"{}\"\nroles = [\"api\"]\n[api]\nlisten = \"127.0.0.1:1\"\nadmin_listen = \"127.0.0.1:2\"\ndeployment_domain = \"x.test\"\n[policy]\ndb_migration_retry_max_attempts = 7\ndb_migration_retry_max_elapsed_ms = 9000\n",
+        cs_common::id::NodeId::generate().unwrap()
+    );
+    let cfg = cs_common::config::Config::from_toml_str(&toml).unwrap();
+    let m = RetryPolicy::migrations_from_policy(&cfg.policy);
+    assert_eq!((m.max_attempts, m.max_elapsed), (7, Duration::from_secs(9)));
+    let tx = RetryPolicy::from_policy(&cfg.policy);
+    assert_eq!(
+        (tx.max_attempts, tx.max_elapsed),
+        (10, Duration::from_secs(5))
+    );
+    let bad = toml.replace("= 7", "= 0");
+    assert!(cs_common::config::Config::from_toml_str(&bad).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Test harness hygiene (QA gate F-1)
+// ---------------------------------------------------------------------------------------------
+
+async fn listed(admin: &str, names: &[String]) -> i64 {
+    use sqlx::Connection as _;
+    let mut c = sqlx::PgConnection::connect(admin).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_database WHERE datname = ANY($1)")
+        .bind(names)
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+    let _ = c.close().await;
+    n
+}
+
+#[tokio::test]
+async fn harness_cleanup_verifies_databases_are_gone() {
+    let Some(t) = TestDomains::create(&[DomainId::Identity, DomainId::Audit]).await else {
+        return;
+    };
+    let admin = t.admin_url().to_owned();
+    let names = vec![
+        t.database_name(&DomainId::Identity).to_owned(),
+        t.database_name(&DomainId::Audit).to_owned(),
+    ];
+    assert_eq!(listed(&admin, &names).await, 2);
+    // open sessions must not prevent the drop
+    t.pool(&DomainId::Identity).ping().await.unwrap();
+    t.cleanup().await;
+    assert_eq!(listed(&admin, &names).await, 0);
+}
+
+#[tokio::test]
+#[should_panic(expected = "dropped without cleanup")]
+async fn harness_forgotten_cleanup_fails_loudly() {
+    let Some(t) = TestDomains::create(&[DomainId::Plugins]).await else {
+        panic!("dropped without cleanup (skipped: no database)");
+    };
+    // The databases are still dropped by the fallback before the panic.
+    drop(t);
+}

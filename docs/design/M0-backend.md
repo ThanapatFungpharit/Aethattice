@@ -107,6 +107,9 @@ Design choices:
 
 - The closure has type `Fn(&mut DomainTx) -> BoxFuture`: it can be re-run and receives only the transaction handle. Each attempt starts with `BEGIN ISOLATION LEVEL READ COMMITTED`.
 - 40001/40P01 errors are retried with full-jitter backoff (10 ms × 2ⁿ, capped at 1 s), bounded by attempts and elapsed time. When the bound is reached the result is `RetryExhausted`, which maps to `unavailable` with `retry_after_ms` 1000.
+- Retry budget (contract rev 4): the elapsed bound is charged only with attempt time (BEGIN through COMMIT/ROLLBACK) and backoff. Connection acquisition is excluded; the pool's `acquire_timeout_ms` bounds it instead.
+  - To time acquisition separately, `DomainTx` owns the pooled connection and issues BEGIN/COMMIT/ROLLBACK itself. If a transaction is dropped while still open, its connection is closed rather than returned to the pool.
+- The migration runner has its own budget: `RetryPolicy::migrations_default()`, 30 attempts or 120 s. It is configured through the policies `db_migration_retry_max_attempts` and `db_migration_retry_max_elapsed_ms`, and set with `DomainPool::with_migration_retry`.
 - At COMMIT:
   - A server-reported error means the transaction did not commit, and it is returned as-is.
   - A lost reply becomes `OutcomeUnknown`, which maps to `outcome_unknown` and is never retried. A test drops the reply through a TCP proxy and shows that the row did commit.
@@ -132,6 +135,16 @@ Design choices:
 - The record and the effect share one transaction. Exactly one of N concurrent duplicates executes; the others wait on the row lock and then replay the committed result.
 - A *visible* `in_progress` record (committed separately, for example by a crashed multi-step flow) yields `outcome_unknown`.
 - Expired records are reclaimed by `INSERT … ON CONFLICT DO UPDATE … WHERE expires_at <= now()`.
+
+### Test harness (`testing` feature)
+
+- Every database the harness creates is registered before it is created. `cleanup()` drops each one with:
+  - no statement timeout, because a DROP on YugabyteDB can take minutes;
+  - up to 8 attempts, each followed by a check against `pg_database`.
+- If a database cannot be dropped, cleanup panics and names the database.
+- Test pools use a 1 s idle timeout and are closed before the drop.
+- If a `TestDomains` is dropped without `cleanup()`, the databases are still dropped and then the test fails.
+- The harness drops only databases with its own `cs_test_` prefix that it created itself.
 
 ## cs-ops
 

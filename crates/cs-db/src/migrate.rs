@@ -338,32 +338,42 @@ struct AppliedRow {
 pub struct Migrator;
 
 impl Migrator {
+    /// Execute one migration (or the bootstrap) with the migration budget (contract §5
+    /// rev 4: default 30 attempts or 120 s, configurable). Like transactions, the budget
+    /// counts execution and backoff only, not connection acquisition.
     async fn exec_retrying(pool: &DomainPool, sql: &str) -> Result<(), DbError> {
-        let policy = pool.retry_policy();
-        let start = Instant::now();
+        let policy = pool.migration_retry_policy();
+        let mut spent = std::time::Duration::ZERO;
         let mut attempt = 0;
         loop {
             attempt += 1;
+            let mut conn = pool.acquire().await?;
+            let started = Instant::now();
             // Migration SQL is embedded, reviewed content (never user input).
-            match sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned()))
-                .execute(pool.raw())
-                .await
-            {
+            let res = sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned()))
+                .execute(&mut *conn)
+                .await;
+            spent += started.elapsed();
+            drop(conn);
+            let e = match res {
                 Ok(_) => return Ok(()),
-                Err(e) => {
-                    let e = DbError::Sqlx(e);
-                    if !e.is_retryable_conflict() {
-                        return Err(e);
-                    }
-                    if attempt >= policy.max_attempts || start.elapsed() >= policy.max_elapsed {
-                        return Err(DbError::RetryExhausted {
-                            attempts: attempt,
-                            last_sqlstate: e.sqlstate().unwrap_or_default(),
-                        });
-                    }
-                    tokio::time::sleep(policy.backoff(attempt)?).await;
-                }
+                Err(e) => DbError::Sqlx(e),
+            };
+            if !e.is_retryable_conflict() {
+                return Err(e);
             }
+            if attempt >= policy.max_attempts || spent >= policy.max_elapsed {
+                tracing::warn!(domain = %pool.domain(), attempt, ?spent, "migration retry budget exhausted");
+                return Err(DbError::RetryExhausted {
+                    attempts: attempt,
+                    last_sqlstate: e.sqlstate().unwrap_or_default(),
+                });
+            }
+            let delay = policy
+                .backoff(attempt)?
+                .min(policy.max_elapsed.saturating_sub(spent));
+            tokio::time::sleep(delay).await;
+            spent += delay;
         }
     }
 

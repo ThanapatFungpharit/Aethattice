@@ -124,6 +124,22 @@ pub const POLICY_TABLE: &[PolicySpec] = &[
         source: "spec §6.6 S default 2 s, max 30 s; min 1 s (design, QA OQ-6: S below the 500 ms heartbeat would make every consumer stale). Enforced from M2",
     },
     PolicySpec {
+        key: "db_migration_retry_max_attempts",
+        default: 30,
+        min: 1,
+        max: 500,
+        unit: "attempts",
+        source: "contract §5 rev 4 default 30; range (design)",
+    },
+    PolicySpec {
+        key: "db_migration_retry_max_elapsed_ms",
+        default: 120_000,
+        min: 1_000,
+        max: 3_600_000,
+        unit: "milliseconds",
+        source: "contract §5 rev 4 default 120 s; range (design)",
+    },
+    PolicySpec {
         key: "saga_reconcile_interval_ms",
         default: 1_000,
         min: 100,
@@ -141,6 +157,8 @@ pub enum PolicyKey {
     DbRetryMaxElapsedMs,
     SagaReconcileIntervalMs,
     RevocationStalenessMs,
+    DbMigrationRetryMaxAttempts,
+    DbMigrationRetryMaxElapsedMs,
 }
 
 impl PolicyKey {
@@ -151,6 +169,8 @@ impl PolicyKey {
             PolicyKey::DbRetryMaxElapsedMs => "db_retry_max_elapsed_ms",
             PolicyKey::SagaReconcileIntervalMs => "saga_reconcile_interval_ms",
             PolicyKey::RevocationStalenessMs => "revocation_staleness_ms",
+            PolicyKey::DbMigrationRetryMaxAttempts => "db_migration_retry_max_attempts",
+            PolicyKey::DbMigrationRetryMaxElapsedMs => "db_migration_retry_max_elapsed_ms",
         }
     }
 }

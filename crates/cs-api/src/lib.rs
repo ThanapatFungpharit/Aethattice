@@ -26,6 +26,7 @@ use cs_common::error::{Error as CsError, ErrorCode, PROBLEM_CONTENT_TYPE};
 use cs_common::id::RequestId;
 use cs_common::idempotency::{IDEMPOTENCY_KEY_HEADER, IdempotencyKey};
 use metrics_exporter_prometheus::PrometheusHandle;
+use opentelemetry::trace::TraceContextExt as _;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -199,16 +200,33 @@ async fn request_middleware(
         );
         return r;
     };
-    let span = tracing::info_span!("http_request", %request_id, %method, path = %path);
+    let span = tracing::info_span!(
+        "http_request",
+        %request_id,
+        %method,
+        path = %path,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+    );
+    // W3C Trace Context (contract §8, spec §25.1): continue an incoming `traceparent`.
     let parent = opentelemetry::global::get_text_map_propagator(|p| {
         p.extract(&HeaderExtractor(req.headers()))
     });
+    let parent_sc = parent.span().span_context().clone();
     let _ = span.set_parent(parent);
+    // The request span's own context (same trace as the parent when one was supplied). Without
+    // an OpenTelemetry layer it is unavailable, and the incoming context is recorded instead.
+    let own_sc = span.context().span().span_context().clone();
+    let sc = if own_sc.is_valid() { own_sc } else { parent_sc };
+    if sc.is_valid() {
+        span.record("trace_id", tracing::field::display(sc.trace_id()));
+        span.record("span_id", tracing::field::display(sc.span_id()));
+    }
     req.extensions_mut().insert(RequestContext {
         request_id,
         path: path.clone(),
     });
-    let mut resp = next.run(req).instrument(span).await;
+    let mut resp = next.run(req).instrument(span.clone()).await;
 
     let status = resp.status();
     if let Some(PendingProblem(err)) = resp.extensions_mut().remove::<PendingProblem>() {
@@ -224,6 +242,9 @@ async fn request_middleware(
     metrics::counter!("cs_http_requests_total", "status" => resp.status().as_u16().to_string())
         .increment(1);
     metrics::histogram!("cs_http_request_duration_seconds").record(started.elapsed().as_secs_f64());
+    let status = resp.status().as_u16();
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    span.in_scope(|| tracing::info!(status, elapsed_ms, "request completed"));
     resp
 }
 
