@@ -4,6 +4,9 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Same toolchain as the dev host, so rustfmt/clippy output matches. Overrides rust-toolchain.toml.
+      RUSTUP_TOOLCHAIN: "1.99.1"
     steps:
       - uses: actions/checkout@v4
       - name: Start YugabyteDB (same image as dev/docker-compose.yml)
@@ -15,8 +18,8 @@ jobs:
             sleep 2
           done
           docker logs yb | tail -50; exit 1
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: "rustfmt, clippy" }
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.99.1", components: "rustfmt, clippy" }
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
