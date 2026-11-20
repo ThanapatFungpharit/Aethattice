@@ -94,10 +94,13 @@ fn check_roles(cfg: &Config) -> Result<(), String> {
 
 fn pools(cfg: &Config) -> Result<Vec<DomainPool>, String> {
     let retry = RetryPolicy::from_policy(&cfg.policy);
+    let migration_retry = RetryPolicy::migrations_from_policy(&cfg.policy);
     cfg.domains
         .iter()
         .map(|(d, dc)| {
-            DomainPool::connect_lazy(d.clone(), dc, retry).map_err(|e| format!("cs: {e}"))
+            DomainPool::connect_lazy(d.clone(), dc, retry)
+                .map(|p| p.with_migration_retry(migration_retry))
+                .map_err(|e| format!("cs: {e}"))
         })
         .collect()
 }

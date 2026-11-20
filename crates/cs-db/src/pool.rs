@@ -10,13 +10,19 @@
 //! closure with exponential backoff and full jitter, bounded by attempts and elapsed time.
 //! The closure is therefore `Fn` (re-runnable) and must be idempotent; it receives only the
 //! transaction handle (no network calls inside transactions, §18.2).
+//!
+//! Retry budget (contract §5 rev 4): the elapsed-time bound counts only transaction attempts
+//! (BEGIN through COMMIT/ROLLBACK) and backoff sleeps. Connection acquisition is excluded; it
+//! is bounded separately by the pool's `acquire_timeout_ms`. The migration runner uses its own
+//! budget ([`RetryPolicy::migrations_default`], 30 attempts or 120 s).
 
 use crate::error::DbError;
 use cs_common::config::{DomainConfig, Policy, PolicyKey};
 use cs_common::vector::DomainId;
 use futures::future::BoxFuture;
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
-use sqlx::{Connection as _, PgConnection, Postgres, Transaction};
+use sqlx::{Connection as _, PgConnection, Postgres};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,7 +49,30 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Build from validated policy values.
+    /// Migration-runner defaults (contract §5 rev 4): 30 attempts or 120 s. Concurrent DDL on
+    /// YugabyteDB can stall far longer than ordinary transactions.
+    pub fn migrations_default() -> Self {
+        Self {
+            max_attempts: 30,
+            max_elapsed: Duration::from_secs(120),
+            base_delay: Duration::from_millis(50),
+            max_delay: Duration::from_secs(5),
+        }
+    }
+
+    /// Migration budget from validated policy values.
+    pub fn migrations_from_policy(p: &Policy) -> Self {
+        Self {
+            max_attempts: u32::try_from(p.get(PolicyKey::DbMigrationRetryMaxAttempts))
+                .unwrap_or(30),
+            max_elapsed: Duration::from_millis(
+                u64::try_from(p.get(PolicyKey::DbMigrationRetryMaxElapsedMs)).unwrap_or(120_000),
+            ),
+            ..Self::migrations_default()
+        }
+    }
+
+    /// Transaction budget from validated policy values.
     pub fn from_policy(p: &Policy) -> Self {
         Self {
             max_attempts: u32::try_from(p.get(PolicyKey::DbRetryMaxAttempts)).unwrap_or(10),
@@ -89,6 +118,7 @@ struct Inner {
     domain: DomainId,
     pool: PgPool,
     retry: RetryPolicy,
+    migration_retry: RetryPolicy,
 }
 
 /// A connection pool bound to exactly one domain.
@@ -106,9 +136,22 @@ impl std::fmt::Debug for DomainPool {
 }
 
 /// A transaction on one domain. Obtained only from [`DomainPool::transaction`].
+///
+/// Owns the pooled connection and issues BEGIN / COMMIT / ROLLBACK itself, so that connection
+/// acquisition can be kept out of the retry budget. If it is dropped while still open (e.g. a
+/// cancelled future), the connection is closed instead of being returned to the pool.
 pub struct DomainTx {
     domain: DomainId,
-    tx: Transaction<'static, Postgres>,
+    conn: PoolConnection<Postgres>,
+    open: bool,
+}
+
+impl Drop for DomainTx {
+    fn drop(&mut self) {
+        if self.open {
+            self.conn.close_on_drop();
+        }
+    }
 }
 
 impl std::fmt::Debug for DomainTx {
@@ -127,7 +170,27 @@ impl DomainTx {
 
     /// The underlying connection, for executing queries inside the transaction.
     pub fn conn(&mut self) -> &mut PgConnection {
-        &mut self.tx
+        &mut self.conn
+    }
+
+    async fn commit(&mut self) -> Result<(), sqlx::Error> {
+        let r = sqlx::raw_sql("COMMIT").execute(&mut *self.conn).await;
+        // Whatever happened, the transaction is no longer usable on this connection; on error
+        // the connection is closed by Drop (state unknown).
+        if r.is_ok() {
+            self.open = false;
+        }
+        r.map(|_| ())
+    }
+
+    async fn rollback(&mut self) {
+        if sqlx::raw_sql("ROLLBACK")
+            .execute(&mut *self.conn)
+            .await
+            .is_ok()
+        {
+            self.open = false;
+        }
     }
 }
 
@@ -169,6 +232,7 @@ impl DomainPool {
                 domain,
                 pool,
                 retry,
+                migration_retry: RetryPolicy::migrations_default(),
             }),
         }
     }
@@ -196,6 +260,30 @@ impl DomainPool {
 
     pub fn retry_policy(&self) -> RetryPolicy {
         self.inner.retry
+    }
+
+    /// Budget of the migration runner on this domain (separate from transactions).
+    pub fn migration_retry_policy(&self) -> RetryPolicy {
+        self.inner.migration_retry
+    }
+
+    /// Replace the migration budget (configured from `[policy]`).
+    pub fn with_migration_retry(self, policy: RetryPolicy) -> Self {
+        let inner = &self.inner;
+        Self {
+            inner: Arc::new(Inner {
+                domain: inner.domain.clone(),
+                pool: inner.pool.clone(),
+                retry: inner.retry,
+                migration_retry: policy,
+            }),
+        }
+    }
+
+    /// Acquire a pooled connection (bounded by the pool's acquire timeout, not by any retry
+    /// budget).
+    pub(crate) async fn acquire(&self) -> Result<PoolConnection<Postgres>, DbError> {
+        Ok(self.inner.pool.acquire().await?)
     }
 
     /// Check that the domain is reachable.
@@ -241,11 +329,16 @@ impl DomainPool {
         F: for<'c> Fn(&'c mut DomainTx) -> TxFuture<'c, T> + Send + Sync,
     {
         let policy = self.inner.retry;
-        let start = Instant::now();
+        // Time charged to the budget: attempts (excluding connection acquisition) + backoff.
+        let mut spent = Duration::ZERO;
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            let err = match self.attempt(iso, &f).await {
+            let conn = self.acquire().await?;
+            let started = Instant::now();
+            let res = self.attempt(iso, conn, &f).await;
+            spent += started.elapsed();
+            let err = match res {
                 Ok(v) => {
                     if attempt > 1 {
                         tracing::debug!(domain = %self.inner.domain, attempt, "transaction succeeded after retry");
@@ -256,31 +349,41 @@ impl DomainPool {
                 Err(e) => return Err(e),
             };
             let sqlstate = err.sqlstate().unwrap_or_default();
-            if attempt >= policy.max_attempts || start.elapsed() >= policy.max_elapsed {
-                tracing::warn!(domain = %self.inner.domain, attempt, sqlstate, "transaction retry bound exhausted");
+            if attempt >= policy.max_attempts || spent >= policy.max_elapsed {
+                tracing::warn!(domain = %self.inner.domain, attempt, sqlstate, ?spent, "transaction retry bound exhausted");
                 return Err(DbError::RetryExhausted {
                     attempts: attempt,
                     last_sqlstate: sqlstate,
                 });
             }
-            let remaining = policy.max_elapsed.saturating_sub(start.elapsed());
-            let delay = policy.backoff(attempt)?.min(remaining);
+            let delay = policy
+                .backoff(attempt)?
+                .min(policy.max_elapsed.saturating_sub(spent));
             tracing::debug!(domain = %self.inner.domain, attempt, sqlstate, ?delay, "retrying conflicting transaction");
             tokio::time::sleep(delay).await;
+            spent += delay;
         }
     }
 
-    async fn attempt<T, F>(&self, iso: Isolation, f: &F) -> Result<T, DbError>
+    async fn attempt<T, F>(
+        &self,
+        iso: Isolation,
+        conn: PoolConnection<Postgres>,
+        f: &F,
+    ) -> Result<T, DbError>
     where
         F: for<'c> Fn(&'c mut DomainTx) -> TxFuture<'c, T> + Send + Sync,
     {
-        let tx = self.inner.pool.begin_with(iso.begin_sql()).await?;
         let mut dtx = DomainTx {
             domain: self.inner.domain.clone(),
-            tx,
+            conn,
+            open: true,
         };
+        if let Err(e) = sqlx::raw_sql(iso.begin_sql()).execute(&mut *dtx.conn).await {
+            return Err(DbError::Sqlx(e));
+        }
         match f(&mut dtx).await {
-            Ok(v) => match dtx.tx.commit().await {
+            Ok(v) => match dtx.commit().await {
                 Ok(()) => Ok(v),
                 // The server answered: the transaction did not commit.
                 Err(e @ sqlx::Error::Database(_)) => Err(DbError::Sqlx(e)),
@@ -288,8 +391,8 @@ impl DomainPool {
                 Err(e) => Err(DbError::OutcomeUnknown(e)),
             },
             Err(e) => {
-                // Explicit rollback; if it fails the connection is discarded anyway.
-                let _ = dtx.tx.rollback().await;
+                // Explicit rollback; if it fails the connection is closed by Drop.
+                dtx.rollback().await;
                 Err(e)
             }
         }

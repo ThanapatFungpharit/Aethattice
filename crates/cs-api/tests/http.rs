@@ -87,7 +87,16 @@ async fn panics() -> &'static str {
 }
 
 fn app(barriers: Vec<Arc<dyn ReadinessBarrier>>) -> Router {
-    let st = state(barriers);
+    app_with_state(state(barriers))
+}
+
+/// Readiness timeout for barriers against a real database. A new connection to a
+/// just-created YugabyteDB database loads its catalog cache and can exceed 2 s under a
+/// parallel test load; this test checks barrier semantics, not the timeout (covered by
+/// `readiness_reports_failing_barriers_without_internal_detail`).
+const REAL_DB_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn app_with_state(st: ApiState) -> Router {
     let routes = cs_api::public_routes()
         .route("/test/key", post(echo_key))
         .route("/test/things", post(make_thing))
@@ -287,7 +296,14 @@ async fn readiness_with_real_domains_requires_reachable_and_migrated() {
             }),
         ]
     };
-    let a = app(barriers(&pool));
+    let real_db_app = |p: &cs_db::DomainPool| {
+        app_with_state(ApiState::new(
+            "qa.example",
+            barriers(p),
+            REAL_DB_READINESS_TIMEOUT,
+        ))
+    };
+    let a = real_db_app(&pool);
     let (s, h, b) = call(&a, get_req("/readyz")).await;
     let p = assert_problem(s, &h, &b, "unavailable");
     assert_eq!(p.errors.len(), 1);
@@ -305,7 +321,7 @@ async fn readiness_with_real_domains_requires_reachable_and_migrated() {
     let dead =
         cs_db::DomainPool::connect_lazy(DomainId::Identity, &cfg, cs_db::RetryPolicy::default())
             .unwrap();
-    let (s, h, b) = call(&app(barriers(&dead)), get_req("/readyz")).await;
+    let (s, h, b) = call(&real_db_app(&dead), get_req("/readyz")).await;
     let p = assert_problem(s, &h, &b, "unavailable");
     assert!(
         p.errors

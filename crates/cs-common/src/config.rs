@@ -124,6 +124,22 @@ pub const POLICY_TABLE: &[PolicySpec] = &[
         source: "spec §6.6 S default 2 s, max 30 s; min 1 s (design, QA OQ-6: S below the 500 ms heartbeat would make every consumer stale). Enforced from M2",
     },
     PolicySpec {
+        key: "db_migration_retry_max_attempts",
+        default: 30,
+        min: 1,
+        max: 500,
+        unit: "attempts",
+        source: "contract §5 rev 4 default 30; range (design)",
+    },
+    PolicySpec {
+        key: "db_migration_retry_max_elapsed_ms",
+        default: 120_000,
+        min: 1_000,
+        max: 3_600_000,
+        unit: "milliseconds",
+        source: "contract §5 rev 4 default 120 s; range (design)",
+    },
+    PolicySpec {
         key: "saga_reconcile_interval_ms",
         default: 1_000,
         min: 100,
@@ -141,6 +157,8 @@ pub enum PolicyKey {
     DbRetryMaxElapsedMs,
     SagaReconcileIntervalMs,
     RevocationStalenessMs,
+    DbMigrationRetryMaxAttempts,
+    DbMigrationRetryMaxElapsedMs,
 }
 
 impl PolicyKey {
@@ -151,6 +169,8 @@ impl PolicyKey {
             PolicyKey::DbRetryMaxElapsedMs => "db_retry_max_elapsed_ms",
             PolicyKey::SagaReconcileIntervalMs => "saga_reconcile_interval_ms",
             PolicyKey::RevocationStalenessMs => "revocation_staleness_ms",
+            PolicyKey::DbMigrationRetryMaxAttempts => "db_migration_retry_max_attempts",
+            PolicyKey::DbMigrationRetryMaxElapsedMs => "db_migration_retry_max_elapsed_ms",
         }
     }
 }
@@ -681,7 +701,8 @@ policy = ["idempotency_retention_hours"]
                 .contains("max_connections")
         );
         // node id must be UUIDv7
-        let v4 = crate::id::ChunkId::generate().unwrap().to_string();
+        // a fixed UUIDv4; a random 128-bit value would be a valid v7 one time in 64
+        let v4 = "1b4e28ba-2fa1-41d2-883f-0016d3cca427";
         let t = g.replacen("id = \"", &format!("id = \"{v4}\"\n#"), 1);
         assert!(invalid(&t).contains("node.id"));
         // multiple errors reported together
