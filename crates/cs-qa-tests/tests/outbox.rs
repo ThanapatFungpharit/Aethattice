@@ -17,40 +17,46 @@ use uuid::Uuid;
 async fn fx(admin: &str, label: &str) -> (TestDb, c::Domain) {
     let db = TestDb::create(admin, label).await;
     let dom = c::domain_open("resources", &db.url).await.unwrap();
-    c::domain_migrate(&dom).await.unwrap();
+    {
+        let _g = support::db::ddl_guard().await;
+        c::domain_migrate(&dom).await.unwrap();
+    }
     (db, dom)
 }
 
-/// All (partition, sequence) pairs in the outbox, via plain SQL on the frozen schema.
-async fn sequences(db: &TestDb) -> BTreeMap<i32, Vec<i64>> {
+/// All sequences per source partition (contract rev 2: the source partition is the pair
+/// (tenant_id, partition)), via plain SQL on the frozen schema.
+async fn sequences(db: &TestDb) -> BTreeMap<(Uuid, i32), Vec<i64>> {
     let mut conn = db.connect().await;
-    let rows = sqlx::query("SELECT partition, sequence FROM outbox ORDER BY partition, sequence")
-        .fetch_all(&mut conn)
-        .await
-        .unwrap();
-    let mut m: BTreeMap<i32, Vec<i64>> = BTreeMap::new();
+    let rows = sqlx::query(
+        "SELECT tenant_id, partition, sequence FROM outbox ORDER BY tenant_id, partition, sequence",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    let mut m: BTreeMap<(Uuid, i32), Vec<i64>> = BTreeMap::new();
     for r in rows {
-        m.entry(r.get::<i32, _>(0))
+        m.entry((r.get::<Uuid, _>(0), r.get::<i32, _>(1)))
             .or_default()
-            .push(r.get::<i64, _>(1));
+            .push(r.get::<i64, _>(2));
     }
     m
 }
 
-fn assert_contiguous(m: &BTreeMap<i32, Vec<i64>>) {
+fn assert_contiguous(m: &BTreeMap<(Uuid, i32), Vec<i64>>) {
     for (p, seqs) in m {
         for w in seqs.windows(2) {
             assert_eq!(
                 w[1],
                 w[0] + 1,
-                "partition {p}: gap or duplicate between {} and {}",
+                "partition {p:?}: gap or duplicate between {} and {}",
                 w[0],
                 w[1]
             );
         }
         assert!(
             seqs[0] <= 1,
-            "partition {p}: first sequence {} (expected 0 or 1; earlier values lost?)",
+            "partition {p:?}: first sequence {} (expected 0 or 1; earlier values lost?)",
             seqs[0]
         );
     }
@@ -72,11 +78,11 @@ async fn outbox_schema_matches_contract() {
     let counters = db
         .scalar_i64(
             "SELECT count(*) FROM information_schema.columns WHERE table_name = 'outbox_counters' AND
-             (column_name, data_type) IN (('partition','integer'),('next_sequence','bigint'))",
+             (column_name, data_type) IN (('tenant_id','uuid'),('partition','integer'),('next_sequence','bigint'))",
         )
         .await;
     assert_eq!(
-        counters, 2,
+        counters, 3,
         "outbox_counters columns differ from contract §5.2"
     );
     let created_default = db
@@ -147,7 +153,7 @@ async fn concurrent_writers_contiguous_sequences() {
             "duplicate (partition, sequence) {a:?}"
         );
         assert!(
-            m[&a.partition].contains(&a.sequence),
+            m[&(tenant, a.partition)].contains(&a.sequence),
             "acknowledged {a:?} not in table"
         );
     }
@@ -182,7 +188,7 @@ async fn rollback_leaves_no_gap() {
         a.sequence + 1,
         "rolled-back appends consumed sequence numbers"
     );
-    let rows = c::outbox_read(&dom, a.partition, a.sequence - 1, 100)
+    let rows = c::outbox_read(&dom, tenant, a.partition, a.sequence - 1, 100)
         .await
         .unwrap();
     assert_eq!(
@@ -215,22 +221,22 @@ async fn gap_detected_after_row_deletion() {
     let p = appended[0].partition;
     let victim = appended[2].sequence;
     db.exec(&format!(
-        "DELETE FROM outbox WHERE partition = {p} AND sequence = {victim}"
+        "DELETE FROM outbox WHERE tenant_id = '{tenant}' AND partition = {p} AND sequence = {victim}"
     ))
     .await;
-    let r = c::outbox_read(&dom, p, appended[0].sequence - 1, 100).await;
+    let r = c::outbox_read(&dom, tenant, p, appended[0].sequence - 1, 100).await;
     assert!(
         r.is_err(),
         "reader silently skipped deleted sequence {victim}: {r:?}"
     );
     // Reading past the gap must not hide it either.
-    let r = c::outbox_read(&dom, p, appended[1].sequence, 100).await;
+    let r = c::outbox_read(&dom, tenant, p, appended[1].sequence, 100).await;
     assert!(
         r.is_err(),
         "reader starting right before the gap did not detect it: {r:?}"
     );
     // Reading entirely before the gap is fine.
-    let ok = c::outbox_read(&dom, p, appended[0].sequence - 1, 2)
+    let ok = c::outbox_read(&dom, tenant, p, appended[0].sequence - 1, 2)
         .await
         .unwrap();
     assert_eq!(ok.len(), 2);
@@ -284,9 +290,11 @@ async fn oversized_payload_rejected() {
     )
     .await
     .unwrap_err();
+    // The payload is built by the server, so an oversize is a server-side defect: any of these
+    // codes is acceptable (retryability is fixed by D.2 per code). Never success or truncation.
     assert!(
-        !e.retryable,
-        "oversized payload must be a permanent error, got {e:?}"
+        ["payload_too_large", "internal", "invalid_request"].contains(&e.code.as_str()),
+        "oversized payload must be rejected with a size/internal error, got {e:?}"
     );
     assert_eq!(db.scalar_i64("SELECT count(*) FROM outbox").await, 0);
     // The failed append must not burn a sequence number either.

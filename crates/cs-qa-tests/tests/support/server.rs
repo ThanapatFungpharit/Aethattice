@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
 pub fn cs_binary() -> PathBuf {
@@ -51,27 +50,44 @@ fn write_config(dir: &tempfile::TempDir, toml: &str) -> PathBuf {
     path
 }
 
+/// Output goes to a file (not a pipe) so a chatty server can never block on a full pipe.
 fn spawn(config_path: &std::path::Path, dir: &tempfile::TempDir) -> Child {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.path().join("cs.log"))
+        .expect("log file");
     let mut cmd = Command::new(cs_binary());
     cmd.args(super::contract::server_args(config_path))
         .current_dir(dir.path())
         .env("RUST_BACKTRACE", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(log.try_clone().expect("log clone")))
+        .stderr(Stdio::from(log))
         .kill_on_drop(true);
     cmd.spawn().expect("spawn cs binary")
 }
 
-async fn drain(child: &mut Child) -> String {
-    let mut out = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        let _ = s.read_to_string(&mut out).await;
+/// Run the commands that must succeed before `serve` (e.g. KMS initialization).
+async fn prepare(config_path: &std::path::Path, dir: &tempfile::TempDir) {
+    for args in super::contract::server_prepare_args(config_path) {
+        let out = Command::new(cs_binary())
+            .args(&args)
+            .current_dir(dir.path())
+            .output()
+            .await
+            .expect("run cs prepare step");
+        assert!(
+            out.status.success(),
+            "cs {args:?} failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
-    if let Some(mut s) = child.stderr.take() {
-        let _ = s.read_to_string(&mut out).await;
-    }
-    out
+}
+
+fn read_log(dir: &tempfile::TempDir) -> String {
+    std::fs::read_to_string(dir.path().join("cs.log")).unwrap_or_default()
 }
 
 impl Server {
@@ -79,13 +95,14 @@ impl Server {
     pub async fn start(config: &str, port: u16) -> Server {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_config(&dir, config);
+        prepare(&path, &dir).await;
         let mut child = spawn(&path, &dir);
         let base = format!("http://127.0.0.1:{port}");
         let client = http();
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(Some(status)) = child.try_wait() {
-                let log = drain(&mut child).await;
+                let log = read_log(&dir);
                 panic!(
                     "cs exited early with {status} during startup:\n{log}\n--- config ---\n{config}"
                 );
@@ -111,7 +128,7 @@ impl Server {
     pub async fn stop(mut self) -> String {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
-        drain(&mut self.child).await
+        read_log(&self.dir)
     }
 }
 
@@ -120,20 +137,28 @@ impl Server {
 pub async fn run_expect_exit(config: &str, timeout: Duration) -> (ExitStatus, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = write_config(&dir, config);
+    // Prepare as for a normal start so a refusal cannot be caused by a missing KMS key; a
+    // config the binary must reject may also make the prepare step fail, which is fine here.
+    for args in super::contract::server_prepare_args(&path) {
+        let _ = Command::new(cs_binary())
+            .args(&args)
+            .current_dir(dir.path())
+            .output()
+            .await;
+    }
     let mut child = spawn(&path, &dir);
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(s) => s.expect("wait cs"),
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            let log = drain(&mut child).await;
+            let log = read_log(&dir);
             panic!(
                 "cs kept running with a config it must refuse:\n{log}\n--- config ---\n{config}"
             );
         }
     };
-    let log = drain(&mut child).await;
-    (status, log)
+    (status, read_log(&dir))
 }
 
 /// True if something accepts TCP connections on the port.

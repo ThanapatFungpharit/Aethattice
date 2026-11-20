@@ -42,20 +42,31 @@ fn id_text_form_lowercase_hyphenated() {
 }
 
 #[test]
-fn chunk_and_extent_ids_are_random_v4() {
+fn chunk_and_extent_ids_are_random_128_bit() {
+    // Contract rev 2: 16 CSPRNG bytes with no version or variant bits forced (§17.1 "128-bit
+    // random"). So the version nibble and the variant bits must vary like any other bits.
     for kind in c::ID_KINDS_RANDOM {
         let mut seen = HashSet::new();
         let mut first_bytes = HashSet::new();
+        let mut version_nibbles = HashSet::new();
+        let mut variant_bits = HashSet::new();
         for _ in 0..500 {
             let u = Uuid::parse_str(&c::new_id_text(kind)).unwrap();
-            assert_eq!(
-                u.get_version_num(),
-                4,
-                "{kind} must be random (UUIDv4 layout), not time-ordered"
-            );
             assert!(seen.insert(u), "{kind}: duplicate");
             first_bytes.insert(u.as_bytes()[0]);
+            version_nibbles.insert(u.as_bytes()[6] >> 4);
+            variant_bits.insert(u.as_bytes()[8] >> 6);
         }
+        assert!(
+            version_nibbles.len() >= 12,
+            "{kind}: version nibble took only {} values: version bits are being forced",
+            version_nibbles.len()
+        );
+        assert_eq!(
+            variant_bits.len(),
+            4,
+            "{kind}: variant bits are being forced"
+        );
         // A time-ordered or counter id would share its leading bytes; random ones spread out.
         assert!(
             first_bytes.len() > 100,

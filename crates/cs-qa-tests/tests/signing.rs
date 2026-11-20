@@ -286,13 +286,17 @@ fn oversized_envelope_rejected_before_decode() {
 fn rotated_keys_both_resolve() {
     let v = vectors::signing();
     let k = keys(&v);
-    let a1 = v.valid.iter().find(|x| x.key_id == "qa-a/1").unwrap();
-    let a2 = v.valid.iter().find(|x| x.key_id == "qa-a/2").unwrap();
+    let a1 = v.valid.iter().find(|x| x.key_id == "qa-a@v1").unwrap();
+    let a2 = v.valid.iter().find(|x| x.key_id == "qa-a@v2").unwrap();
     assert!(c::sig_verify(&a1.envelope, &a1.context, &k).is_ok());
     assert!(c::sig_verify(&a2.envelope, &a2.context, &k).is_ok());
     // With only the new version available, an artifact naming the old one fails (no fallback
     // to "some key of the same issuer").
-    let only_new: Vec<_> = k.iter().filter(|(id, _)| id != "qa-a/1").cloned().collect();
+    let only_new: Vec<_> = k
+        .iter()
+        .filter(|(id, _)| id != "qa-a@v1")
+        .cloned()
+        .collect();
     assert!(
         c::sig_verify(&a1.envelope, &a1.context, &only_new).is_err(),
         "resolver fell back to another key version"

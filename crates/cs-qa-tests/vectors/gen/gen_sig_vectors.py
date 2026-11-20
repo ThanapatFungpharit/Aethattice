@@ -322,9 +322,9 @@ def envelope(context, key_id, payload, sig, version=1):
 
 # Fixed, published test seeds (never use outside tests).
 KEYS = {
-    "qa-a/1": bytes.fromhex("a1" * 32),
-    "qa-a/2": bytes.fromhex("a2" * 32),
-    "qa-b/1": bytes.fromhex("b1" * 32),
+    "qa-a@v1": bytes.fromhex("a1" * 32),
+    "qa-a@v2": bytes.fromhex("a2" * 32),
+    "qa-b@v1": bytes.fromhex("b1" * 32),
 }
 
 
@@ -376,7 +376,7 @@ def main(out_path):
     self_test()
 
     T = "test/v1"
-    A = "qa-a/1"
+    A = "qa-a@v1"
     base_payload = {"n": 1, "s": "x"}
 
     valid = []
@@ -399,9 +399,9 @@ def main(out_path):
     valid.append(valid_vector("map_key_ordering", T, A, {
         "b": 1, "aa": 2, 10: 3, 1: 4, -1: 5, "": 6, b"\x00": 7,
     }, note="RFC 8949 4.2.1: keys sorted bytewise by their encoding: ints before tstr, shorter tstr before longer"))
-    valid.append(valid_vector("rotated_key_version_2", T, "qa-a/2", base_payload,
+    valid.append(valid_vector("rotated_key_version_2", T, "qa-a@v2", base_payload,
                               note="second version of key qa-a; both versions must resolve"))
-    valid.append(valid_vector("second_issuer_key", T, "qa-b/1", base_payload))
+    valid.append(valid_vector("second_issuer_key", T, "qa-b@v1", base_payload))
 
     # Largest envelope that fits exactly in MAX_ENVELOPE bytes.
     def env_len_for(n):
@@ -530,12 +530,24 @@ def main(out_path):
                                   "payload byte-string length not in preferred form", tags=["oq8"]))
 
     # --- keys
-    invalid.append(invalid_vector("unknown_key_id", T, signed_env(good_payload, key_id="qa-unknown/1", signer=A),
+    invalid.append(invalid_vector("unknown_key_id", T, signed_env(good_payload, key_id="qa-unknown@v1", signer=A),
                                   "key_id not known to the resolver"))
-    invalid.append(invalid_vector("wrong_key_for_key_id", T, signed_env(good_payload, key_id=A, signer="qa-b/1"),
-                                  "signed by qa-b/1 but names qa-a/1"))
-    invalid.append(invalid_vector("old_key_version_names_new", T, signed_env(good_payload, key_id="qa-a/2", signer=A),
-                                  "signed by qa-a/1 but names qa-a/2"))
+    invalid.append(invalid_vector("wrong_key_for_key_id", T, signed_env(good_payload, key_id=A, signer="qa-b@v1"),
+                                  "signed by qa-b@v1 but names qa-a@v1"))
+    invalid.append(invalid_vector("old_key_version_names_new", T, signed_env(good_payload, key_id="qa-a@v2", signer=A),
+                                  "signed by qa-a@v1 but names qa-a@v2"))
+    # Contract §3 rev 2: key_id is "<key-name>@v<version>", at most 128 bytes. Each of these is
+    # validly signed by qa-a@v1's key, so only the key_id format can reject it.
+    for name, kid in (("key_id_old_slash_format", "qa-a/1"),
+                      ("key_id_version_leading_zero", "qa-a@v01"),
+                      ("key_id_version_zero", "qa-a@v0"),
+                      ("key_id_missing_version", "qa-a@v"),
+                      ("key_id_uppercase_name", "QA-a@v1"),
+                      ("key_id_129_bytes", "k" * 126 + "@v1"),
+                      ("key_id_empty", "")):
+        sig = sign_with(A, T, good_payload)
+        invalid.append(invalid_vector(name, T, envelope(T, kid, good_payload, sig),
+                                      "malformed key_id %r (contract §3 rev 2)" % kid[:20]))
 
     # --- signature tampering
     for byte_i, bit in ((0, 0), (31, 7), (32, 0), (63, 3)):
