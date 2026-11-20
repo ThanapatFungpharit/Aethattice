@@ -52,9 +52,14 @@ async fn test_db_is_created_isolated_and_dropped() {
         0
     );
     let (na, nb) = (a.name.clone(), b.name.clone());
-    a.drop_now().await;
+    a.drop_forced().await;
     assert!(!exists(&admin, &na).await, "explicit drop left {na}");
     // Implicit drop (the panic path) also cleans up.
+    if support::db::defer_drop() {
+        b.drop_forced().await;
+        assert!(!exists(&admin, &nb).await, "forced drop left {nb}");
+        return;
+    }
     drop(b);
     assert!(!exists(&admin, &nb).await, "Drop guard left {nb}");
 }

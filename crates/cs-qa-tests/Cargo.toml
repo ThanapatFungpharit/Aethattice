@@ -41,6 +41,11 @@ hex = "0.4"
 base64 = "0.22"
 tempfile = "3.27"
 futures = "0.3"
+# Used only by the adapter (support/contract.rs) to call the HTTP-layer extractors and to build
+# serde payloads for the outbox.
+serde = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
 
 [lints]
 workspace = true

@@ -26,6 +26,11 @@ const M3: &str =
     "CREATE INDEX IF NOT EXISTS qa_widgets_name_idx ON qa_widgets (tenant_id, name);\n";
 
 async fn applied(db: &TestDb) -> Vec<(i32, String, String, Vec<u8>, String)> {
+    // A runner that rejects a migration set before bootstrapping never creates the table:
+    // that means "nothing applied".
+    if !table_exists(db, "schema_migrations").await {
+        return Vec::new();
+    }
     let mut conn = db.connect().await;
     sqlx::query("SELECT version, name, class, checksum, applied_at::text FROM schema_migrations ORDER BY version")
         .fetch_all(&mut conn)
@@ -34,6 +39,13 @@ async fn applied(db: &TestDb) -> Vec<(i32, String, String, Vec<u8>, String)> {
         .into_iter()
         .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
         .collect()
+}
+
+/// Runs the migration runner while holding the harness DDL guard: parallel tests migrating
+/// their own databases would otherwise contend on YugabyteDB's shared catalog (40001).
+async fn mig(url: &str, dir: &Path) -> Result<Vec<i32>, String> {
+    let _g = support::db::ddl_guard().await;
+    c::migrate_dir(url, DOMAIN, dir).await
 }
 
 async fn table_exists(db: &TestDb, t: &str) -> bool {
@@ -53,7 +65,7 @@ async fn applies_in_order_and_records_checksums() {
     write(dir.path(), "0003_widgets_name_idx.expand.sql", M3);
     write(dir.path(), "0001_widgets.expand.sql", M1);
     write(dir.path(), "0002_widgets_colour.expand.sql", M2);
-    let ran = c::migrate_dir(&db.url, DOMAIN, dir.path()).await.unwrap();
+    let ran = mig(&db.url, dir.path()).await.unwrap();
     assert_eq!(ran, vec![1, 2, 3]);
     let rows = applied(&db).await;
     assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 2, 3]);
@@ -80,11 +92,11 @@ async fn rerun_is_noop() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "0001_widgets.expand.sql", M1);
     write(dir.path(), "0002_widgets_colour.expand.sql", M2);
-    c::migrate_dir(&db.url, DOMAIN, dir.path()).await.unwrap();
+    mig(&db.url, dir.path()).await.unwrap();
     let before = applied(&db).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     for _ in 0..3 {
-        let ran = c::migrate_dir(&db.url, DOMAIN, dir.path()).await.unwrap();
+        let ran = mig(&db.url, dir.path()).await.unwrap();
         assert!(ran.is_empty(), "re-run applied {ran:?}");
     }
     assert_eq!(
@@ -101,7 +113,7 @@ async fn checksum_tamper_is_hard_error() {
     let db = TestDb::create(&admin, "mig_tamper").await;
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "0001_widgets.expand.sql", M1);
-    c::migrate_dir(&db.url, DOMAIN, dir.path()).await.unwrap();
+    mig(&db.url, dir.path()).await.unwrap();
     let before = applied(&db).await;
     // Even a comment-only change to an applied file is tampering.
     for tampered in [
@@ -111,12 +123,16 @@ async fn checksum_tamper_is_hard_error() {
     ] {
         write(dir.path(), "0001_widgets.expand.sql", &tampered);
         write(dir.path(), "0002_widgets_colour.expand.sql", M2);
-        let r = c::migrate_dir(&db.url, DOMAIN, dir.path()).await;
+        let r = mig(&db.url, dir.path()).await;
         let err = r.expect_err("checksum mismatch on an applied migration must be a hard error");
-        assert!(
-            err.to_lowercase().contains("checksum"),
-            "error should name the checksum mismatch: {err}"
-        );
+        // An empty file is rejected by the parser before any checksum comparison; for real
+        // content changes the error must name the checksum mismatch.
+        if !tampered.is_empty() {
+            assert!(
+                err.to_lowercase().contains("checksum"),
+                "error should name the checksum mismatch: {err}"
+            );
+        }
         assert_eq!(
             applied(&db).await,
             before,
@@ -126,7 +142,7 @@ async fn checksum_tamper_is_hard_error() {
     // Deleting an applied file is also not silently accepted (fail closed).
     std::fs::remove_file(dir.path().join("0001_widgets.expand.sql")).unwrap();
     assert!(
-        c::migrate_dir(&db.url, DOMAIN, dir.path()).await.is_err(),
+        mig(&db.url, dir.path()).await.is_err(),
         "missing applied migration file accepted"
     );
     db.drop_now().await;
@@ -146,7 +162,7 @@ async fn failed_migration_not_recorded_and_retry_applies() {
         ),
     );
     write(dir.path(), "0003_widgets_name_idx.expand.sql", M3);
-    assert!(c::migrate_dir(&db.url, DOMAIN, dir.path()).await.is_err());
+    assert!(mig(&db.url, dir.path()).await.is_err());
     let rows = applied(&db).await;
     assert_eq!(
         rows.iter().map(|r| r.0).collect::<Vec<_>>(),
@@ -161,10 +177,7 @@ async fn failed_migration_not_recorded_and_retry_applies() {
     let v1_applied_at = rows[0].4.clone();
     // Fixed file (not yet applied, so changing it is legitimate): resume from version 2.
     write(dir.path(), "0002_widgets_colour.expand.sql", M2);
-    assert_eq!(
-        c::migrate_dir(&db.url, DOMAIN, dir.path()).await.unwrap(),
-        vec![2, 3]
-    );
+    assert_eq!(mig(&db.url, dir.path()).await.unwrap(), vec![2, 3]);
     assert_eq!(
         applied(&db).await[0].4,
         v1_applied_at,
@@ -201,9 +214,7 @@ async fn interrupted_migration_resumes() {
         "interrupted migration recorded as applied: {mid:?}"
     );
     // Same files (unchanged checksums): a fresh run must complete everything.
-    let ran = c::migrate_dir(&db.url, DOMAIN, dir.path())
-        .await
-        .expect("resume after crash");
+    let ran = mig(&db.url, dir.path()).await.expect("resume after crash");
     assert!(ran.contains(&2) && ran.contains(&3), "resume ran {ran:?}");
     assert_eq!(
         applied(&db).await.iter().map(|r| r.0).collect::<Vec<_>>(),
@@ -225,11 +236,11 @@ async fn contract_before_finalized_expand_refused() {
         "0003_drop_colour.contract.sql",
         &format!(
             "{}ALTER TABLE qa_widgets DROP COLUMN IF EXISTS colour;\n",
-            c::requires_finalized_header(2)
+            c::requires_finalized_header("qa-r1")
         ),
     );
     // Expand applied in the same (unfinalized) run: contract must be refused.
-    let r = c::migrate_dir(&db.url, DOMAIN, dir.path()).await;
+    let r = mig(&db.url, dir.path()).await;
     assert!(
         r.is_err(),
         "contract migration applied before its expand was finalized"
@@ -249,22 +260,23 @@ async fn contract_before_finalized_expand_refused() {
         "ALTER TABLE qa_widgets DROP COLUMN IF EXISTS colour;\n",
     );
     assert!(
-        c::migrate_dir(&db.url, DOMAIN, dir.path()).await.is_err(),
+        mig(&db.url, dir.path()).await.is_err(),
         "contract migration without requires_finalized accepted"
     );
-    // Contract that names a version that is not an expand (or does not exist) is refused.
+    // Contract naming a release that was never finalized is refused, even after another
+    // release has been finalized.
     write(
         dir.path(),
         "0003_drop_colour.contract.sql",
         &format!(
             "{}ALTER TABLE qa_widgets DROP COLUMN IF EXISTS colour;\n",
-            c::requires_finalized_header(9)
+            c::requires_finalized_header("qa-r9")
         ),
     );
-    c::finalize_current_release(&db.url, DOMAIN).await.unwrap();
+    c::finalize_release(&db.url, DOMAIN, "qa-r2").await.unwrap();
     assert!(
-        c::migrate_dir(&db.url, DOMAIN, dir.path()).await.is_err(),
-        "contract naming unknown expand 0009 accepted"
+        mig(&db.url, dir.path()).await.is_err(),
+        "contract naming unfinalized release qa-r9 accepted"
     );
     db.drop_now().await;
 }
@@ -276,20 +288,18 @@ async fn contract_after_finalized_expand_applies() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "0001_widgets.expand.sql", M1);
     write(dir.path(), "0002_widgets_colour.expand.sql", M2);
-    c::migrate_dir(&db.url, DOMAIN, dir.path()).await.unwrap();
-    c::finalize_current_release(&db.url, DOMAIN).await.unwrap();
+    mig(&db.url, dir.path()).await.unwrap();
+    // The release that shipped the expands (0001, 0002) is finalized.
+    c::finalize_release(&db.url, DOMAIN, "qa-r1").await.unwrap();
     write(
         dir.path(),
         "0003_drop_colour.contract.sql",
         &format!(
             "{}ALTER TABLE qa_widgets DROP COLUMN IF EXISTS colour;\n",
-            c::requires_finalized_header(2)
+            c::requires_finalized_header("qa-r1")
         ),
     );
-    assert_eq!(
-        c::migrate_dir(&db.url, DOMAIN, dir.path()).await.unwrap(),
-        vec![3]
-    );
+    assert_eq!(mig(&db.url, dir.path()).await.unwrap(), vec![3]);
     let rows = applied(&db).await;
     assert_eq!(rows.last().map(|r| r.2.as_str()), Some("contract"));
     db.drop_now().await;
@@ -312,7 +322,7 @@ async fn invalid_filename_or_class_rejected() {
         let db = TestDb::create(&admin, &format!("mig_name{i}")).await;
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), bad, M1);
-        let r = c::migrate_dir(&db.url, DOMAIN, dir.path()).await;
+        let r = mig(&db.url, dir.path()).await;
         assert!(
             r.is_err(),
             "file {bad:?} accepted (fail closed: a misnamed migration must not be silently skipped)"
@@ -333,7 +343,7 @@ async fn duplicate_version_rejected() {
     write(dir.path(), "0001_widgets.expand.sql", M1);
     write(dir.path(), "0001_other.expand.sql", M2);
     assert!(
-        c::migrate_dir(&db.url, DOMAIN, dir.path()).await.is_err(),
+        mig(&db.url, dir.path()).await.is_err(),
         "two migrations with version 0001 accepted"
     );
     assert!(
@@ -349,7 +359,7 @@ async fn schema_migrations_class_check_constraint() {
     let db = TestDb::create(&admin, "mig_check").await;
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "0001_widgets.expand.sql", M1);
-    c::migrate_dir(&db.url, DOMAIN, dir.path()).await.unwrap();
+    mig(&db.url, dir.path()).await.unwrap();
     let mut conn = db.connect().await;
     let r = sqlx::query("INSERT INTO schema_migrations (version, name, class, checksum) VALUES (99, 'x', 'destroy', '\\x00')")
         .execute(&mut conn)
@@ -366,12 +376,18 @@ async fn schema_migrations_class_check_constraint() {
 #[tokio::test]
 async fn core_tables_follow_appendix_e() {
     let admin = require_db!();
-    let not_tenant_first = ["outbox", "outbox_counters", "sagas", "schema_migrations"];
+    // Contract rev 2 (OQ-16): outbox, outbox_counters and sagas now lead with tenant_id, so
+    // only the runner's own bookkeeping table is exempt.
+    let not_tenant_first = ["schema_migrations"];
     let mut problems = Vec::new();
+    let mut created = Vec::new();
     for d in spec::DOMAINS {
         let db = TestDb::create(&admin, &format!("mig_e_{d}")).await;
         let dom = c::domain_open(d, &db.url).await.unwrap();
-        c::domain_migrate(&dom).await.unwrap();
+        {
+            let _g = support::db::ddl_guard().await;
+            c::domain_migrate(&dom).await.unwrap();
+        }
         let mut conn = db.connect().await;
         let tables: Vec<String> = sqlx::query(
             "SELECT table_name::text FROM information_schema.tables WHERE table_schema = 'public'",
@@ -462,8 +478,9 @@ async fn core_tables_follow_appendix_e() {
             problems.push(format!("{d}: foreign keys to unknown relations"));
         }
         drop(conn);
-        db.drop_now().await;
+        created.push(db);
     }
+    TestDb::drop_all(created).await;
     assert!(
         problems.is_empty(),
         "App. E violations:\n{}",

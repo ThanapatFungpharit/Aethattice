@@ -23,9 +23,12 @@ struct Fx {
 async fn fx(admin: &str) -> Fx {
     let db = TestDb::create(admin, "idem").await;
     let dom = c::domain_open("resources", &db.url).await.unwrap();
-    c::domain_migrate(&dom).await.unwrap();
-    db.exec("CREATE TABLE qa_effects (tenant_id uuid NOT NULL, effect_id uuid NOT NULL, tag text NOT NULL, PRIMARY KEY (tenant_id, effect_id))")
-        .await;
+    {
+        let _g = support::db::ddl_guard().await;
+        c::domain_migrate(&dom).await.unwrap();
+        db.exec("CREATE TABLE qa_effects (tenant_id uuid NOT NULL, effect_id uuid NOT NULL, tag text NOT NULL, PRIMARY KEY (tenant_id, effect_id))")
+            .await;
+    }
     Fx {
         db,
         dom,
@@ -221,23 +224,24 @@ fn digest_covers_method_route_params_and_body() {
     for (what, r) in variants {
         assert_ne!(c::idem_digest(&r), d0, "digest ignores {what}");
     }
-    // OQ-5: key-order canonicalization is reported, not asserted.
-    let reordered = IdemRequest {
-        body: b"{\"b\":2,\"a\":1}".to_vec(),
+    // Contract rev 2 (OQ-5 resolved): the JSON body is canonicalized with RFC 8785 (JCS), so
+    // key order and insignificant whitespace do not change the digest, but values do.
+    let body = |b: &[u8]| IdemRequest {
+        body: b.to_vec(),
         ..req("")
     };
-    let ordered = IdemRequest {
-        body: b"{\"a\":1,\"b\":2}".to_vec(),
-        ..req("")
-    };
-    eprintln!(
-        "OQ-5 observation: JSON key order {} the digest",
-        if c::idem_digest(&reordered) == c::idem_digest(&ordered) {
-            "does not change"
-        } else {
-            "changes"
-        }
+    assert_eq!(
+        c::idem_digest(&body(b"{\"b\":2,\"a\":1}")),
+        c::idem_digest(&body(b"{ \"a\" : 1, \"b\" : 2 }")),
+        "JCS: key order / whitespace must not change the digest"
     );
+    assert_ne!(
+        c::idem_digest(&body(b"{\"a\":1}")),
+        c::idem_digest(&body(b"{\"a\":\"1\"}")),
+        "JCS: number vs string must change the digest"
+    );
+    // Absent body digests as the empty string; an empty JSON object is a different body.
+    assert_ne!(c::idem_digest(&body(b"")), c::idem_digest(&body(b"{}")));
 }
 
 #[tokio::test]
@@ -270,9 +274,10 @@ async fn concurrent_identical_requests_single_effect() {
         for t in tasks {
             match t.await.unwrap() {
                 Ok(r) => ok.push(r),
-                // OQ-4: a duplicate racing the original may see conflict (not retryable).
+                // Contract rev 3: a concurrent duplicate blocks and then receives the stored
+                // result; outcome_unknown (504, retryable) is the only other admissible outcome.
                 Err(e) => assert!(
-                    e.code == "conflict" && !e.retryable && e.status == 409,
+                    e.code == "outcome_unknown" && e.retryable && e.status == 504,
                     "race loser got unexpected error {e:?}"
                 ),
             }
@@ -307,7 +312,7 @@ async fn concurrent_identical_requests_single_effect() {
 }
 
 #[tokio::test]
-async fn in_progress_duplicate_is_conflict_not_retryable() {
+async fn in_progress_record_is_outcome_unknown() {
     let admin = require_db!();
     let f = fx(&admin).await;
     let k = key();
@@ -336,10 +341,11 @@ async fn in_progress_duplicate_is_conflict_not_retryable() {
     )
     .await
     .unwrap_err();
+    // Contract rev 3: a visible (separately committed) in_progress record yields
+    // outcome_unknown (504, retryable).
     assert!(
-        (e.code == "conflict" && e.status == 409 && !e.retryable)
-            || (e.code == "outcome_unknown" && e.status == 504 && e.retryable),
-        "in-progress duplicate must be conflict (409, not retryable) or outcome_unknown (504); got {e:?}"
+        e.code == "outcome_unknown" && e.status == 504 && e.retryable,
+        "visible in-progress record must give outcome_unknown (504, retryable); got {e:?}"
     );
     assert_eq!(
         effects(&f, "inprog").await,
@@ -581,11 +587,14 @@ async fn record_written_in_same_transaction_as_effect() {
 }
 
 #[tokio::test]
-async fn oversized_response_stored_by_reference() {
+async fn oversized_response_refused_as_internal() {
+    // Contract rev 2: stored responses are <= 64 KiB; an operation whose response could be
+    // larger must return a reference. Exceeding the limit is an `internal` error, never
+    // truncation, and (record and effect sharing one transaction) leaves no effect behind.
     let admin = require_db!();
     let f = fx(&admin).await;
     let k = key();
-    let first = c::idem_execute(
+    let e = c::idem_execute(
         &f.dom,
         f.tenant,
         f.principal,
@@ -595,22 +604,12 @@ async fn oversized_response_stored_by_reference() {
         false,
     )
     .await
-    .unwrap();
-    assert!(first.body.len() > spec::MAX_ROW_PAYLOAD);
-    let again = c::idem_execute(
-        &f.dom,
-        f.tenant,
-        f.principal,
-        &k,
-        &req("{}"),
-        "big:1",
-        false,
-    )
-    .await
-    .unwrap();
+    .expect_err("a > 64 KiB stored response must be refused");
+    assert_eq!(e.code, "internal", "{e:?}");
     assert_eq!(
-        again, first,
-        "large response must replay identically (OQ-19)"
+        effects(&f, "big:1").await,
+        0,
+        "effect committed although its response was refused"
     );
     let max_row =
         f.db.scalar_i64(

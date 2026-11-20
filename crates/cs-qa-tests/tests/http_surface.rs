@@ -145,6 +145,7 @@ async fn wrong_method_returns_405_problem() {
 }
 
 #[tokio::test]
+#[ignore = "contract rev 2 (OQ-7): M0 has no JSON-body routes; moved to the M1 gate"]
 async fn malformed_json_body_returns_400_problem() {
     let Some(route) = c::JSON_POST_ROUTE else {
         panic!(

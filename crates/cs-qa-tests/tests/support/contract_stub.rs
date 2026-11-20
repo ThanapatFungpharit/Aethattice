@@ -15,7 +15,14 @@ pub const DEPLOYMENT_DOMAIN: &str = "qa.example";
 pub const JSON_POST_ROUTE: Option<&str> = None;
 
 pub fn server_args(config: &Path) -> Vec<String> {
-    vec!["--config".into(), config.display().to_string()]
+    vec![
+        "serve".into(),
+        "--config".into(),
+        config.display().to_string(),
+    ]
+}
+pub fn server_prepare_args(_config: &Path) -> Vec<Vec<String>> {
+    stub()
 }
 pub fn config_toml(
     _listen_port: u16,
@@ -170,6 +177,7 @@ pub async fn outbox_append(
 }
 pub async fn outbox_read(
     _d: &Domain,
+    _tenant: Uuid,
     _partition: i32,
     _after_sequence: i64,
     _limit: usize,
@@ -194,13 +202,13 @@ pub async fn idem_execute(
 }
 
 // ---------------------------------------------------------------- migrations
-pub fn requires_finalized_header(_expand_version: i32) -> String {
+pub fn requires_finalized_header(_release: &str) -> String {
     stub()
 }
 pub async fn migrate_dir(_url: &str, _domain: &str, _dir: &Path) -> Result<Vec<i32>, String> {
     stub()
 }
-pub async fn finalize_current_release(_url: &str, _domain: &str) -> Result<(), String> {
+pub async fn finalize_release(_url: &str, _domain: &str, _release: &str) -> Result<(), String> {
     stub()
 }
 

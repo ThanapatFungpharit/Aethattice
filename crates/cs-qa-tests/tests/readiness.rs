@@ -128,7 +128,10 @@ async fn readyz_lists_only_the_failing_domain() {
     for d in spec::DOMAINS {
         let t = TestDb::create(&admin, &format!("rdy_{d}")).await;
         let dom = c::domain_open(d, &t.url).await.unwrap();
-        c::domain_migrate(&dom).await.unwrap();
+        {
+            let _g = support::db::ddl_guard().await;
+            c::domain_migrate(&dom).await.unwrap();
+        }
         dbs.push((d.to_string(), t));
     }
     let urls: std::collections::HashMap<String, String> = dbs
@@ -165,9 +168,7 @@ async fn readyz_lists_only_the_failing_domain() {
         );
     }
     s.stop().await;
-    for (_, t) in dbs {
-        t.drop_now().await;
-    }
+    TestDb::drop_all(dbs.into_iter().map(|(_, t)| t).collect()).await;
 }
 
 #[tokio::test]
@@ -178,7 +179,10 @@ async fn readyz_200_when_all_domains_reachable_and_migrated() {
         let t = TestDb::create(&admin, &format!("rdy_{d}")).await;
         // OQ-12: QA migrates explicitly; if `cs` migrates on start this is a no-op.
         let dom = c::domain_open(d, &t.url).await.unwrap();
-        c::domain_migrate(&dom).await.unwrap();
+        {
+            let _g = support::db::ddl_guard().await;
+            c::domain_migrate(&dom).await.unwrap();
+        }
         dbs.push((d.to_string(), t));
     }
     let urls: std::collections::HashMap<String, String> = dbs
@@ -205,7 +209,9 @@ async fn readyz_200_when_all_domains_reachable_and_migrated() {
     }
     // Readiness must be withdrawn when a domain database disappears (no stale readiness).
     let (_, victim) = dbs.remove(0);
-    victim.drop_now().await;
+    // The drop is the stimulus of this test, so it is always performed (even with
+    // CS_QA_DEFER_DROP=1).
+    victim.drop_forced().await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let r = cl.get(s.url("/readyz")).send().await.unwrap();
@@ -228,7 +234,5 @@ async fn readyz_200_when_all_domains_reachable_and_migrated() {
         200
     );
     s.stop().await;
-    for (_, t) in dbs {
-        t.drop_now().await;
-    }
+    TestDb::drop_all(dbs.into_iter().map(|(_, t)| t).collect()).await;
 }

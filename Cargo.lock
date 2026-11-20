@@ -630,6 +630,7 @@ dependencies = [
 name = "cs-qa-tests"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "cs-api",
  "cs-common",
@@ -639,8 +640,10 @@ dependencies = [
  "cs-ops",
  "futures",
  "hex",
+ "http",
  "proptest",
  "reqwest",
+ "serde",
  "serde_json",
  "sqlx",
  "tempfile",

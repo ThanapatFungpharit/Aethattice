@@ -39,7 +39,10 @@ async fn fx(admin: &str) -> Fx {
     let ops = TestDb::create(admin, "saga_ops").await;
     let a = TestDb::create(admin, "saga_a").await;
     let b = TestDb::create(admin, "saga_b").await;
-    let env = c::saga_env(&ops.url, &a.url, &b.url).await.unwrap();
+    let env = {
+        let _g = support::db::ddl_guard().await;
+        c::saga_env(&ops.url, &a.url, &b.url).await.unwrap()
+    };
     Fx {
         ops,
         a,
@@ -56,9 +59,7 @@ impl Fx {
         {
             let _env = env; // dropped at the end of this block
         }
-        ops.drop_now().await;
-        a.drop_now().await;
-        b.drop_now().await;
+        TestDb::drop_all(vec![ops, a, b]).await;
     }
     async fn row(&self, op: Uuid) -> SagaRow {
         let mut conn = self.ops.connect().await;

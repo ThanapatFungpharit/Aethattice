@@ -109,6 +109,36 @@ fn exact_duplicates_are_deduplicated() {
 }
 
 #[test]
+fn conflicting_duplicates_merge_to_maximum() {
+    // Contract rev 2 (OQ-9): same (cluster, domain, partition) merges to the maximum position,
+    // and the 64 limit applies after merging.
+    let key = |pos| Comp {
+        cluster: Uuid::from_u128(CLUSTERS[0]),
+        domain: "authz".into(),
+        partition: 7,
+        position: pos,
+    };
+    for order in [vec![3, 9, 5], vec![9, 3, 5], vec![5, 5, 9, 3]] {
+        let v = c::cv_new(order.iter().map(|p| key(*p)).collect()).unwrap();
+        let out = c::cv_components(&v);
+        assert_eq!(out.len(), 1, "{order:?}");
+        assert_eq!(
+            out[0].position, 9,
+            "{order:?}: must keep the maximum position"
+        );
+    }
+    let mut v = comps(spec::MAX_VECTOR_COMPONENTS);
+    v.extend(comps(spec::MAX_VECTOR_COMPONENTS).into_iter().map(|mut c| {
+        c.position += 100;
+        c
+    }));
+    let merged =
+        c::cv_new(v).expect("128 entries over 64 distinct keys is 64 components after merging");
+    assert_eq!(c::cv_components(&merged).len(), spec::MAX_VECTOR_COMPONENTS);
+    assert!(c::cv_components(&merged).iter().all(|c| c.position >= 100));
+}
+
+#[test]
 fn domain_ids_match_spec_18_1() {
     let mut got = c::domain_wire_names();
     got.sort();
