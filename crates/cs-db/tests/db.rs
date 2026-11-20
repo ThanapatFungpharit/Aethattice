@@ -1282,11 +1282,11 @@ fn side_pool(t: &TestDomains, max_connections: u32, retry: RetryPolicy) -> Domai
 #[tokio::test]
 async fn retry_budget_excludes_connection_acquisition() {
     let Some(t) = setup().await else { return };
-    // 1 s budget, generous attempts. Every retry has to wait ~600 ms for a connection held by
+    // 3 s budget, generous attempts. Every retry has to wait ~2 s for a connection held by
     // another task, so acquisition alone exceeds the budget; only attempt + backoff time counts.
     let policy = RetryPolicy {
         max_attempts: 50,
-        max_elapsed: Duration::from_secs(1),
+        max_elapsed: Duration::from_secs(3),
         base_delay: Duration::from_millis(1),
         max_delay: Duration::from_millis(5),
     };
@@ -1300,12 +1300,12 @@ async fn retry_budget_excludes_connection_acquisition() {
             let n = a.fetch_add(1, Ordering::SeqCst) + 1;
             if n <= 3 {
                 // Queue a competitor for the only connection; it gets it as soon as this
-                // attempt rolls back and holds it for 600 ms.
+                // attempt rolls back and holds it for 2 s.
                 let p2 = p.clone();
                 h.lock().unwrap().push(tokio::spawn(async move {
                     p2.transaction(|_tx| {
                         Box::pin(async move {
-                            tokio::time::sleep(Duration::from_millis(600)).await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
                             Ok(())
                         })
                     })
@@ -1325,8 +1325,8 @@ async fn retry_budget_excludes_connection_acquisition() {
     let total = started.elapsed();
     assert_eq!(n, 4, "three conflicts, then success");
     assert!(
-        total >= Duration::from_millis(1500),
-        "acquisition waits did happen ({total:?}) yet did not exhaust the 1 s budget"
+        total >= Duration::from_secs(5),
+        "acquisition waits did happen ({total:?}) yet did not exhaust the 3 s budget (6 s of acquisition waits)"
     );
     let handles: Vec<_> = std::mem::take(&mut *holders.lock().unwrap());
     for hd in handles {
