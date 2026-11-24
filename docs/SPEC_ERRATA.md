@@ -40,6 +40,9 @@ Approved by the project owner on 2026-11-24 (M0 gate follow-up, owner form). C11
 | Account-recovery waiting period | 24 h | 1 h–14 d | §5 |
 | Recovery grant validity | 15 min | fixed | M1 contract (design) |
 | Refresh lost-response window | 30 s | fixed | M1 contract (design) |
+| Group nesting depth (max) | 32 | 4–64 | M1 contract (design; owner 2026-11-24) |
+| Group closure size (max members) | 10,000 | 1,000–100,000 | M1 contract (design; owner 2026-11-24) |
+| Setup-link lifetime | 24 h | 15 min–7 d | M1 contract (design; owner 2026-11-24) |
 
 ## Process for future errata
 
