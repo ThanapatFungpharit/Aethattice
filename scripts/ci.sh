@@ -11,6 +11,13 @@ if [[ "${1:-}" == "--with-db" ]]; then
   CS_REQUIRE_DB=1 CS_TEST_DATABASE_URL="${CS_TEST_DATABASE_URL:-postgres://yugabyte@localhost:5433/yugabyte}" \
     cargo test --workspace -- --test-threads=4
 fi
+echo "== opaque-wasm pkg freshness"
+# The committed wasm-bindgen output must match the crate (M1 rev 5 §2.1). Needs wasm-bindgen-cli 0.2.130.
+if WB="${WASM_BINDGEN:-wasm-bindgen}"; [[ "$("$WB" --version 2>/dev/null)" == "wasm-bindgen 0.2.130" ]]; then
+  scripts/build-opaque-wasm.sh --check
+else
+  echo "SKIPPED: wasm-bindgen 0.2.130 not installed (set WASM_BINDGEN); pkg/ freshness not verified"
+fi
 echo "== web"; (cd web && npm ci --no-audit --no-fund >/dev/null && npm run typecheck && npm run lint && npm test --if-present -- --passWithNoTests && npm run build)
 echo "== traceability lint"; scripts/trace-lint.sh
 echo "CI OK"

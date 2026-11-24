@@ -8,7 +8,7 @@ import tseslint from "typescript-eslint";
 /** @param {string} tsconfigRootDir */
 export function config(tsconfigRootDir) {
   return tseslint.config(
-    { ignores: ["**/dist/**", "**/node_modules/**", "**/*.js", "**/*.mjs", "**/*.config.ts"] },
+    { ignores: ["**/dist/**", "packages/opaque-wasm/pkg/**", "**/node_modules/**", "**/*.js", "**/*.mjs", "**/*.config.ts"] },
     js.configs.recommended,
     ...tseslint.configs.strictTypeChecked,
     ...tseslint.configs.stylisticTypeChecked,
