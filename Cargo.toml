@@ -53,6 +53,14 @@ uuid = { version = "1.29.2", default-features = false, features = ["std", "serde
 zeroize = { version = "1.9.1", features = ["derive"] }
 serde_jcs = "0.2.0"
 sha2 = "0.11.1"
+cs-identity-wire = { path = "crates/cs-identity-wire" }
+# OPAQUE (M1 contract rev 5 §2.1): opaque-ke 4.0.1 (RFC 9807) with argon2 0.5. opaque-ke 4 is
+# built on the digest 0.10 ecosystem, so its SHA-512 comes from sha2 0.10.
+opaque-ke = { version = "=4.0.1", default-features = false, features = ["ristretto255", "argon2", "serde"] }
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
+sha2_010 = { package = "sha2", version = "0.10.9" }
+# CSPRNG adapter for opaque-ke 4 (rand_core 0.6 traits); OsRng reads the OS CSPRNG.
+rand_core_06 = { package = "rand_core", version = "0.6.4", features = ["getrandom"] }
 unicode-normalization = "0.1.26"
 
 [workspace.lints.rust]
@@ -68,3 +76,10 @@ todo = "warn"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Argon2id with the contract parameters (64 MiB, t = 3) is impractically slow unoptimized; the
+# test-side OPAQUE client runs it on every registration and login.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

@@ -10,7 +10,8 @@ use cs_db::DomainPool;
 use cs_db::migrate::{MigrationSet, Migrator, common_migrations};
 use cs_db::testing::TestDomains;
 use cs_identity::admin::{
-    GROUP_COMPLEXITY_LIMIT, GroupLimits, IdentityAdmin, Member, NewUser, UserKind, UserStatus,
+    GROUP_COMPLEXITY_LIMIT, GROUP_CYCLE, GroupLimits, IdentityAdmin, Member, NewUser, UserKind,
+    UserStatus,
 };
 use cs_identity::token;
 use sqlx::Row;
@@ -482,6 +483,7 @@ async fn group_cycles_rejected_and_nothing_written() {
             .await
             .unwrap_err();
         assert_eq!(code(&e), ErrorCode::InvalidRequest, "{parent} <- {child}");
+        assert_eq!(e.field_errors()[0].code, GROUP_CYCLE, "{parent} <- {child}");
     }
     assert_eq!(
         events(&p, ten).await.len(),
@@ -714,5 +716,61 @@ async fn setup_link_is_rt1_stored_as_sha256_single_active() {
         ),
         ErrorCode::NotFound
     );
+    t.cleanup().await;
+}
+
+#[tokio::test]
+async fn setup_link_lifetime_and_group_limits_follow_policy() {
+    use cs_common::config::{Policy, PolicyKey};
+    let Some((t, _)) = setup().await else { return };
+    let p = t.pool(&ID).clone();
+    let policy = Policy::default()
+        .with_value(PolicyKey::SetupLinkLifetimeSecs, 900)
+        .unwrap()
+        .with_value(PolicyKey::GroupMaxDepth, 4)
+        .unwrap()
+        .with_value(PolicyKey::GroupMaxClosure, 1_000)
+        .unwrap();
+    // Outside C13 ranges is refused, exactly like check-config.
+    assert!(
+        Policy::default()
+            .with_value(PolicyKey::SetupLinkLifetimeSecs, 899)
+            .is_err()
+    );
+    assert!(
+        Policy::default()
+            .with_value(PolicyKey::GroupMaxDepth, 65)
+            .is_err()
+    );
+    let a = IdentityAdmin::with_policy(p.clone(), &policy).unwrap();
+    assert_eq!(
+        a.group_limits(),
+        GroupLimits {
+            max_depth: 4,
+            max_closure: 1_000
+        }
+    );
+    assert_eq!(
+        IdentityAdmin::new(p.clone()).unwrap().group_limits(),
+        GroupLimits {
+            max_depth: 32,
+            max_closure: 10_000
+        }
+    );
+    let ten = a.create_tenant("Acme").await.unwrap().tenant_id;
+    let u = a
+        .create_user(ten, user("admin@acme.test"))
+        .await
+        .unwrap()
+        .user_id;
+    let l = a.issue_setup_link(ten, u).await.unwrap();
+    let r = rows(
+        &p,
+        "SELECT extract(epoch FROM (expires_at - created_at))::float8 FROM setup_links",
+    )
+    .await;
+    let secs: f64 = r[0].get(0);
+    assert!((secs - 900.0).abs() < 5.0, "lifetime {secs}");
+    drop(l);
     t.cleanup().await;
 }

@@ -17,6 +17,7 @@
 
 use crate::login::normalize_login;
 use crate::token::{self, TokenHash};
+use cs_common::config::{Policy, PolicyKey};
 use cs_common::error::{Error, ErrorCode, FieldError};
 use cs_common::id::{GroupId, TenantId, UserId};
 use cs_common::secret::Secret;
@@ -27,38 +28,35 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
-/// Group nesting depth limit (edges on the longest group-in-group chain).
-///
-/// Provisional design constant: §6.4 requires "configured depth and cardinality limits", but
-/// neither the spec, erratum C13 nor the M1 contract gives a default or safe range, so this is
-/// not yet a configurable policy (reported to the Team Leader).
-pub const DEFAULT_MAX_GROUP_DEPTH: u32 = 32;
-/// Closure cardinality limit: distinct principals (users and groups) in a group's transitive
-/// membership. Provisional design constant (see [`DEFAULT_MAX_GROUP_DEPTH`]).
-pub const DEFAULT_MAX_GROUP_CLOSURE: usize = 10_000;
-/// Validity of a first-administrator setup link. Provisional design constant: the contract
-/// gives the link an expiry but no value (reported to the Team Leader).
-pub const SETUP_LINK_LIFETIME_SECS: i64 = 24 * 3600;
-
 /// `errors[].code` for a group depth or cardinality breach (contract §6.1).
 pub const GROUP_COMPLEXITY_LIMIT: &str = "group_complexity_limit";
+/// `errors[].code` for a membership change that would create a cycle (contract §6.1 rev 4).
+pub const GROUP_CYCLE: &str = "group_cycle";
 
 /// Marker recorded in outbox payloads for actions taken through the CLI.
 const VIA_CLI: &str = "cs-admin";
 
-/// Group expansion limits (§6.4).
+/// Group expansion limits (§6.4). The values are the policies `group_max_depth` and
+/// `group_max_closure` (erratum C13, contract §1 rev 4), range-checked by `check-config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupLimits {
     pub max_depth: u32,
     pub max_closure: usize,
 }
 
+impl GroupLimits {
+    /// Limits from validated policy.
+    pub fn from_policy(p: &Policy) -> Self {
+        Self {
+            max_depth: u32::try_from(p.get(PolicyKey::GroupMaxDepth)).unwrap_or(32),
+            max_closure: usize::try_from(p.get(PolicyKey::GroupMaxClosure)).unwrap_or(10_000),
+        }
+    }
+}
+
 impl Default for GroupLimits {
     fn default() -> Self {
-        Self {
-            max_depth: DEFAULT_MAX_GROUP_DEPTH,
-            max_closure: DEFAULT_MAX_GROUP_CLOSURE,
-        }
+        Self::from_policy(&Policy::default())
     }
 }
 
@@ -284,6 +282,19 @@ fn app(code: ErrorCode, detail: impl Into<String>) -> DbError {
     DbError::app(Error::new(code).with_detail(detail))
 }
 
+fn cycle(detail: &str) -> DbError {
+    let detail = detail.to_owned();
+    DbError::app(
+        Error::new(ErrorCode::InvalidRequest)
+            .with_detail(detail.clone())
+            .with_field_error(FieldError {
+                pointer: String::new(),
+                code: GROUP_CYCLE.to_owned(),
+                detail,
+            }),
+    )
+}
+
 fn complexity(detail: impl Into<String>) -> DbError {
     let detail = detail.into();
     DbError::app(
@@ -417,10 +428,7 @@ async fn expand(
         let mut next = Vec::new();
         for (m, is_group) in rows {
             if stop_at == Some(m) {
-                return Err(app(
-                    ErrorCode::InvalidRequest,
-                    "membership would create a group cycle",
-                ));
+                return Err(cycle("membership would create a group cycle"));
             }
             all.insert(m);
             if is_group && seen_groups.insert(m) {
@@ -497,10 +505,7 @@ async fn check_closure(
         Member::User(u) => (HashSet::from([u.into_uuid()]), 0u32),
         Member::Group(c) => {
             if c == group {
-                return Err(app(
-                    ErrorCode::InvalidRequest,
-                    "a group cannot be a member of itself",
-                ));
+                return Err(cycle("a group cannot be a member of itself"));
             }
             // A cycle exists iff `group` is already reachable from the new member group.
             let (desc, depth) = expand(tx, tenant, c.into_uuid(), limits, Some(p)).await?;
@@ -577,6 +582,7 @@ pub type AdminResult<T> = Result<T, AdminError>;
 pub struct IdentityAdmin {
     pool: DomainPool,
     limits: GroupLimits,
+    setup_link_lifetime_secs: i64,
 }
 
 impl IdentityAdmin {
@@ -590,10 +596,22 @@ impl IdentityAdmin {
                 ))
                 .into());
         }
-        Ok(Self {
+        Ok(Self::with_policy_values(pool, &Policy::default()))
+    }
+
+    /// `pool` must be the identity domain's pool; group depth/closure limits and the setup-link
+    /// lifetime come from validated `policy` (erratum C13, contract rev 4).
+    pub fn with_policy(pool: DomainPool, policy: &Policy) -> AdminResult<Self> {
+        let a = Self::new(pool)?;
+        Ok(Self::with_policy_values(a.pool, policy))
+    }
+
+    fn with_policy_values(pool: DomainPool, policy: &Policy) -> Self {
+        Self {
             pool,
-            limits: GroupLimits::default(),
-        })
+            limits: GroupLimits::from_policy(policy),
+            setup_link_lifetime_secs: policy.get(PolicyKey::SetupLinkLifetimeSecs),
+        }
     }
 
     /// Override the group expansion limits.
@@ -901,6 +919,7 @@ impl IdentityAdmin {
         tenant: TenantId,
         user: UserId,
     ) -> AdminResult<IssuedSetupLink> {
+        let lifetime = self.setup_link_lifetime_secs;
         let r = self
             .pool
             .transaction(move |tx| {
@@ -945,7 +964,7 @@ impl IdentityAdmin {
                     .bind(tenant.as_uuid())
                     .bind(issued.hash.as_bytes().as_slice())
                     .bind(user.as_uuid())
-                    .bind(SETUP_LINK_LIFETIME_SECS as f64)
+                    .bind(lifetime as f64)
                     .fetch_one(tx.conn())
                     .await?;
                     Outbox::append(
@@ -1161,4 +1180,10 @@ async fn finish_membership_change(
         membership_version: new_version,
         event,
     })
+}
+
+impl From<AdminError> for Error {
+    fn from(e: AdminError) -> Self {
+        e.into_inner()
+    }
 }
