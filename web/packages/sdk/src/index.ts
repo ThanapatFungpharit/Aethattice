@@ -7,5 +7,6 @@ export * from "./problem";
 export * from "./retry";
 export * from "./idempotency";
 export * from "./client";
+export * from "./auth";
 export * from "./i18n";
 export * from "./tokens";
