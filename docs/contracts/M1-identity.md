@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 5)
+# M1 Contracts: Identity (FROZEN rev 6)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -58,6 +58,18 @@ Outbox events: `identity.user.created|updated|disabled`, `identity.group.members
   - `login/finish {login_txn, credential_finalization}` → an authentication result (§2.4)
   - `register/start` and `register/finish`: allowed only with a registration grant (setup link, invitation, completed recovery, or step-up session for a password change)
 - `login_txn` is a server-side record with a 60 s TTL, single use, bound to tenant, login and source.
+- (rev 6) **Storage for transactions and server keys:**
+  - `auth_txns ((tenant_id, txn_hash) HASH)` holds `login_txn` and `registration_txn`.
+    - The txn id uses the `rt1` format, and only its SHA-256 is stored.
+    - The ServerLogin state is AEAD-sealed under the txn-sealing key, with associated data `tenant_id ‖ txn_hash ‖ kind`.
+    - Each txn is consumed by a conditional delete or state transition in the finishing transaction, so it is single use even across nodes.
+    - Expired rows are reclaimed lazily.
+  - `opaque_server_keys (key_version)` is a deployment-wide table, so it has no `tenant_id`. Each row holds an envelope with the OPAQUE ServerSetup, the [R3] PRF key and the txn-sealing key.
+    - The envelope is encrypted under the KMS KEK `identity-opaque/vN`, with associated data `key_version ‖ purpose`.
+    - It is created once with `INSERT … ON CONFLICT DO NOTHING`, and every node then re-reads the stored row, never using its own candidate.
+    - Nodes unwrap it into memory only at startup. It is never logged.
+    - Rotation adds a new version, and each registration records its version.
+- (rev 6) Access-token claims: `iss = "https://<deployment domain>"`, `aud = "https://<deployment domain>/api/v2"`.
 - (rev 5) **Wire format, binding for client and server:**
   - Crate `opaque-ke` 4.0.1 (RFC 9807 final) with `argon2` 0.5. The cipher suite type is defined once, in a small dependency-free crate `cs-identity-wire`, which server and `web/packages/opaque-wasm` both use. That crate also holds login normalization, so client and server normalize identically.
   - OPAQUE messages are base64url without padding in JSON (as in M0 text transports).
@@ -195,3 +207,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-24: **rev 3, frozen.** The owner approved §0 (no HTTP admin API in M1: `cs admin` CLI and the first-administrator setup link only; HTTP admin in M2 under the relationship model) and the §8 ranges (erratum C13). Builds on M0 contract rev 6.
 - 2026-11-24 rev 4 (TL, from backend slice 1): §6.1 adds `group_cycle` (`errors[]` code on `invalid_request`); §1 adds three non-revocation outbox events. Owner-approved the same day (erratum C13): group nesting depth default 32 (4–64), group closure size default 10,000 (1,000–100,000), setup-link lifetime default 24 h (15 min–7 d); all are policies enforced by `check-config`.
 - 2026-11-25 rev 5 (TL, frontend question): §2.1 OPAQUE wire format fixed: crate versions, shared `cs-identity-wire` suite and normalization, base64url encoding, ksf_params shape, context and identifiers, tenant as UUID, register endpoint shapes; register/finish returns 204.
+- 2026-11-25 rev 6 (TL, backend question): §2.1 adds the `auth_txns` and `opaque_server_keys` tables (sealed state, KEK envelope, single-use and cross-node creation rules) and fixes `iss` and `aud`.
