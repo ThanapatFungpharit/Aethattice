@@ -30,6 +30,7 @@ cs-crypto = { path = "../cs-crypto" }
 cs-ops = { path = "../cs-ops" }
 cs-kms = { path = "../cs-kms" }
 cs-api = { path = "../cs-api" }
+cs-identity = { path = "../cs-identity" }
 # Test tooling only.
 tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "time", "process", "net", "sync", "io-util"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "uuid"] }

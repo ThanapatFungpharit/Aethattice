@@ -16,6 +16,7 @@ cs-kms = { path = "crates/cs-kms" }
 cs-db = { path = "crates/cs-db" }
 cs-ops = { path = "crates/cs-ops" }
 cs-api = { path = "crates/cs-api" }
+cs-identity = { path = "crates/cs-identity" }
 # external (pinned minor versions; Cargo.lock pins exact versions)
 async-trait = "0.1.89"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "query", "original-uri", "matched-path"] }
@@ -51,6 +52,8 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter", "fm
 uuid = { version = "1.29.2", default-features = false, features = ["std", "serde"] }
 zeroize = { version = "1.9.1", features = ["derive"] }
 serde_jcs = "0.2.0"
+sha2 = "0.11.1"
+unicode-normalization = "0.1.26"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -14,10 +14,12 @@ clap.workspace = true
 cs-api.workspace = true
 cs-common.workspace = true
 cs-db.workspace = true
+cs-identity.workspace = true
 cs-kms.workspace = true
 cs-ops.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 cs-common.workspace = true
