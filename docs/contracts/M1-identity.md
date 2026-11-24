@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 4)
+# M1 Contracts: Identity (FROZEN rev 5)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -58,6 +58,14 @@ Outbox events: `identity.user.created|updated|disabled`, `identity.group.members
   - `login/finish {login_txn, credential_finalization}` → an authentication result (§2.4)
   - `register/start` and `register/finish`: allowed only with a registration grant (setup link, invitation, completed recovery, or step-up session for a password change)
 - `login_txn` is a server-side record with a 60 s TTL, single use, bound to tenant, login and source.
+- (rev 5) **Wire format, binding for client and server:**
+  - Crate `opaque-ke` 4.0.1 (RFC 9807 final) with `argon2` 0.5. The cipher suite type is defined once, in a small dependency-free crate `cs-identity-wire`, which server and `web/packages/opaque-wasm` both use. That crate also holds login normalization, so client and server normalize identically.
+  - OPAQUE messages are base64url without padding in JSON (as in M0 text transports).
+  - `ksf_params = {"algorithm":"argon2id","m_kib":65536,"t":3,"p":1}`. The server rejects parameter sets below the defaults when registering.
+  - OPAQUE context is the ASCII string `cs-opaque/v1`. The client identifier is the UTF-8 string `<tenant UUID>/<normalized login>`. The server identifier is the default (the server public key; the registration records the key version).
+  - `tenant` is always the tenant UUID in canonical text form. Tenant names, slugs or domains are not resolved in M1.
+  - `register/start {grant, login, registration_request}` → `{registration_txn, registration_response, ksf_params}`. `grant` is the full `rt1.` token. The tenant comes from the grant, and `registration_txn` has a 60 s TTL and is single use.
+  - `register/finish {registration_txn, registration_upload}` → `204`, consuming the grant. The client then signs in normally, so sessions are issued only by `login/finish`.
 
 ### 2.2 WebAuthn (§5.3)
 
@@ -186,3 +194,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-20: §9: log-secret scan added to the M1 gate (M0 carry-over CT.M0-28).
 - 2026-11-24: **rev 3, frozen.** The owner approved §0 (no HTTP admin API in M1: `cs admin` CLI and the first-administrator setup link only; HTTP admin in M2 under the relationship model) and the §8 ranges (erratum C13). Builds on M0 contract rev 6.
 - 2026-11-24 rev 4 (TL, from backend slice 1): §6.1 adds `group_cycle` (`errors[]` code on `invalid_request`); §1 adds three non-revocation outbox events. Owner-approved the same day (erratum C13): group nesting depth default 32 (4–64), group closure size default 10,000 (1,000–100,000), setup-link lifetime default 24 h (15 min–7 d); all are policies enforced by `check-config`.
+- 2026-11-25 rev 5 (TL, frontend question): §2.1 OPAQUE wire format fixed: crate versions, shared `cs-identity-wire` suite and normalization, base64url encoding, ksf_params shape, context and identifiers, tenant as UUID, register endpoint shapes; register/finish returns 204.
