@@ -1,6 +1,6 @@
 # Cloud System — Workspace Platform Specification
 
-- Version: 2.4.1 (v2.4 plus approved errata C1–C10, recorded in docs/SPEC_ERRATA.md)
+- Version: 2.4.2 (v2.4 plus approved errata C1–C13, recorded in docs/SPEC_ERRATA.md)
 - Status: Normative architecture specification and source of truth for implementation
 - Part 1 of 4: sections 1–9 (platform, resources, identity, authorization, applications, data, integration).
 - Part 2: sections 10–16 (collaboration, events, search, sync, UI, security, reference applications).
@@ -39,7 +39,7 @@ Out of scope for version 2: cross-tenant deduplication, active-active multi-regi
 
 - MUST / MUST NOT: mandatory invariants. No configuration can disable them.
 - SHOULD: recommended defaults that operators may change, with documented consequences.
-- Policy: a configurable parameter, listed with its default and safe range.
+- Policy: a configurable parameter, listed with its default and safe range. Where this document gives only a default, the safe range is defined by erratum C13 (docs/SPEC_ERRATA.md); a value outside its range is rejected at configuration load.
 - Decision status: this specification defines the target architecture. Implementation plans, migration records, review history and unresolved engineering tasks are maintained separately and are not part of this document.
 
 ### 1.5 Terminology
@@ -2013,7 +2013,7 @@ C2. Every authoritative mutation that another domain depends on writes an outbox
 
 C3. Every saga has a durable operation record, idempotency key, explicit pivot, pre-pivot compensation, post-pivot forward recovery and level-triggered reconciler.
 
-C4. Every public request that starts a saga supplies an idempotency key and request digest. Reuse with a different digest is conflict.
+C4. Every public request that starts a saga supplies an idempotency key and request digest. Reuse with a different digest is rejected with idempotency_mismatch (appendix D.2).
 
 C5. Data visibility follows dependency order: object publication readiness precedes resource-version publication; resource visibility precedes derived indexing; revocation commits at its authoritative source before any subsequent protected operation may rely on a stale allow.
 
@@ -2083,11 +2083,13 @@ not_found                  404   no         does not exist, or exists but the ca
 method_not_allowed         405   no
 conflict                   409   no         state conflict (name exists, invalid state transition)
 resource_trashed           409   no         the target or its ancestor is trashed
+cursor_expired             410   no         the sync cursor is no longer valid; the client performs a full resync (13.1.1)
 precondition_failed        412   no         expected version or ETag does not match the current head
 payload_too_large          413   no
 unsupported_media_type     415   no
 idempotency_mismatch       422   no         the idempotency key was used with a different request body
 locked                     423   no         retention, legal hold or exclusive lock prevents the change
+client_upgrade_required    426   no         the client protocol or schema version is no longer supported; the body carries the minimum compatible version (13.1.1)
 rate_limited               429   yes        per-caller, per-tenant or per-application rate limit
 quota_exceeded             507   no         the change would exceed a quota
 internal                   500   yes        unexpected server error
@@ -2474,4 +2476,4 @@ A release is published only when this suite passes.
 - Revoked or deleted data may remain in user-controlled exports or unmanaged copies. The platform guarantees revocation of future server access and managed-client reconciliation, not remote erasure of plaintext already copied outside platform control.
 
 ---
-*End of Cloud System Workspace Platform Specification v2.4.1.*
+*End of Cloud System Workspace Platform Specification v2.4.2.*

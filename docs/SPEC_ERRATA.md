@@ -14,6 +14,32 @@ Approved by the project owner on 2026-11-19. Applied to `Cloud_System_Workspace_
 | C8 | No signature algorithm was given for several signed artifacts | Ed25519 for every signed artifact, with a separate domain-separation context per artifact type and canonical serialization. HMAC artifacts stay HMAC. | §6.4 |
 | C9 | Part footers said "appendices A–L" | Normalized to A–M. | Part 2 and Part 3 footers |
 | C10 | The custom crypto format had no explicit stability status | Explicitly non-production-stable until independent review. Test vectors and fuzzing are required. | §17.2 |
+| C11 | App. C rule C4 said reusing an idempotency key with a different digest "is conflict", while D.2 defines `idempotency_mismatch` (422) for exactly this case (QA OQ-2) | `idempotency_mismatch` (422, not retryable) is canonical. "Conflict" in rule C4 was plain English, not the `conflict` code. | App. C rule C4 |
+| C12 | §13.1.1 requires `cursor_expired` and `client_upgrade_required`, which were missing from D.2 (QA OQ-3) | Added to D.2: `cursor_expired` 410, not retryable (full resync); `client_upgrade_required` 426, not retryable (body carries the minimum compatible version). | D.2 |
+| C13 | §1.4 requires every policy to have a safe range, but most policies give only a default (QA OQ-6) | The ranges below are normative. Policies added later without a spec range get their range recorded here when their milestone contract is frozen. | §1.4 |
+
+## C11–C13 approval
+
+Approved by the project owner on 2026-11-24 (M0 gate follow-up, owner form). C11–C13 are applied to the spec, which is now v2.4.2.
+
+### C13 policy safe ranges
+
+| Policy | Default | Safe range | Source of default |
+|---|---|---|---|
+| Idempotency retention | 24 h | 24–720 h | D.3 |
+| Transaction retry (40001/40P01): attempts | 10 | 1–50 | M0 contract §5 |
+| Transaction retry: time budget | 5 s | 0.1–60 s | M0 contract §5 |
+| Migration retry: attempts | 30 | 1–500 | M0 contract §5 rev 4 |
+| Migration retry: time budget | 120 s | 1 s–1 h | M0 contract §5 rev 4 |
+| Saga reconcile interval | 1 s | 0.1–60 s | M0 contract (design) |
+| Revocation staleness S | 2 s | 1–30 s (maximum from §6.6; the minimum stays above the 500 ms heartbeat) | §6.6 |
+| Step-up window | 5 min | 1–60 min | §5 |
+| Access-token lifetime | 600 s | 60–3600 s | §5 |
+| Session idle lifetime | 14 d | 1 h–90 d | §5 |
+| Session absolute lifetime | 90 d | 1–365 d | §5 |
+| Account-recovery waiting period | 24 h | 1 h–14 d | §5 |
+| Recovery grant validity | 15 min | fixed | M1 contract (design) |
+| Refresh lost-response window | 30 s | fixed | M1 contract (design) |
 
 ## Process for future errata
 

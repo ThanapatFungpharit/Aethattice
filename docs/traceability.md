@@ -1,6 +1,6 @@
 # Requirement Traceability Matrix
 
-Source: Cloud_System_Workspace_Platform_Specification.md (v2.4.1 = v2.4 + errata C1–C10, docs/SPEC_ERRATA.md).
+Source: Cloud_System_Workspace_Platform_Specification.md (v2.4.2 = v2.4 + errata C1–C13, docs/SPEC_ERRATA.md).
 
 Status values: `implemented` (code exists) · `tested` (code + passing tests named in the row) · `production-ready` (tested + reviewed for production; nothing in M0–M3 qualifies) · `in-progress` · `deferred(Mn)` · `n/a(reason)`.
 `scripts/trace-lint.sh` enforces that every row has a valid status.
