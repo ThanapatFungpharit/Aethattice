@@ -154,6 +154,10 @@ async fn retry_exhaustion_is_bounded_by_elapsed_time() {
     let Some(t) = TestDomains::create_with(&[D], policy).await else {
         return;
     };
+    // Contract rev 4: connection acquisition is outside the retry budget. Open the first
+    // connection before timing (a cold connection to a just-created YugabyteDB database can
+    // take seconds under parallel load); retries reuse it (backoff < pool idle timeout).
+    t.pool(&D).ping().await.unwrap();
     let started = std::time::Instant::now();
     let err = t
         .pool(&D)
