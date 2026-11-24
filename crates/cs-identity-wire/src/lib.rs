@@ -52,9 +52,28 @@ impl KsfParams {
         p: 1,
     };
 
+    /// Lower bounds (rev 5: nothing below the defaults; rev 7 bounds).
+    pub const MIN: KsfParams = Self::DEFAULT;
+    /// Upper bounds (rev 7): `m_kib ≤ 262144`, `t ≤ 10`, `p ≤ 4`.
+    pub const MAX: KsfParams = KsfParams {
+        m_kib: 262_144,
+        t: 10,
+        p: 4,
+    };
+
     /// Whether a registration may use these parameters: none below the defaults (rev 5).
     pub fn meets_minimum(&self) -> bool {
-        self.m_kib >= Self::DEFAULT.m_kib && self.t >= Self::DEFAULT.t && self.p >= Self::DEFAULT.p
+        self.m_kib >= Self::MIN.m_kib && self.t >= Self::MIN.t && self.p >= Self::MIN.p
+    }
+
+    /// Whether the parameters are within the rev 7 bounds `65536 ≤ m_kib ≤ 262144`,
+    /// `3 ≤ t ≤ 10`, `1 ≤ p ≤ 4`. The client refuses anything else before running Argon2id;
+    /// the server never stores or offers anything else.
+    pub fn is_valid(&self) -> bool {
+        self.meets_minimum()
+            && self.m_kib <= Self::MAX.m_kib
+            && self.t <= Self::MAX.t
+            && self.p <= Self::MAX.p
     }
 
     /// The Argon2id instance the client runs as the OPAQUE KSF.
@@ -100,5 +119,18 @@ mod tests {
         assert!(!k(65_536, 2, 1).meets_minimum());
         assert!(!k(65_536, 3, 0).meets_minimum());
         assert!(KsfParams::DEFAULT.argon2().is_ok());
+    }
+
+    #[test]
+    fn ksf_bounds_rev7() {
+        let k = |m_kib, t, p| KsfParams { m_kib, t, p };
+        assert!(KsfParams::DEFAULT.is_valid());
+        assert!(k(262_144, 10, 4).is_valid());
+        assert!(!k(262_145, 3, 1).is_valid());
+        assert!(!k(65_536, 11, 1).is_valid());
+        assert!(!k(65_536, 3, 5).is_valid());
+        assert!(!k(65_535, 3, 1).is_valid());
+        assert!(!k(65_536, 2, 1).is_valid());
+        assert!(!k(65_536, 3, 0).is_valid());
     }
 }
