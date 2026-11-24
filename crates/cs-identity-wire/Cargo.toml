@@ -1,0 +1,17 @@
+[package]
+name = "cs-identity-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OPAQUE wire definitions shared by the server and the browser WASM client (M1 contract rev 5 §2.1)"
+
+# No cs-* dependencies: this crate is also compiled to WASM for web/packages/opaque-wasm.
+[dependencies]
+argon2.workspace = true
+opaque-ke.workspace = true
+sha2_010.workspace = true
+unicode-normalization.workspace = true
+
+[lints]
+workspace = true
