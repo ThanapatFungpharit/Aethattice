@@ -260,13 +260,17 @@ async fn serve(path: &Path) -> Result<(), String> {
     let cfg = load(path)?;
     check_roles(&cfg)?;
     let telemetry = cs_common::telemetry::init(&cfg.telemetry).map_err(|e| format!("cs: {e}"))?;
-    let _kms = open_kms(&cfg)?;
+    let kms = open_kms(&cfg)?;
     let api = cfg
         .api
         .clone()
         .ok_or("cs: the api role needs an [api] section")?;
     let mut barriers: Vec<Arc<dyn ReadinessBarrier>> = Vec::new();
+    let mut identity_pool = None;
     for pool in pools(&cfg)? {
+        if pool.domain() == &DomainId::Identity {
+            identity_pool = Some(pool.clone());
+        }
         barriers.push(Arc::new(DomainReachable(pool.clone())));
         let set = migration_set(pool.domain())?;
         barriers.push(Arc::new(MigrationsCurrent { pool, set }));
@@ -277,6 +281,22 @@ async fn serve(path: &Path) -> Result<(), String> {
         Duration::from_millis(api.readiness_timeout_ms),
     );
     let max_body = usize::try_from(api.max_body_bytes).unwrap_or(usize::MAX);
+    // Identity routes (M1 contract §2, §3) need the identity domain and a KMS.
+    let mut routes = cs_api::public_routes();
+    match (identity_pool, kms) {
+        (Some(pool), Some(kms)) => {
+            let auth = Arc::new(cs_identity::auth::AuthService::new(
+                pool,
+                Arc::new(kms),
+                &api.deployment_domain,
+                cs_identity::session::SessionPolicy::from_policy(&cfg.policy),
+            ));
+            routes = routes.merge(cs_identity::http::routes(auth));
+        }
+        _ => tracing::warn!(
+            "identity routes disabled: they need [domains.identity] and a [kms] section"
+        ),
+    }
     let public = tokio::net::TcpListener::bind(api.listen)
         .await
         .map_err(|e| format!("cs: cannot bind api.listen {}: {e}", api.listen))?;
@@ -295,7 +315,7 @@ async fn serve(path: &Path) -> Result<(), String> {
     let mut rx1 = rx;
     let public_task = tokio::spawn(cs_api::serve(
         public,
-        cs_api::router(state.clone(), max_body),
+        cs_api::with_middleware(routes, state.clone(), max_body),
         async move {
             let _ = rx1.wait_for(|v| *v).await;
         },
@@ -378,12 +398,16 @@ async fn admin(path: &Path, action: AdminCmd) -> Result<(), String> {
         RetryPolicy::from_policy(&cfg.policy),
     )
     .map_err(|e| format!("cs admin: {e}"))?;
-    let res = admin_run(&pool, action).await;
+    let res = admin_run(&pool, &cfg.policy, action).await;
     pool.close().await;
     res
 }
 
-async fn admin_run(pool: &DomainPool, action: AdminCmd) -> Result<(), String> {
+async fn admin_run(
+    pool: &DomainPool,
+    policy: &cs_common::config::Policy,
+    action: AdminCmd,
+) -> Result<(), String> {
     // Refuse to write into a schema this binary does not match (J.4 step 3 runs first).
     let set = migration_set(&DomainId::Identity)?;
     let status = Migrator::status(pool, &set)
@@ -395,7 +419,7 @@ async fn admin_run(pool: &DomainPool, action: AdminCmd) -> Result<(), String> {
             status.pending
         ));
     }
-    let a = IdentityAdmin::new(pool.clone()).map_err(|e| admin_error(&e))?;
+    let a = IdentityAdmin::with_policy(pool.clone(), policy).map_err(|e| admin_error(&e))?;
     let err = |e: AdminError| admin_error(&e);
     match action {
         AdminCmd::Tenant(TenantCmd::Create { name }) => {

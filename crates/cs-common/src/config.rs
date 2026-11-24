@@ -147,6 +147,54 @@ pub const POLICY_TABLE: &[PolicySpec] = &[
         unit: "milliseconds",
         source: "(design) §18.4 reconcilers run continuously",
     },
+    PolicySpec {
+        key: "group_max_depth",
+        default: 32,
+        min: 4,
+        max: 64,
+        unit: "levels",
+        source: "erratum C13 / M1 contract §1 rev 4 (design; owner 2026-11-24)",
+    },
+    PolicySpec {
+        key: "group_max_closure",
+        default: 10_000,
+        min: 1_000,
+        max: 100_000,
+        unit: "principals",
+        source: "erratum C13 / M1 contract §1 rev 4 (design; owner 2026-11-24)",
+    },
+    PolicySpec {
+        key: "setup_link_lifetime_secs",
+        default: 86_400,
+        min: 900,
+        max: 604_800,
+        unit: "seconds",
+        source: "erratum C13 / M1 contract rev 4 (design; owner 2026-11-24): 24 h, 15 min–7 d",
+    },
+    PolicySpec {
+        key: "access_token_lifetime_secs",
+        default: 600,
+        min: 60,
+        max: 3_600,
+        unit: "seconds",
+        source: "spec §5.5 / erratum C13 / M1 contract §8: 600 s, 60–3600 s",
+    },
+    PolicySpec {
+        key: "session_idle_lifetime_secs",
+        default: 1_209_600,
+        min: 3_600,
+        max: 7_776_000,
+        unit: "seconds",
+        source: "spec §5.5 / erratum C13 / M1 contract §8: 14 d, 1 h–90 d",
+    },
+    PolicySpec {
+        key: "session_absolute_lifetime_secs",
+        default: 7_776_000,
+        min: 86_400,
+        max: 31_536_000,
+        unit: "seconds",
+        source: "spec §5.5 / erratum C13 / M1 contract §8: 90 d, 1–365 d",
+    },
 ];
 
 /// Typed handle on a policy key.
@@ -159,6 +207,12 @@ pub enum PolicyKey {
     RevocationStalenessMs,
     DbMigrationRetryMaxAttempts,
     DbMigrationRetryMaxElapsedMs,
+    GroupMaxDepth,
+    GroupMaxClosure,
+    SetupLinkLifetimeSecs,
+    AccessTokenLifetimeSecs,
+    SessionIdleLifetimeSecs,
+    SessionAbsoluteLifetimeSecs,
 }
 
 impl PolicyKey {
@@ -171,6 +225,12 @@ impl PolicyKey {
             PolicyKey::RevocationStalenessMs => "revocation_staleness_ms",
             PolicyKey::DbMigrationRetryMaxAttempts => "db_migration_retry_max_attempts",
             PolicyKey::DbMigrationRetryMaxElapsedMs => "db_migration_retry_max_elapsed_ms",
+            PolicyKey::GroupMaxDepth => "group_max_depth",
+            PolicyKey::GroupMaxClosure => "group_max_closure",
+            PolicyKey::SetupLinkLifetimeSecs => "setup_link_lifetime_secs",
+            PolicyKey::AccessTokenLifetimeSecs => "access_token_lifetime_secs",
+            PolicyKey::SessionIdleLifetimeSecs => "session_idle_lifetime_secs",
+            PolicyKey::SessionAbsoluteLifetimeSecs => "session_absolute_lifetime_secs",
         }
     }
 }
@@ -201,6 +261,24 @@ impl Policy {
                     .map(|p| p.default)
             })
             .unwrap_or(0)
+    }
+
+    /// Set one value, enforcing the same safe range as `check-config`.
+    pub fn with_value(mut self, key: PolicyKey, value: i64) -> Result<Self, ConfigError> {
+        let spec = POLICY_TABLE
+            .iter()
+            .find(|s| s.key == key.as_str())
+            .ok_or_else(|| {
+                ConfigError::Invalid(vec![format!("policy.{}: unknown", key.as_str())])
+            })?;
+        if value < spec.min || value > spec.max {
+            return Err(ConfigError::Invalid(vec![format!(
+                "policy.{}: {value} is outside the safe range {}..={} {}",
+                spec.key, spec.min, spec.max, spec.unit
+            )]));
+        }
+        self.values.insert(spec.key, value);
+        Ok(self)
     }
 
     fn from_raw(raw: BTreeMap<String, toml::Value>, errs: &mut Vec<String>) -> Self {
@@ -658,6 +736,44 @@ policy = ["idempotency_retention_hours"]
             invalid(&g.replace("idempotency_retention_hours = 48", "made_up = 1"))
                 .contains("unknown policy key")
         );
+    }
+
+    #[test]
+    fn m1_policy_ranges_enforced() {
+        // erratum C13 rows added by M1 (contract §8, rev 4): bounds inclusive, outside rejected.
+        for (key, lo, hi) in [
+            ("group_max_depth", 4, 64),
+            ("group_max_closure", 1_000, 100_000),
+            ("setup_link_lifetime_secs", 900, 604_800),
+            ("access_token_lifetime_secs", 60, 3_600),
+            ("session_idle_lifetime_secs", 3_600, 7_776_000),
+            ("session_absolute_lifetime_secs", 86_400, 31_536_000),
+        ] {
+            let g = good();
+            for ok in [lo, hi] {
+                let doc = g.replace(
+                    "idempotency_retention_hours = 48",
+                    &format!("idempotency_retention_hours = 48\n{key} = {ok}"),
+                );
+                let c = Config::from_toml_str(&doc).unwrap();
+                assert!(c.policy.values.get(key) == Some(&ok), "{key}={ok}");
+            }
+            for bad in [lo - 1, hi + 1] {
+                let doc = g.replace(
+                    "idempotency_retention_hours = 48",
+                    &format!("idempotency_retention_hours = 48\n{key} = {bad}"),
+                );
+                assert!(
+                    invalid(&doc).contains("outside the safe range"),
+                    "{key}={bad}"
+                );
+            }
+        }
+        let d = Policy::default();
+        assert_eq!(d.get(PolicyKey::GroupMaxDepth), 32);
+        assert_eq!(d.get(PolicyKey::GroupMaxClosure), 10_000);
+        assert_eq!(d.get(PolicyKey::SetupLinkLifetimeSecs), 86_400);
+        assert_eq!(d.get(PolicyKey::AccessTokenLifetimeSecs), 600);
     }
 
     #[test]

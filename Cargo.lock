@@ -676,16 +676,31 @@ dependencies = [
 name = "cs-identity"
 version = "0.0.0"
 dependencies = [
+ "argon2",
+ "async-trait",
+ "axum",
  "base64 0.22.1",
+ "blake3",
+ "chacha20poly1305",
+ "cs-api",
  "cs-common",
  "cs-crypto",
  "cs-db",
+ "cs-identity-wire",
+ "cs-kms",
+ "ed25519-dalek 3.0.0",
  "futures",
+ "http-body-util",
+ "opaque-ke",
+ "rand_core 0.6.4",
  "serde",
+ "serde_json",
  "sha2 0.11.1",
  "sqlx",
+ "tempfile",
  "tokio",
- "unicode-normalization",
+ "tower",
+ "tracing",
  "uuid",
  "zeroize",
 ]
@@ -2101,6 +2116,9 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
+]
 
 [[package]]
 name = "rand_core"

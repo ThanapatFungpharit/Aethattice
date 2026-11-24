@@ -59,6 +59,8 @@ cs-identity-wire = { path = "crates/cs-identity-wire" }
 opaque-ke = { version = "=4.0.1", default-features = false, features = ["ristretto255", "argon2", "serde"] }
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
 sha2_010 = { package = "sha2", version = "0.10.9" }
+# CSPRNG adapter for opaque-ke 4 (rand_core 0.6 traits); OsRng reads the OS CSPRNG.
+rand_core_06 = { package = "rand_core", version = "0.6.4", features = ["getrandom"] }
 unicode-normalization = "0.1.26"
 
 [workspace.lints.rust]
@@ -74,3 +76,10 @@ todo = "warn"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Argon2id with the contract parameters (64 MiB, t = 3) is impractically slow unoptimized; the
+# test-side OPAQUE client runs it on every registration and login.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
