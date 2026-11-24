@@ -1,6 +1,6 @@
 //! Appendix D error model (contract §2).
 //!
-//! - [`ErrorCode`] is exactly table D.2.
+//! - [`ErrorCode`] is exactly table D.2 (including erratum C12: `cursor_expired`, `client_upgrade_required`).
 //! - [`Code`] adds application codes `app.{application_id}.{code}`, each mapped to a D.2 status.
 //! - HTTP status and `retryable` are derived from the code and cannot be set independently.
 //! - [`Error`] is the platform error value. Its `detail` must be safe for the caller; the
@@ -80,6 +80,9 @@ codes! {
     Unavailable          => "unavailable",            503, true,  "Service unavailable";
     Timeout              => "timeout",                504, true,  "Timeout";
     OutcomeUnknown       => "outcome_unknown",        504, true,  "Outcome unknown";
+    // Erratum C12: required by §13.1.1, added to D.2.
+    CursorExpired        => "cursor_expired",         410, false, "Cursor expired; full resync required";
+    ClientUpgradeRequired=> "client_upgrade_required",426, false, "Client upgrade required";
 }
 
 impl fmt::Display for ErrorCode {
@@ -429,6 +432,9 @@ mod tests {
             ("unavailable", 503, true),
             ("timeout", 504, true),
             ("outcome_unknown", 504, true),
+            // erratum C12
+            ("cursor_expired", 410, false),
+            ("client_upgrade_required", 426, false),
         ];
         assert_eq!(ErrorCode::ALL.len(), expected.len());
         for (c, (w, s, r)) in ErrorCode::ALL.iter().zip(expected) {

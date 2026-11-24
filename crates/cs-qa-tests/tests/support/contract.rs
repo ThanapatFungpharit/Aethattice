@@ -407,6 +407,10 @@ fn migration_set(domain: &DomainId) -> Result<MigrationSet, String> {
         DomainId::Operations => common
             .merge(cs_ops::migrations().map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string()),
+        // M1: the identity domain gains its schema (M1 contract §1); mirrors `cs migrate`.
+        DomainId::Identity => common
+            .merge(cs_identity::migrations().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string()),
         _ => Ok(common),
     }
 }

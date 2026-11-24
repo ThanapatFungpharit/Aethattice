@@ -190,3 +190,139 @@ async fn serve_never_migrates_and_readyz_tracks_migrate() {
     let _ = child.wait();
     t.cleanup().await;
 }
+
+fn kv(out: &str, key: &str) -> String {
+    out.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("no {key}= in {out:?}"))
+        .to_owned()
+}
+
+/// `cs admin` (M1 contract §0 [R4]): standalone, identity domain only, no listener and no
+/// `control` role needed; refuses an unmigrated schema; each action is one identity-domain
+/// transaction with an outbox event (outbox contents are covered by cs-identity's tests).
+#[tokio::test]
+async fn admin_cli_manages_tenants_users_groups_and_setup_links() {
+    let Some(t) = TestDomains::create(&[DomainId::Identity]).await else {
+        return;
+    };
+    let base = t.admin_url().rsplit_once('/').unwrap().0.to_owned();
+    let domains = format!(
+        "[domains.identity]\nurl = \"{base}/{}\"\n",
+        t.database_name(&DomainId::Identity)
+    );
+    // Hold the configured API port: `cs admin` must never try to listen.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let d = tempfile::tempdir().unwrap();
+    // `control` is refused by `serve` until M8, but `cs admin` is not a server role.
+    let p = write(
+        d.path(),
+        &config("\"api\", \"control\"", &domains, port, free_port(), ""),
+    );
+    let cfg = p.to_str().unwrap();
+    let admin = |args: &[&str]| {
+        let mut v = vec!["admin", "--config", cfg];
+        v.extend_from_slice(args);
+        run(&v)
+    };
+
+    let (code, _, err) = admin(&["tenant", "create", "--name", "Acme"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("cs migrate"), "{err}");
+    let (code, out, err) = run(&["migrate", "--config", cfg]);
+    assert_eq!(code, 0, "{out}{err}");
+
+    let (code, out, err) = admin(&["tenant", "create", "--name", "Acme"]);
+    assert_eq!(code, 0, "{err}");
+    let tenant = kv(&out, "tenant_id");
+    let (code, out, err) = admin(&[
+        "user",
+        "create",
+        "--tenant",
+        &tenant,
+        "--login",
+        "Admin@Acme.test",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let user = kv(&out, "user_id");
+    assert_eq!(kv(&out, "login"), "admin@acme.test");
+    assert_eq!(kv(&out, "status"), "invited");
+    let (code, out, err) = admin(&[
+        "user",
+        "create",
+        "--tenant",
+        &tenant,
+        "--login",
+        "admin@acme.test",
+    ]);
+    assert_ne!(code, 0, "{out}");
+    assert!(err.contains("conflict"), "{err}");
+
+    let (_, out, _) = admin(&["group", "create", "--tenant", &tenant, "--name", "Admins"]);
+    let g1 = kv(&out, "group_id");
+    let (_, out, _) = admin(&["group", "create", "--tenant", &tenant, "--name", "Ops"]);
+    let g2 = kv(&out, "group_id");
+    let add = |g: &str, m: &str, kind: &str, extra: &[&str]| {
+        let mut v = vec![
+            "group",
+            "add-member",
+            "--tenant",
+            &tenant,
+            "--group",
+            g,
+            "--member",
+            m,
+            "--kind",
+            kind,
+        ];
+        v.extend_from_slice(extra);
+        admin(&v)
+    };
+    let (code, out, err) = add(&g1, &user, "user", &["--expected-version", "1"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(kv(&out, "membership_version"), "2");
+    let (code, _, err) = add(&g1, &g2, "group", &["--expected-version", "1"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("precondition_failed"), "{err}");
+    let (code, out, err) = add(&g1, &g2, "group", &[]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(kv(&out, "membership_version"), "3");
+    let (code, _, err) = add(&g2, &g1, "group", &[]);
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("invalid_request") && err.contains("cycle"),
+        "{err}"
+    );
+    let (code, out, err) = admin(&[
+        "group",
+        "remove-member",
+        "--tenant",
+        &tenant,
+        "--group",
+        &g1,
+        "--member",
+        &g2,
+        "--kind",
+        "group",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(kv(&out, "membership_version"), "4");
+
+    let (code, out, err) = admin(&["setup-link", "--tenant", &tenant, "--user", &user]);
+    assert_eq!(code, 0, "{err}");
+    let tok = kv(&out, "setup_token");
+    assert!(!err.contains(&tok), "token must not reach stderr");
+    let parsed = cs_identity::token::parse(&tok).unwrap();
+    assert_eq!(parsed.tenant_id.to_string(), tenant);
+    let a = cs_identity::admin::IdentityAdmin::new(t.pool(&DomainId::Identity).clone()).unwrap();
+    let (state, u) = a
+        .setup_link_state(parsed.tenant_id, parsed.hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((state.as_str(), u.to_string()), ("active", user.clone()));
+
+    drop(held);
+    t.cleanup().await;
+}
