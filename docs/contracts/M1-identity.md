@@ -65,7 +65,7 @@ Outbox events: `identity.user.created|updated|disabled`, `identity.group.members
     - Each txn is consumed by a conditional delete or state transition in the finishing transaction, so it is single use even across nodes.
     - Expired rows are reclaimed lazily.
   - `opaque_server_keys (key_version)` is a deployment-wide table, so it has no `tenant_id`. Each row holds an envelope with the OPAQUE ServerSetup, the [R3] PRF key and the txn-sealing key.
-    - The envelope is encrypted under the KMS KEK `identity-opaque/vN`, with associated data `key_version ‖ purpose`.
+    - The envelope is encrypted under the KMS KEK `identity-opaque@vN`, with associated data `key_version ‖ purpose`.
     - It is created once with `INSERT … ON CONFLICT DO NOTHING`, and every node then re-reads the stored row, never using its own candidate.
     - Nodes unwrap it into memory only at startup. It is never logged.
     - Rotation adds a new version, and each registration records its version.
