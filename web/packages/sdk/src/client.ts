@@ -4,7 +4,9 @@ import {
   ApiError,
   codeForNonProblemStatus,
   isProblemContentType,
+  isStepUpProblem,
   parseProblem,
+  StepUpRequired,
   synthesizeProblem,
   type Problem,
 } from "./problem";
@@ -19,8 +21,10 @@ export function isWriteMethod(method: HttpMethod): boolean {
 }
 
 /**
- * Authentication hook. M0 has no authentication; M1 wires the shell's token store in here.
- * D.2: on `unauthenticated` the client refreshes once and retries once.
+ * Authentication hook. M1 wires the SDK auth session ({@link AuthSession}) in here.
+ * D.2: on `unauthenticated` the client refreshes once and retries once, except when the problem's
+ * `errors[]` contains `step_up_required` (M0 contract rev 5, M1 §2.3 [R2]): then it does not refresh and
+ * rejects with {@link StepUpRequired}.
  */
 export interface AuthHook {
   /** Value for the Authorization header of each attempt, or undefined for none. */
@@ -150,6 +154,9 @@ export class ApiClient {
       if (result.kind === "ok") return result.response;
       const { problem } = result.error;
 
+      // Step-up (M1 §2.3 [R2]): a refresh cannot satisfy it, so it is surfaced at once as StepUpRequired.
+      if (result.error instanceof StepUpRequired) throw result.error;
+
       // D.2 `unauthenticated`: refresh once, retry once (outside the retry budget).
       if (problem.code === "unauthenticated" && this.auth && !refreshed && (!write || key !== undefined)) {
         refreshed = true;
@@ -255,10 +262,11 @@ export class ApiClient {
               ...(retryAfterMs !== undefined && { retryAfterMs }),
             });
             if (parsed.ok) {
-              return {
-                kind: "error",
-                error: new ApiError(parsed.problem, { httpStatus: res.status, synthesized: false, attempts: attempt }),
-              };
+              const errOpts = { httpStatus: res.status, synthesized: false, attempts: attempt };
+              const error = isStepUpProblem(parsed.problem)
+                ? new StepUpRequired(parsed.problem, errOpts)
+                : new ApiError(parsed.problem, errOpts);
+              return { kind: "error", error };
             }
           }
         }

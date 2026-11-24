@@ -9,7 +9,7 @@ import {
   parseAppErrorCode,
 } from "./errors";
 
-// Table D.2, transcribed independently of the implementation.
+// Table D.2 (spec v2.4.2, including erratum C12), transcribed independently of the implementation.
 const D2: [string, number, boolean][] = [
   ["invalid_request", 400, false],
   ["unauthenticated", 401, false],
@@ -18,11 +18,13 @@ const D2: [string, number, boolean][] = [
   ["method_not_allowed", 405, false],
   ["conflict", 409, false],
   ["resource_trashed", 409, false],
+  ["cursor_expired", 410, false],
   ["precondition_failed", 412, false],
   ["payload_too_large", 413, false],
   ["unsupported_media_type", 415, false],
   ["idempotency_mismatch", 422, false],
   ["locked", 423, false],
+  ["client_upgrade_required", 426, false],
   ["rate_limited", 429, true],
   ["quota_exceeded", 507, false],
   ["internal", 500, true],
@@ -42,12 +44,17 @@ describe("ErrorCode table (D.2)", () => {
     expect(ERROR_CODE_TABLE[code as keyof typeof ERROR_CODE_TABLE]).toEqual({ status, retryable });
   });
 
+  it("includes the erratum C12 codes, never retryable", () => {
+    expect(ERROR_CODE_TABLE.cursor_expired).toEqual({ status: 410, retryable: false });
+    expect(ERROR_CODE_TABLE.client_upgrade_required).toEqual({ status: 426, retryable: false });
+  });
+
   it("is frozen", () => {
     expect(Object.isFrozen(ERROR_CODE_TABLE)).toBe(true);
   });
 
   it("collects the D.2 status set", () => {
-    expect([...D2_STATUSES].sort()).toEqual([400, 401, 403, 404, 405, 409, 412, 413, 415, 422, 423, 429, 500, 503, 504, 507]);
+    expect([...D2_STATUSES].sort()).toEqual([400, 401, 403, 404, 405, 409, 410, 412, 413, 415, 422, 423, 426, 429, 500, 503, 504, 507]);
   });
 
   it("rejects non-codes", () => {

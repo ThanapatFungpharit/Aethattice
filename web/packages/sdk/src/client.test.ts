@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ApiClient, type AuthHook } from "./client";
-import { ApiError } from "./problem";
+import { ApiError, StepUpRequired, isStepUpRequired } from "./problem";
 import { RetryPolicy, type Clock } from "./retry";
 
 interface Call {
@@ -415,5 +415,74 @@ describe("ApiClient unauthenticated hook", () => {
     const second = fakeFetch(unauth, () => ok());
     await rejection(client(second.fetch, { auth: { refresh } }).c.post("/x", { idempotencyKey: null }));
     expect(second.calls).toHaveLength(1);
+  });
+});
+
+describe("ApiClient step-up (M0 contract rev 5, M1 §2.3 [R2])", () => {
+  const stepUp = (): Response =>
+    problem("unauthenticated", 401, false, {
+      errors: [{ pointer: "", code: "step_up_required", detail: "Confirm it is you" }],
+    });
+
+  it("does not refresh and surfaces StepUpRequired", async () => {
+    const refresh = vi.fn().mockResolvedValue(true);
+    const { fetch, calls } = fakeFetch(stepUp, () => ok());
+    const e = await rejection(client(fetch, { auth: { refresh } }).c.post("/x"));
+    expect(e).toBeInstanceOf(StepUpRequired);
+    expect(isStepUpRequired(e)).toBe(true);
+    expect(e.name).toBe("StepUpRequired");
+    expect(e.problem.code).toBe("unauthenticated");
+    expect(e.problem.errors?.[0]?.code).toBe("step_up_required");
+    expect(refresh).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("finds step_up_required among other errors[] entries", async () => {
+    const refresh = vi.fn().mockResolvedValue(true);
+    const { fetch } = fakeFetch(() =>
+      problem("unauthenticated", 401, false, {
+        errors: [
+          { pointer: "/x", code: "other" },
+          { pointer: "", code: "step_up_required" },
+        ],
+      }),
+    );
+    const e = await rejection(client(fetch, { auth: { refresh } }).c.get("/x"));
+    expect(e).toBeInstanceOf(StepUpRequired);
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("is surfaced without an auth hook too", async () => {
+    const { fetch } = fakeFetch(stepUp);
+    expect(await rejection(client(fetch).c.get("/x"))).toBeInstanceOf(StepUpRequired);
+  });
+
+  it("is surfaced when the retry after a refresh asks for step-up", async () => {
+    const refresh = vi.fn().mockResolvedValue(true);
+    const { fetch, calls } = fakeFetch(() => problem("unauthenticated", 401, false), stepUp);
+    const e = await rejection(client(fetch, { auth: { refresh } }).c.get("/x"));
+    expect(e).toBeInstanceOf(StepUpRequired);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("other errors[] codes under unauthenticated still refresh (e.g. mfa_required is not step-up)", async () => {
+    const refresh = vi.fn().mockResolvedValue(true);
+    const { fetch, calls } = fakeFetch(
+      () => problem("unauthenticated", 401, false, { errors: [{ pointer: "", code: "mfa_required" }] }),
+      () => ok(),
+    );
+    const r = await client(fetch, { auth: { refresh } }).c.get("/x");
+    expect(r.status).toBe(200);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("step_up_required under a code other than unauthenticated is a plain ApiError", async () => {
+    const { fetch } = fakeFetch(() =>
+      problem("permission_denied", 403, false, { errors: [{ pointer: "", code: "step_up_required" }] }),
+    );
+    const e = await rejection(client(fetch).c.get("/x"));
+    expect(e).not.toBeInstanceOf(StepUpRequired);
   });
 });
