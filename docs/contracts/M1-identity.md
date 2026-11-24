@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 3)
+# M1 Contracts: Identity (FROZEN rev 4)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -38,7 +38,7 @@ All tables follow App. E: tenant_id first, CAS version columns, DB-set timestamp
 
 Group cycles are rejected at write time by a closure check inside the membership transaction, under the configured depth and cardinality limits. Exceeding a limit returns a typed `invalid_request` with error `group_complexity_limit`. A partial result is never returned (§6.4). Group writes are CLI-only in M1 (§0); the code is listed in the error catalogue (§6.1) for the M2 HTTP API.
 
-Outbox events: `identity.user.created|updated|disabled`, `identity.group.membership_changed` (carries the new membership_version), `identity.session.revoked` (carries session generation), `identity.credentials.changed`. These are the revocation sources that M2's authz domain consumes (§6.6).
+Outbox events: `identity.user.created|updated|disabled`, `identity.group.membership_changed` (carries the new membership_version), `identity.session.revoked` (carries session generation), `identity.credentials.changed`. These are the revocation sources that M2's authz domain consumes (§6.6). (rev 4) Administrative actions without a revocation effect also emit `identity.tenant.created`, `identity.group.created` and `identity.setup_link.issued`, so every `cs admin` action writes an outbox event (§0).
 
 ## 2. Authentication protocols
 
@@ -148,6 +148,7 @@ Every M1 endpoint publishes its possible codes in the OpenAPI document (App. G.5
 | `step_up_required` | `unauthenticated` | Recent strong authentication needed (§2.3) |
 | `mfa_required` | `unauthenticated` | Second factor needed to finish sign-in |
 | `group_complexity_limit` | `invalid_request` | Group depth or cardinality limit (§1) |
+| `group_cycle` | `invalid_request` | (rev 4) Membership change would create a group cycle (§1) |
 | `registration_grant_required` | `permission_denied` | `register/*` without a valid grant |
 
 ## 7. Frontend (M1)
@@ -184,3 +185,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-20: draft rev 2: resolves QA review M1-R1 … M1-R14. Pending owner decision: §0 (no HTTP admin API in M1) and §8 policy ranges.
 - 2026-11-20: §9: log-secret scan added to the M1 gate (M0 carry-over CT.M0-28).
 - 2026-11-24: **rev 3, frozen.** The owner approved §0 (no HTTP admin API in M1: `cs admin` CLI and the first-administrator setup link only; HTTP admin in M2 under the relationship model) and the §8 ranges (erratum C13). Builds on M0 contract rev 6.
+- 2026-11-24 rev 4 (TL, from backend slice 1): §6.1 adds `group_cycle` (`errors[]` code on `invalid_request`); §1 adds three non-revocation outbox events. Pending owner: defaults and ranges for group depth, group closure cardinality and setup-link lifetime (to be recorded in erratum C13); provisional constants until then.
