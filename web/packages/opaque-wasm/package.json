@@ -1,0 +1,1 @@
+{"name":"@cs/opaque-wasm","version":"0.0.0","private":true,"license":"MIT","type":"module","main":"pkg/cs_opaque_wasm.js","types":"pkg/cs_opaque_wasm.d.ts","files":["pkg"]}

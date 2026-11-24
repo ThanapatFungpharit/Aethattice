@@ -2,15 +2,23 @@
 // region and main region. M0 renders service readiness from GET /readyz through the error model.
 import "@cs/components";
 import { LocaleController } from "@cs/components";
-import { t, type ApiClient } from "@cs/sdk";
+import { isStepUpRequired, t, type ApiClient, type IdentityDeps } from "@cs/sdk";
 import { LitElement, css, html, nothing, type TemplateResult } from "lit";
+import "./auth-pages";
+import type { SignedInUser } from "./auth-pages";
 import "./dev-errors";
 import { checkReadiness, type Readiness } from "./readiness";
 
-type Route = "home" | "dev-errors";
+type Route = "home" | "dev-errors" | "sign-in" | "register" | "account";
 
-function routeFromHash(hash: string): Route {
-  return hash === "#/dev/errors" ? "dev-errors" : "home";
+const REGISTER_PREFIX = "#/register/";
+
+export function routeFromHash(hash: string): Route {
+  if (hash === "#/dev/errors") return "dev-errors";
+  if (hash === "#/sign-in") return "sign-in";
+  if (hash === "#/register" || hash.startsWith(REGISTER_PREFIX)) return "register";
+  if (hash === "#/account") return "account";
+  return "home";
 }
 
 export class CsShellApp extends LitElement {
@@ -20,6 +28,11 @@ export class CsShellApp extends LitElement {
     readiness: { state: true },
     route: { state: true },
     launcherOpen: { state: true },
+    identity: { attribute: false },
+    authedClient: { attribute: false },
+    user: { state: true },
+    stepUpOpen: { state: true },
+    setupToken: { state: true },
   };
 
   static override styles = css`
@@ -125,6 +138,12 @@ export class CsShellApp extends LitElement {
       display: flex;
       gap: var(--cs-space-2);
     }
+    .tab-notice {
+      margin: 0;
+      padding: var(--cs-space-2) var(--cs-space-4);
+      background: var(--cs-color-surface-raised);
+      border-bottom: 1px solid var(--cs-color-border-strong);
+    }
   `;
 
   declare client: ApiClient | undefined;
@@ -132,10 +151,19 @@ export class CsShellApp extends LitElement {
   declare readiness: Readiness | "checking";
   declare route: Route;
   declare launcherOpen: boolean;
+  /** OPAQUE engine, auth client and session (contract M1 §7). Without it the identity pages are not offered. */
+  declare identity: IdentityDeps | undefined;
+  /** Client whose auth hook is `identity.session`, for authenticated calls such as logout. */
+  declare authedClient: ApiClient | undefined;
+  declare user: SignedInUser | undefined;
+  declare stepUpOpen: boolean;
+  declare setupToken: string;
 
   private abort: AbortController | undefined;
+  private unsubscribeSession: (() => void) | undefined;
+  private stepUpWaiters: { resolve: (ok: boolean) => void }[] = [];
   private readonly onHashChange = (): void => {
-    this.route = routeFromHash(location.hash);
+    this.applyHash();
   };
 
   constructor() {
@@ -145,20 +173,82 @@ export class CsShellApp extends LitElement {
     this.readiness = "checking";
     this.route = "home";
     this.launcherOpen = false;
+    this.identity = undefined;
+    this.authedClient = undefined;
+    this.user = undefined;
+    this.stepUpOpen = false;
+    this.setupToken = "";
     new LocaleController(this);
   }
 
   override connectedCallback(): void {
     super.connectedCallback();
     window.addEventListener("hashchange", this.onHashChange);
-    this.route = routeFromHash(location.hash);
+    this.applyHash();
+    this.unsubscribeSession = this.identity?.session.subscribe((s) => {
+      // Signed out here or in another tab (or the refresh cookie was rejected).
+      if (!s.authenticated) this.user = undefined;
+      this.requestUpdate();
+    });
     void this.refreshReadiness();
   }
 
   override disconnectedCallback(): void {
     window.removeEventListener("hashchange", this.onHashChange);
+    this.unsubscribeSession?.();
     this.abort?.abort();
     super.disconnectedCallback();
+  }
+
+  /**
+   * Runs `op`; when it fails with StepUpRequired (§2.3 [R2]) asks for the password again and, after a successful
+   * re-authentication, retries `op` once. Rejects with the original StepUpRequired when the user cancels.
+   */
+  async runWithStepUp<T>(op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch (e) {
+      if (!isStepUpRequired(e) || !this.user || !this.identity) throw e;
+      const ok = await new Promise<boolean>((resolve) => {
+        this.stepUpWaiters.push({ resolve });
+        this.stepUpOpen = true;
+      });
+      if (!ok) throw e;
+      return op();
+    }
+  }
+
+  private settleStepUp(ok: boolean): void {
+    this.stepUpOpen = false;
+    const waiters = this.stepUpWaiters;
+    this.stepUpWaiters = [];
+    for (const w of waiters) w.resolve(ok);
+  }
+
+  private applyHash(): void {
+    const hash = location.hash;
+    this.route = routeFromHash(hash);
+    if (hash.startsWith(REGISTER_PREFIX)) {
+      // The setup link is a bearer secret: take it out of the address bar and history.
+      this.setupToken = decodeURIComponent(hash.slice(REGISTER_PREFIX.length));
+      history.replaceState(null, "", "#/register");
+    }
+  }
+
+  private navigate(hash: string): void {
+    if (location.hash !== hash) location.hash = hash;
+    this.route = routeFromHash(hash);
+  }
+
+  private onSignedIn(e: CustomEvent<SignedInUser>): void {
+    this.user = e.detail;
+    this.setupToken = "";
+    this.navigate("#/account");
+  }
+
+  private onSignedOut(): void {
+    this.user = undefined;
+    this.navigate("#/sign-in");
   }
 
   /** Re-checks GET /readyz. Resolves when the status has been rendered. */
@@ -190,19 +280,76 @@ export class CsShellApp extends LitElement {
                 >${t("shell.launcher")}</cs-button
               >
             </li>
+            ${this.identity
+              ? this.signedIn
+                ? html`<li><a href="#/account">${t("auth.account_link")}</a></li>`
+                : html`<li><a href="#/sign-in">${t("auth.signin_link")}</a></li>`
+              : nothing}
             ${this.showDevLink ? html`<li><a href="#/dev/errors">${t("shell.dev_link")}</a></li>` : nothing}
           </ul>
         </nav>
       </header>
+      ${this.renderTabNotice()}
       <section class="notifications" aria-labelledby="notifications-heading">
         <h2 id="notifications-heading">${t("shell.notifications")}</h2>
         <div role="log" aria-live="polite">${t("shell.notifications_empty")}</div>
       </section>
-      <main id="main" tabindex="-1">${this.route === "dev-errors" ? html`<cs-dev-errors></cs-dev-errors>` : this.renderHome()}</main>
+      <main id="main" tabindex="-1">${this.renderRoute()}</main>
       <cs-dialog heading=${t("shell.launcher_heading")} ?open=${this.launcherOpen} @cs-close=${this.onLauncherClose}>
         <p>${t("shell.launcher_placeholder")}</p>
       </cs-dialog>
+      ${this.identity
+        ? html`<cs-step-up-dialog
+            ?open=${this.stepUpOpen}
+            .user=${this.user}
+            .identity=${this.identity}
+            @cs-step-up-done=${() => {
+              this.settleStepUp(true);
+            }}
+            @cs-step-up-cancel=${() => {
+              this.settleStepUp(false);
+            }}
+          ></cs-step-up-dialog>`
+        : nothing}
     `;
+  }
+
+  private get signedIn(): boolean {
+    return this.user !== undefined && this.identity?.session.state.authenticated === true;
+  }
+
+  /**
+   * Contract M1 §3 [R1]: without Web Locks the SDK serializes refreshes with a localStorage lease (or not at all),
+   * and the UI degrades to a single active tab, so the user is told to keep one tab open.
+   */
+  private renderTabNotice(): TemplateResult | typeof nothing {
+    const mode = this.identity?.session.crossTabMode;
+    if (!this.signedIn || mode === undefined || mode === "web-locks") return nothing;
+    return html`<p class="tab-notice" role="status">${t("auth.single_tab_notice")}</p>`;
+  }
+
+  private renderRoute(): TemplateResult {
+    const id = this.identity;
+    switch (this.route) {
+      case "dev-errors":
+        return html`<cs-dev-errors></cs-dev-errors>`;
+      case "sign-in":
+        if (id) return html`<cs-sign-in-page .identity=${id} @cs-signed-in=${this.onSignedIn}></cs-sign-in-page>`;
+        break;
+      case "register":
+        if (id)
+          return html`<cs-register-page .identity=${id} .token=${this.setupToken} @cs-signed-in=${this.onSignedIn}></cs-register-page>`;
+        break;
+      case "account":
+        if (id && this.signedIn)
+          return html`<cs-account-page .user=${this.user} .session=${id.session} .authedClient=${this.authedClient}
+            @cs-signed-out=${this.onSignedOut}></cs-account-page>`;
+        if (id) return html`<cs-sign-in-page .identity=${id} @cs-signed-in=${this.onSignedIn}></cs-sign-in-page>`;
+        break;
+      case "home":
+        break;
+    }
+    return this.renderHome();
   }
 
   private renderHome(): TemplateResult {
