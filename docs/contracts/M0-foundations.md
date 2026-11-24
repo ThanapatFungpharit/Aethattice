@@ -1,7 +1,7 @@
 # M0 Contracts: Foundations (FROZEN)
 
 - Status: **frozen for M0**, revision 3 (Team Leader, 2026-11-19). Changes require Team Leader approval and a changelog entry at the bottom of this file.
-- Spec: v2.4.1. Where this contract adds detail the spec leaves open, it says "(design)".
+- Spec: v2.4.2 (rev 6). Where this contract adds detail the spec leaves open, it says "(design)".
 - Multi-node rule: nothing here may assume a single node, a single database cluster or a single process.
 
 ## 1. Identifiers (spec §4.1, App. E)
@@ -224,3 +224,4 @@ OpenTelemetry tracing with W3C trace context propagation, structured JSON logs, 
 - 2026-11-20 rev 3: idempotency concurrent-duplicate semantics aligned with the single-transaction design (block, then stored result; `outcome_unknown` only for separately committed in-progress records). Minimum Rust version raised to 1.94 (sqlx 0.9).
 - 2026-11-20 rev 4 (QA gate F-2): 40001/40P01 retry budget excludes connection acquisition; migrations get a separate, longer budget.
 - 2026-11-20 rev 5 (M1 review M1-R2): SDK refresh hook skips `step_up_required`. No change to problem fields.
+- 2026-11-24 rev 6 (errata C11–C13, spec v2.4.2): D.2 now includes `cursor_expired` (410) and `client_upgrade_required` (426). The Rust `ErrorCode`, the TypeScript union and the exact-set tests add them at M1 start. Reusing an idempotency key with a different digest stays `idempotency_mismatch` (C11). Policy ranges are normative per C13; the code's ranges already match.

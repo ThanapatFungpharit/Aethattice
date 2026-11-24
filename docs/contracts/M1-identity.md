@@ -1,15 +1,15 @@
-# M1 Contracts: Identity (DRAFT rev 2, frozen at M0 gate after review)
+# M1 Contracts: Identity (FROZEN rev 3)
 
-- Status: **draft**. It is frozen only once the M0 gate passes and the QA Engineer and project owner have reviewed it.
-- Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8.
-- Builds on `M0-foundations.md` (rev 4).
+- Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
+- Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
+- Builds on `M0-foundations.md` (rev 6).
 - Rev 2 resolves QA review M1-R1 … M1-R14 (`docs/qa/M0-gate.md` §6.1). Each resolution is tagged `[R<n>]`.
 
-## 0. Ordering issue: admin authorization before M2 (owner decision needed)
+## 0. Ordering issue: admin authorization before M2 (owner-approved 2026-11-24)
 
 Spec §6.8 says administrative actions are authorized through the relationship model. That model, with its tuples on tenant resources in the resources domain and the decision service, arrives in M2. M1 has no compliant way to authorize tenant-admin HTTP APIs.
 
-**Proposal:**
+**Decision (owner-approved):**
 - M1 exposes **no HTTP admin API**. Tenant, user and group administration in M1 happens only through:
   - (a) the `cs admin` CLI. `[R4]` It is a standalone subcommand, not a server role: it does not start a listener and does not need the `control` role, which stays refused until M8. It connects only to the identity domain with the operator credential from `--config`, runs each action as one identity-domain transaction, and writes an outbox event for each action so M4 audit can consume it; and
   - (b) the one-time first-administrator setup link (J.4 step 4).
@@ -68,7 +68,7 @@ Outbox events: `identity.user.created|updated|disabled`, `identity.group.members
 ### 2.3 MFA and step-up
 
 - When tenant policy requires MFA, a successful OPAQUE login returns `{state: "mfa_required", auth_txn, methods}`, and only `webauthn/assert` or `recovery-code` completes it.
-- Step-up: sensitive operations (§5.5 list) require `last_strong_auth_at ≥ now() − 5 min` (policy, proposed range 1–60 min, §8). `[R2]` Otherwise they get `unauthenticated` (401) with an `errors[]` entry `{pointer: "", code: "step_up_required", detail}`. No new problem member is added, so the M0 problem fields stay frozen. The M0 SDK hook "unauthenticated → refresh once → retry once" is amended (M0 contract rev 5): it does **not** refresh when `errors[]` contains `step_up_required`, and the SDK surfaces a typed `StepUpRequired` error so the UI can run `webauthn/assert` or re-enter the password.
+- Step-up: sensitive operations (§5.5 list) require `last_strong_auth_at ≥ now() − 5 min` (policy, range 1–60 min, §8). `[R2]` Otherwise they get `unauthenticated` (401) with an `errors[]` entry `{pointer: "", code: "step_up_required", detail}`. No new problem member is added, so the M0 problem fields stay frozen. The M0 SDK hook "unauthenticated → refresh once → retry once" is amended (M0 contract rev 5): it does **not** refresh when `errors[]` contains `step_up_required`, and the SDK surfaces a typed `StepUpRequired` error so the UI can run `webauthn/assert` or re-enter the password.
 
 ### 2.4 Authentication result
 
@@ -81,7 +81,7 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
 ## 3. Tokens (§5.5, C8)
 
 - **Access token:** JWS compact, `alg: EdDSA`, `typ: at+jwt`, `kid` = KMS key ID with version.
-  - Claims: `iss`, `aud` (deployment API audience), `sub`, `tid`, `sid`, `sgen` (session `generation`), `amr`, `auth_time`, `iat`, `exp` (iat + 600 s, proposed policy range 60–3600 s, §8), `jti`, plus `cnf.jkt` when DPoP-bound.
+  - Claims: `iss`, `aud` (deployment API audience), `sub`, `tid`, `sid`, `sgen` (session `generation`), `amr`, `auth_time`, `iat`, `exp` (iat + 600 s, policy range 60–3600 s, §8), `jti`, plus `cnf.jkt` when DPoP-bound.
   - `[R9]` The claim name `av` is **reserved** for the authorization version (§5.5) that M2 defines over authz epochs and membership versions. M1 tokens omit it; M2 adds it as a new claim, which is not a breaking change. Verifiers ignore unknown claims.
   - Clock skew `[R12]`: `iat` may be at most 60 s in the future; `exp` is enforced with 0 s leeway on the server and 60 s on the client's proactive refresh.
   - Verifiers accept only EdDSA and only known `kid`s. `alg: none`, HS*, and `jwk`/`jku`/`x5u` headers are all rejected.
@@ -160,11 +160,11 @@ Every M1 endpoint publishes its possible codes in the OpenAPI document (App. G.5
   - implements the "unauthenticated → refresh once → retry once" hook from M0, skipping the refresh for `step_up_required` (§2.3);
   - serializes refreshes across tabs (§3 `[R1]`).
 
-## 8. Policy ranges (proposed, owner review) `[R11]`
+## 8. Policy ranges (owner-approved, erratum C13) `[R11]`
 
-These ranges are not in the spec. They are recorded here for owner review together with the M0 policy ranges (open question OQ-6) and are enforced by `check-config`.
+These ranges were not in the spec. The owner approved them on 2026-11-24 together with the M0 policy ranges, and they are now normative as erratum C13 (docs/SPEC_ERRATA.md). `check-config` enforces them.
 
-| Policy | Default | Proposed range |
+| Policy | Default | Range |
 |---|---|---|
 | Step-up window | 5 min | 1–60 min |
 | Access-token lifetime | 600 s | 60–3600 s |
@@ -183,3 +183,4 @@ These ranges are not in the spec. They are recorded here for owner review togeth
 - 2026-11-19: draft.
 - 2026-11-20: draft rev 2: resolves QA review M1-R1 … M1-R14. Pending owner decision: §0 (no HTTP admin API in M1) and §8 policy ranges.
 - 2026-11-20: §9: log-secret scan added to the M1 gate (M0 carry-over CT.M0-28).
+- 2026-11-24: **rev 3, frozen.** The owner approved §0 (no HTTP admin API in M1: `cs admin` CLI and the first-administrator setup link only; HTTP admin in M2 under the relationship model) and the §8 ranges (erratum C13). Builds on M0 contract rev 6.
