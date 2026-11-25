@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 9)
+# M1 Contracts: Identity (FROZEN rev 10)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -169,6 +169,32 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
   - There is no state in which the new password exists and old sessions are still valid. Sessions are not revoked before then, so an abandoned recovery leaves the account usable.
   - The request is idempotent with `Idempotency-Key`. Presenting a used or expired grant returns `unauthenticated`. An expired grant returns the request to `expired`, and the user must start over.
   - All devices are notified after commit through the `Notifier` (outbox-driven, outside the transaction).
+- (rev 10) **Recovery endpoints.**
+  - **Recovery code:** no waiting period, because possessing the code is the proof.
+    - `POST /api/v2/auth/recovery/start {tenant, login, method: "recovery_code", code}` returns `{state: "granted", grant, grant_expires_in}` for a valid unused code.
+    - Unknown tenant, unknown account, wrong code and used code all return the same `unauthenticated` problem, with the same timing path. Rate limits per §5 apply.
+  - **Verified email:**
+    - `start {tenant, login, method: "email"}` always returns `202 {state: "pending"}`, with an identical shape for unknown accounts.
+    - When the account exists, a request is created, and the `Notifier` sends an `rt1` recovery link to the verified address. It is never returned in the API.
+    - `POST /api/v2/auth/recovery/status {token}` (the token from the link) returns `{state, available_at}`. Possessing the link verifies the email.
+    - Once `not_before` has passed, the state is `granted` and the response carries `grant` (15 min, single use).
+    - Users with MFA must also send `code` (a recovery code) in that `status` call, per §4 "a second factor or the recovery code". A user who still has a passkey signs in passwordless instead and changes the password by step-up.
+  - **Approval from a signed-in device:**
+    - `start {tenant, login, method: "device_approval"}` returns `202 {state: "pending", recovery_txn}`, also for unknown accounts. `recovery_txn` uses the `rt1` format.
+    - The user's session sees the request in `GET /api/v2/me/recovery-requests` and approves it with `POST …/{id}/approve` (step-up required). The requester then polls `status {recovery_txn}` and gets `granted` plus `grant`.
+    - Approval counts as the second factor and skips the waiting period.
+  - **Administrator-assisted:** `cs admin recovery start` creates an email-method request with the waiting period.
+  - **Cancel:** any session of the user can list pending requests (`GET /api/v2/me/recovery-requests`) and cancel one with `DELETE …/{id}`, which sets the state to `cancelled`.
+  - **Completion:** unchanged ([R5]). `register/start {grant, login, registration_request}` → `register/finish` → normal sign-in.
+- (rev 10) **WebAuthn and session wire shapes** (L3 JSON forms, binary as base64url without padding):
+  - Passkey registration: `webauthn/register/start {}` (access token, DPoP, step-up) → `{registration_txn, public_key}`; `webauthn/register/finish {registration_txn, credential, label}` → `{id, label, created_at, prf}`.
+  - Passwordless sign-in: `webauthn/login/start {tenant}` → `{login_txn, public_key}`, with discoverable credentials and empty `allowCredentials`; `webauthn/login/finish {login_txn, credential}` → §2.4 result, with a DPoP proof as for OPAQUE.
+  - MFA after OPAQUE: `webauthn/assert/start {auth_txn}` → `{assert_txn, public_key}`; `webauthn/assert/finish {assert_txn, credential}` → §2.4 result. With a recovery code instead: `POST /api/v2/auth/mfa/recovery-code {auth_txn, code}` → §2.4 result.
+  - Step-up: `webauthn/assert/start {}` with the access token → `{assert_txn, public_key}`; `webauthn/assert/finish` → `204` and sets `last_strong_auth_at`.
+  - Passkeys: `GET /api/v2/me/passkeys` → `{items: [{id, label, created_at, last_used_at, prf}]}`; `DELETE /api/v2/me/passkeys/{id}` (step-up) → `204`.
+  - Sessions: `GET /api/v2/me/sessions` → `{items: [{sid, created_at, last_seen_at, amr, user_agent, current}]}`, bounded per user and not paginated.
+  - `DELETE /api/v2/me/sessions/{sid}` → `204`. Revoking another session requires step-up; revoking the current session acts as logout.
+  - Recovery codes: `POST /api/v2/me/recovery-codes` (step-up) → `{codes}`, which replaces the previous set; `GET` → `{remaining}`.
 - Email delivery uses a configured outbound SMTP relay through a `Notifier` trait. The notification service proper is M4; M1 ships the trait plus an SMTP relay implementation and a dev log sink.
   - `[R7]` The log sink writes bearer secrets (recovery links), so it is refused unless `cs serve` runs with the explicit `--dev` profile. `check-config` rejects it otherwise, and every line it writes is prefixed `DEV-ONLY SECRET`. It is never the default.
 - Account recovery never touches vault keys.
@@ -241,3 +267,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-25 rev 7 (TL, frontend slice 2): KSF parameter bounds; `opaque/reauth/*` for password step-up on the existing session; `GET /api/v2/me`.
 - 2026-11-25 rev 8 (TL, frontend DPoP questions): DPoP wire details (algorithms, no nonce in M1, binding of session and refresh family, `DPoP` auth scheme, `htu`, key lifetime).
 - 2026-11-25 rev 9 (TL, backend question): re-registration by a step-up session (password change and KSF/key upgrade), the `reregister` signal, and revocation of the user's other sessions on every re-registration.
+- 2026-11-26 rev 10 (TL, frontend proposal): recovery endpoints per method (code without a waiting period; email by link with a waiting period, plus a recovery code for MFA users; device approval; admin-assisted; cancel), and WebAuthn, passkey, session and recovery-code wire shapes.
