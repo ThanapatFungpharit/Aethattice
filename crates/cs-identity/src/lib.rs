@@ -23,8 +23,12 @@
 //!   re-registration by a step-up session (rev 9: password change, KSF / key-version upgrade,
 //!   `reregister` signal at login).
 //!
-//! Not yet: WebAuthn/MFA, recovery flows, rate limiting, `/me/sessions`, native
-//! (device-bound) refresh.
+//! - Slice 4 (rev 10/11): [`webauthn`] passkeys (webauthn-rs), [`mfa`] (second factor and
+//!   the enrolment-only session), [`ceremony`] state, [`recovery`] (codes, request flows,
+//!   [R5] completion in [`auth`]), [`ratelimit`] (Valkey, limit/N fallback), [`me`]
+//!   (`/me/sessions`), [`notify`] (Notifier trait; SMTP relay not yet).
+//!
+//! Not yet: SMTP relay notifier, native (device-bound) refresh.
 
 pub mod admin;
 pub mod auth;

@@ -1136,7 +1136,11 @@ impl IdentityAdmin {
     /// email-method request under the same waiting period (policy
     /// `recovery_waiting_period_secs`). Returns the `rt1` link token, shown once; only its
     /// SHA-256 is stored. Outbox `identity.recovery.requested` (method `admin`).
-    pub async fn start_recovery(&self, tenant: TenantId, user: UserId) -> AdminResult<Secret<String>> {
+    pub async fn start_recovery(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+    ) -> AdminResult<Secret<String>> {
         crate::recovery::create_email_request(
             &self.pool,
             tenant,
@@ -1181,7 +1185,8 @@ impl IdentityAdmin {
                     .bind(verified)
                     .fetch_optional(tx.conn())
                     .await?;
-                    let status = status.ok_or_else(|| app(ErrorCode::NotFound, "user not found"))?;
+                    let status =
+                        status.ok_or_else(|| app(ErrorCode::NotFound, "user not found"))?;
                     Outbox::append(
                         tx,
                         NewEvent {

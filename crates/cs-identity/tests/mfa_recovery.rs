@@ -423,7 +423,9 @@ fn sha256(b: &[u8]) -> Vec<u8> {
 impl Authenticator {
     fn new() -> Self {
         let key = loop {
-            if let Ok(k) = p256::ecdsa::SigningKey::from_slice(&cs_crypto::rand::bytes::<32>().unwrap()) {
+            if let Ok(k) =
+                p256::ecdsa::SigningKey::from_slice(&cs_crypto::rand::bytes::<32>().unwrap())
+            {
                 break k;
             }
         };
@@ -511,7 +513,10 @@ async fn add_passkey(e: &Env, at: &str, a: &mut Authenticator) -> Value {
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    assert_eq!(v["public_key"]["authenticatorSelection"]["residentKey"], "preferred");
+    assert_eq!(
+        v["public_key"]["authenticatorSelection"]["residentKey"],
+        "preferred"
+    );
     let cred = a.create(&v["public_key"], ORIGIN, DOMAIN);
     let (s, _, p) = e
         .req(
@@ -572,7 +577,13 @@ async fn webauthn_register_mfa_passwordless_stepup_and_negatives() {
     // Label rule: missing / empty / too long → invalid_request at /label, txn not consumed.
     let mut a = Authenticator::new();
     let (_, _, st) = e
-        .req("POST", "/api/v2/auth/webauthn/register/start", Some(&at), Some(json!({})), &[])
+        .req(
+            "POST",
+            "/api/v2/auth/webauthn/register/start",
+            Some(&at),
+            Some(json!({})),
+            &[],
+        )
         .await;
     let cred = a.create(&st["public_key"], ORIGIN, DOMAIN);
     for body in [
@@ -581,14 +592,27 @@ async fn webauthn_register_mfa_passwordless_stepup_and_negatives() {
         json!({"registration_txn": st["registration_txn"], "credential": cred, "label": "x".repeat(101)}),
     ] {
         let (s, _, v) = e
-            .req("POST", "/api/v2/auth/webauthn/register/finish", Some(&at), Some(body), &[])
+            .req(
+                "POST",
+                "/api/v2/auth/webauthn/register/finish",
+                Some(&at),
+                Some(body),
+                &[],
+            )
             .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
         assert_eq!(v["errors"][0]["pointer"], "/label", "{v}");
     }
-    let finish = json!({"registration_txn": st["registration_txn"], "credential": cred, "label": "Laptop"});
+    let finish =
+        json!({"registration_txn": st["registration_txn"], "credential": cred, "label": "Laptop"});
     let (s, _, p) = e
-        .req("POST", "/api/v2/auth/webauthn/register/finish", Some(&at), Some(finish.clone()), &[])
+        .req(
+            "POST",
+            "/api/v2/auth/webauthn/register/finish",
+            Some(&at),
+            Some(finish.clone()),
+            &[],
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{p}");
     assert_eq!(p["label"], "Laptop");
@@ -597,17 +621,33 @@ async fn webauthn_register_mfa_passwordless_stepup_and_negatives() {
     assert!(p["created_at"].as_str().unwrap().ends_with('Z'));
     // Ceremony replay.
     let (s, _, _) = e
-        .req("POST", "/api/v2/auth/webauthn/register/finish", Some(&at), Some(finish), &[])
+        .req(
+            "POST",
+            "/api/v2/auth/webauthn/register/finish",
+            Some(&at),
+            Some(finish),
+            &[],
+        )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     assert_eq!(
-        scalar_i64(e.pool(), "SELECT count(*) FROM webauthn_credentials WHERE prf_supported AND discoverable").await,
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM webauthn_credentials WHERE prf_supported AND discoverable"
+        )
+        .await,
         1
     );
     // Wrong origin at registration is refused.
     let mut evil = Authenticator::new();
     let (_, _, st) = e
-        .req("POST", "/api/v2/auth/webauthn/register/start", Some(&at), Some(json!({})), &[])
+        .req(
+            "POST",
+            "/api/v2/auth/webauthn/register/start",
+            Some(&at),
+            Some(json!({})),
+            &[],
+        )
         .await;
     let cred = evil.create(&st["public_key"], "https://evil.test", DOMAIN);
     let (s, _, _) = e
@@ -617,7 +657,9 @@ async fn webauthn_register_mfa_passwordless_stepup_and_negatives() {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 
     // Listing.
-    let (s, _, l) = e.req("GET", "/api/v2/me/passkeys", Some(&at), None, &[]).await;
+    let (s, _, l) = e
+        .req("GET", "/api/v2/me/passkeys", Some(&at), None, &[])
+        .await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(l["items"].as_array().unwrap().len(), 1);
     assert!(l["items"][0]["last_used_at"].is_null());
@@ -631,41 +673,77 @@ async fn webauthn_register_mfa_passwordless_stepup_and_negatives() {
     let auth_txn = m["auth_txn"].clone();
     // The auth_txn on the wrong endpoint → 401 mfa_required (and stays usable).
     let (s, _, v) = e.refresh(auth_txn.as_str().unwrap()).await;
-    assert_eq!((s, code_of(&v)), (StatusCode::UNAUTHORIZED, Some("mfa_required")), "{v}");
+    assert_eq!(
+        (s, code_of(&v)),
+        (StatusCode::UNAUTHORIZED, Some("mfa_required")),
+        "{v}"
+    );
     let (s, _, v) = e
-        .post("/api/v2/auth/opaque/login/finish",
-              json!({"login_txn": auth_txn, "credential_finalization": b64(&[0u8; 64])}))
+        .post(
+            "/api/v2/auth/opaque/login/finish",
+            json!({"login_txn": auth_txn, "credential_finalization": b64(&[0u8; 64])}),
+        )
         .await;
-    assert_eq!((s, code_of(&v)), (StatusCode::UNAUTHORIZED, Some("mfa_required")), "{v}");
+    assert_eq!(
+        (s, code_of(&v)),
+        (StatusCode::UNAUTHORIZED, Some("mfa_required")),
+        "{v}"
+    );
     // Wrong origin, wrong rp id, missing UV → refused; the auth_txn survives.
-    let (s, _, _) = mfa_assert(&e, &auth_txn, |pk| a.get_with(pk, "https://evil.test", DOMAIN, 50)).await;
+    let (s, _, _) = mfa_assert(&e, &auth_txn, |pk| {
+        a.get_with(pk, "https://evil.test", DOMAIN, 50)
+    })
+    .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, _, _) = mfa_assert(&e, &auth_txn, |pk| a.get_with(pk, ORIGIN, "evil.test", 51)).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     // MFA bypass: an access token with an auth_txn is refused; another user's token cannot
     // finish an MFA ceremony.
     let (s, _, _) = e
-        .req("POST", "/api/v2/auth/webauthn/assert/start", Some(&at), Some(json!({"auth_txn": auth_txn})), &[])
+        .req(
+            "POST",
+            "/api/v2/auth/webauthn/assert/start",
+            Some(&at),
+            Some(json!({"auth_txn": auth_txn})),
+            &[],
+        )
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     let (_, _, st) = e
-        .post("/api/v2/auth/webauthn/assert/start", json!({"auth_txn": auth_txn}))
+        .post(
+            "/api/v2/auth/webauthn/assert/start",
+            json!({"auth_txn": auth_txn}),
+        )
         .await;
     a.counter = 10;
     let cred = a.get(&st["public_key"]);
     let (s, _, _) = e
-        .req("POST", "/api/v2/auth/webauthn/assert/finish", Some(&at),
-             Some(json!({"assert_txn": st["assert_txn"], "credential": cred})), &[])
+        .req(
+            "POST",
+            "/api/v2/auth/webauthn/assert/finish",
+            Some(&at),
+            Some(json!({"assert_txn": st["assert_txn"], "credential": cred})),
+            &[],
+        )
         .await;
-    assert_eq!(s, StatusCode::UNAUTHORIZED, "MFA assertion with an access token");
+    assert_eq!(
+        s,
+        StatusCode::UNAUTHORIZED,
+        "MFA assertion with an access token"
+    );
     // Correct assertion completes MFA.
     let (s, _, st) = e
-        .post("/api/v2/auth/webauthn/assert/start", json!({"auth_txn": auth_txn}))
+        .post(
+            "/api/v2/auth/webauthn/assert/start",
+            json!({"auth_txn": auth_txn}),
+        )
         .await;
     assert_eq!(s, StatusCode::OK);
     let cred = a.get(&st["public_key"]);
     let fin = json!({"assert_txn": st["assert_txn"], "credential": cred});
-    let (s, _, ok) = e.post("/api/v2/auth/webauthn/assert/finish", fin.clone()).await;
+    let (s, _, ok) = e
+        .post("/api/v2/auth/webauthn/assert/finish", fin.clone())
+        .await;
     assert_eq!(s, StatusCode::OK, "{ok}");
     assert_eq!(ok["state"], "authenticated");
     let c = claims_of(ok["access_token"].as_str().unwrap());
@@ -675,16 +753,25 @@ async fn webauthn_register_mfa_passwordless_stepup_and_negatives() {
     let (s, _, _) = e.post("/api/v2/auth/webauthn/assert/finish", fin).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (s, _, _) = e
-        .post("/api/v2/auth/webauthn/assert/start", json!({"auth_txn": auth_txn}))
+        .post(
+            "/api/v2/auth/webauthn/assert/start",
+            json!({"auth_txn": auth_txn}),
+        )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 
     // Counter regression is refused.
     let (_, _, m) = login(&e, &ts, LOGIN, "pw").await;
     let last = a.counter;
-    let (s, _, _) = mfa_assert(&e, &m["auth_txn"], |pk| a.get_with(pk, ORIGIN, DOMAIN, last)).await;
+    let (s, _, _) = mfa_assert(&e, &m["auth_txn"], |pk| {
+        a.get_with(pk, ORIGIN, DOMAIN, last)
+    })
+    .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "same counter");
-    let (s, _, _) = mfa_assert(&e, &m["auth_txn"], |pk| a.get_with(pk, ORIGIN, DOMAIN, last - 1)).await;
+    let (s, _, _) = mfa_assert(&e, &m["auth_txn"], |pk| {
+        a.get_with(pk, ORIGIN, DOMAIN, last - 1)
+    })
+    .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "lower counter");
 
     // Passwordless sign-in with the discoverable credential.
@@ -695,7 +782,10 @@ async fn webauthn_register_mfa_passwordless_stepup_and_negatives() {
     assert_eq!(st["public_key"]["allowCredentials"], json!([]));
     // Unknown tenant: same shape (no lookup).
     let (s2, _, st2) = e
-        .post("/api/v2/auth/webauthn/login/start", json!({"tenant": "0190f1e2-0000-7000-8000-000000000000"}))
+        .post(
+            "/api/v2/auth/webauthn/login/start",
+            json!({"tenant": "0190f1e2-0000-7000-8000-000000000000"}),
+        )
         .await;
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(
@@ -704,43 +794,83 @@ async fn webauthn_register_mfa_passwordless_stepup_and_negatives() {
     );
     let cred = a.get(&st["public_key"]);
     let (s, h, pl) = e
-        .post("/api/v2/auth/webauthn/login/finish", json!({"login_txn": st["login_txn"], "credential": cred}))
+        .post(
+            "/api/v2/auth/webauthn/login/finish",
+            json!({"login_txn": st["login_txn"], "credential": cred}),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{pl}");
-    assert_eq!(claims_of(pl["access_token"].as_str().unwrap())["amr"], json!(["hwk", "user"]));
+    assert_eq!(
+        claims_of(pl["access_token"].as_str().unwrap())["amr"],
+        json!(["hwk", "user"])
+    );
     assert!(h.get(header::SET_COOKIE).is_some());
     // Replay of the login ceremony.
     let (s, _, _) = e
-        .post("/api/v2/auth/webauthn/login/finish", json!({"login_txn": st["login_txn"], "credential": a.get(&st["public_key"])}))
+        .post(
+            "/api/v2/auth/webauthn/login/finish",
+            json!({"login_txn": st["login_txn"], "credential": a.get(&st["public_key"])}),
+        )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 
     // Step-up by assertion on the existing session (204, last_strong_auth_at set).
     let at2 = pl["access_token"].as_str().unwrap().to_owned();
-    exec(e.pool(), "UPDATE sessions SET last_strong_auth_at = now() - interval '1 hour'").await;
-    let (s, _, v) = e.req("DELETE", "/api/v2/me/passkeys/AAAA", Some(&at2), None, &[]).await;
-    assert_eq!((s, code_of(&v)), (StatusCode::UNAUTHORIZED, Some("step_up_required")));
+    exec(
+        e.pool(),
+        "UPDATE sessions SET last_strong_auth_at = now() - interval '1 hour'",
+    )
+    .await;
+    let (s, _, v) = e
+        .req("DELETE", "/api/v2/me/passkeys/AAAA", Some(&at2), None, &[])
+        .await;
+    assert_eq!(
+        (s, code_of(&v)),
+        (StatusCode::UNAUTHORIZED, Some("step_up_required"))
+    );
     let (s, _, st) = e
-        .req("POST", "/api/v2/auth/webauthn/assert/start", Some(&at2), Some(json!({})), &[])
+        .req(
+            "POST",
+            "/api/v2/auth/webauthn/assert/start",
+            Some(&at2),
+            Some(json!({})),
+            &[],
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{st}");
     let cred = a.get(&st["public_key"]);
     // Without the access token the step-up ceremony cannot finish (no MFA session issued).
     let (s, _, _) = e
-        .post("/api/v2/auth/webauthn/assert/finish", json!({"assert_txn": st["assert_txn"], "credential": cred}))
+        .post(
+            "/api/v2/auth/webauthn/assert/finish",
+            json!({"assert_txn": st["assert_txn"], "credential": cred}),
+        )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (_, _, st) = e
-        .req("POST", "/api/v2/auth/webauthn/assert/start", Some(&at2), Some(json!({})), &[])
+        .req(
+            "POST",
+            "/api/v2/auth/webauthn/assert/start",
+            Some(&at2),
+            Some(json!({})),
+            &[],
+        )
         .await;
     let cred = a.get(&st["public_key"]);
     let (s, _, _) = e
-        .req("POST", "/api/v2/auth/webauthn/assert/finish", Some(&at2),
-             Some(json!({"assert_txn": st["assert_txn"], "credential": cred})), &[])
+        .req(
+            "POST",
+            "/api/v2/auth/webauthn/assert/finish",
+            Some(&at2),
+            Some(json!({"assert_txn": st["assert_txn"], "credential": cred})),
+            &[],
+        )
         .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
     // Now the passkey can be deleted (step-up satisfied); unknown id → 404.
-    let (s, _, _) = e.req("DELETE", "/api/v2/me/passkeys/AAAA", Some(&at2), None, &[]).await;
+    let (s, _, _) = e
+        .req("DELETE", "/api/v2/me/passkeys/AAAA", Some(&at2), None, &[])
+        .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     let path = format!("/api/v2/me/passkeys/{}", b64(&a.cred_id));
     let (s, _, _) = e.req("DELETE", &path, Some(&at2), None, &[]).await;
@@ -782,32 +912,73 @@ async fn mfa_policy_enrolment_scope_and_recovery_code_factor() {
         ("GET", "/api/v2/me/sessions", None),
         ("GET", "/api/v2/me/passkeys", None),
         ("GET", "/api/v2/me/recovery-requests", None),
-        ("DELETE", "/api/v2/me/sessions/00000000-0000-4000-8000-000000000000", None),
-        ("POST", "/api/v2/auth/webauthn/assert/start", Some(json!({}))),
-        ("POST", "/api/v2/auth/opaque/reauth/start", Some(json!({"credential_request": "AA"}))),
-        ("POST", "/api/v2/auth/opaque/register/start", Some(json!({"purpose": "password_change", "registration_request": "AA"}))),
+        (
+            "DELETE",
+            "/api/v2/me/sessions/00000000-0000-4000-8000-000000000000",
+            None,
+        ),
+        (
+            "POST",
+            "/api/v2/auth/webauthn/assert/start",
+            Some(json!({})),
+        ),
+        (
+            "POST",
+            "/api/v2/auth/opaque/reauth/start",
+            Some(json!({"credential_request": "AA"})),
+        ),
+        (
+            "POST",
+            "/api/v2/auth/opaque/register/start",
+            Some(json!({"purpose": "password_change", "registration_request": "AA"})),
+        ),
     ] {
         let (s, _, v) = e.req(m, p, Some(&at), b, &[]).await;
-        assert_eq!((s, code_of(&v)), (StatusCode::UNAUTHORIZED, Some("mfa_required")), "{m} {p}: {v}");
+        assert_eq!(
+            (s, code_of(&v)),
+            (StatusCode::UNAUTHORIZED, Some("mfa_required")),
+            "{m} {p}: {v}"
+        );
     }
     // Refresh keeps the scope.
     let (s, h2, r) = e.refresh(&rt_of(&h)).await;
     assert_eq!(s, StatusCode::OK, "{r}");
-    assert_eq!(claims_of(r["access_token"].as_str().unwrap())["scp"], "mfa_enrolment");
+    assert_eq!(
+        claims_of(r["access_token"].as_str().unwrap())["scp"],
+        "mfa_enrolment"
+    );
     let at = r["access_token"].as_str().unwrap().to_owned();
-    let (s, _, v) = e.req("GET", "/api/v2/me/sessions", Some(&at), None, &[]).await;
-    assert_eq!((s, code_of(&v)), (StatusCode::UNAUTHORIZED, Some("mfa_required")));
+    let (s, _, v) = e
+        .req("GET", "/api/v2/me/sessions", Some(&at), None, &[])
+        .await;
+    assert_eq!(
+        (s, code_of(&v)),
+        (StatusCode::UNAUTHORIZED, Some("mfa_required"))
+    );
     let _ = h2;
     // Enrol recovery codes (allowed on the enrolment session).
-    let (s, _, c) = e.req("POST", "/api/v2/me/recovery-codes", Some(&at), None, &[]).await;
+    let (s, _, c) = e
+        .req("POST", "/api/v2/me/recovery-codes", Some(&at), None, &[])
+        .await;
     assert_eq!(s, StatusCode::OK, "{c}");
-    let codes: Vec<String> = c["codes"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_owned()).collect();
+    let codes: Vec<String> = c["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_owned())
+        .collect();
     assert_eq!(codes.len(), 10);
     assert_eq!(
-        scalar_i64(e.pool(), "SELECT count(*) FROM recovery_code_entries WHERE code_hash LIKE '$argon2id$%'").await,
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM recovery_code_entries WHERE code_hash LIKE '$argon2id$%'"
+        )
+        .await,
         10
     );
-    let (_, _, r) = e.req("GET", "/api/v2/me/recovery-codes", Some(&at), None, &[]).await;
+    let (_, _, r) = e
+        .req("GET", "/api/v2/me/recovery-codes", Some(&at), None, &[])
+        .await;
     assert_eq!(r["remaining"], 10);
 
     // Signing in again: mfa_required with the recovery-code method only.
@@ -816,11 +987,17 @@ async fn mfa_policy_enrolment_scope_and_recovery_code_factor() {
     assert_eq!(m["methods"], json!(["recovery_code"]));
     let wrong = "AAAAAAAA-AAAAAAAAAAAAAAAAAAAA";
     let (s, _, w) = e
-        .post("/api/v2/auth/mfa/recovery-code", json!({"auth_txn": m["auth_txn"], "code": wrong}))
+        .post(
+            "/api/v2/auth/mfa/recovery-code",
+            json!({"auth_txn": m["auth_txn"], "code": wrong}),
+        )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "{w}");
     let (s, _, ok) = e
-        .post("/api/v2/auth/mfa/recovery-code", json!({"auth_txn": m["auth_txn"], "code": codes[0].to_lowercase()}))
+        .post(
+            "/api/v2/auth/mfa/recovery-code",
+            json!({"auth_txn": m["auth_txn"], "code": codes[0].to_lowercase()}),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{ok}");
     let c = claims_of(ok["access_token"].as_str().unwrap());
@@ -828,19 +1005,33 @@ async fn mfa_policy_enrolment_scope_and_recovery_code_factor() {
     assert!(c.get("scp").is_none());
     // auth_txn single use; the used code is refused on a new sign-in.
     let (s, _, _) = e
-        .post("/api/v2/auth/mfa/recovery-code", json!({"auth_txn": m["auth_txn"], "code": codes[1]}))
+        .post(
+            "/api/v2/auth/mfa/recovery-code",
+            json!({"auth_txn": m["auth_txn"], "code": codes[1]}),
+        )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     let (_, _, m) = login(&e, &ts, LOGIN, "pw").await;
     let (s, _, _) = e
-        .post("/api/v2/auth/mfa/recovery-code", json!({"auth_txn": m["auth_txn"], "code": codes[0]}))
+        .post(
+            "/api/v2/auth/mfa/recovery-code",
+            json!({"auth_txn": m["auth_txn"], "code": codes[0]}),
+        )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "code reuse");
     // Tenant override 0 beats deployment 1: but the user has no passkey → plain session.
-    exec(e.pool(), "UPDATE tenants SET policy = '\\xa16c6d66615f726571756972656400'::bytea").await;
+    exec(
+        e.pool(),
+        "UPDATE tenants SET policy = '\\xa16c6d66615f726571756972656400'::bytea",
+    )
+    .await;
     let (_, _, v) = login(&e, &ts, LOGIN, "pw").await;
     assert_eq!(v["state"], "authenticated", "{v}");
-    assert!(claims_of(v["access_token"].as_str().unwrap()).get("scp").is_none());
+    assert!(
+        claims_of(v["access_token"].as_str().unwrap())
+            .get("scp")
+            .is_none()
+    );
     exec(e.pool(), "UPDATE tenants SET policy = '\\xa0'::bytea").await;
 
     // rev 11 addendum: reregister appears on the MFA completion result, never on mfa_required.
@@ -850,12 +1041,21 @@ async fn mfa_policy_enrolment_scope_and_recovery_code_factor() {
     assert_eq!(m["state"], "mfa_required");
     assert!(m.get("reregister").is_none(), "{m}");
     let (s, _, ok) = e
-        .post("/api/v2/auth/mfa/recovery-code", json!({"auth_txn": m["auth_txn"], "code": codes[2]}))
+        .post(
+            "/api/v2/auth/mfa/recovery-code",
+            json!({"auth_txn": m["auth_txn"], "code": codes[2]}),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{ok}");
     assert_eq!(ok["reregister"], true, "{ok}");
     let (_, _, r) = e
-        .req("GET", "/api/v2/me/recovery-codes", Some(ok["access_token"].as_str().unwrap()), None, &[])
+        .req(
+            "GET",
+            "/api/v2/me/recovery-codes",
+            Some(ok["access_token"].as_str().unwrap()),
+            None,
+            &[],
+        )
         .await;
     assert_eq!(r["remaining"], 8);
     e.t.cleanup().await;
@@ -871,11 +1071,11 @@ async fn recovery_by_code_and_r5_completion() {
     let (_, h1, v1) = login(&e, &ts, LOGIN, "old").await;
     let (_, h2, _) = login(&e, &ts, LOGIN, "old").await;
     let at = v1["access_token"].as_str().unwrap().to_owned();
-    let (_, _, c) = e.req("POST", "/api/v2/me/recovery-codes", Some(&at), None, &[]).await;
+    let (_, _, c) = e
+        .req("POST", "/api/v2/me/recovery-codes", Some(&at), None, &[])
+        .await;
     let code = c["codes"][0].as_str().unwrap().to_owned();
-    let start = |tenant: &str, login: &str, code: &str| {
-        json!({"tenant": tenant, "login": login, "method": "recovery_code", "code": code})
-    };
+    let start = |tenant: &str, login: &str, code: &str| json!({"tenant": tenant, "login": login, "method": "recovery_code", "code": code});
     // Unknown tenant, unknown account, wrong code: the same problem.
     let other = "0190f1e2-0000-7000-8000-000000000000";
     let mut bodies = vec![];
@@ -891,25 +1091,69 @@ async fn recovery_by_code_and_r5_completion() {
     }
     assert!(bodies.windows(2).all(|w| w[0] == w[1]), "{bodies:?}");
     // Valid code → granted with a 15 min grant.
-    let (s, _, g) = e.post("/api/v2/auth/recovery/start", start(&ts, LOGIN, &code)).await;
+    let (s, _, g) = e
+        .post("/api/v2/auth/recovery/start", start(&ts, LOGIN, &code))
+        .await;
     assert_eq!(s, StatusCode::OK, "{g}");
     assert_eq!(g["state"], "granted");
     assert_eq!(g["grant_expires_in"], 900);
     let grant = g["grant"].as_str().unwrap().to_owned();
     // Sessions are untouched until completion (an abandoned recovery leaves the account usable).
-    assert_eq!(scalar_i64(e.pool(), "SELECT count(*) FROM sessions WHERE state = 'active'").await, 2);
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM sessions WHERE state = 'active'"
+        )
+        .await,
+        2
+    );
     // Completion, idempotent by Idempotency-Key.
     let (s, f, v) = register_with(&e, t, &grant, "new", Some("recovery-key-1")).await;
     assert_eq!((s, f), (StatusCode::OK, StatusCode::NO_CONTENT), "{v}");
-    assert_eq!(scalar_i64(e.pool(), "SELECT count(*) FROM sessions WHERE state = 'active'").await, 0);
-    assert_eq!(scalar_i64(e.pool(), "SELECT count(*) FROM refresh_tokens WHERE state = 'active'").await, 0);
-    assert_eq!(scalar_i64(e.pool(), "SELECT count(*) FROM recovery_requests WHERE state = 'completed'").await, 1);
-    assert_eq!(scalar_i64(e.pool(), "SELECT count(*) FROM recovery_code_entries WHERE used_at IS NOT NULL").await, 1);
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM sessions WHERE state = 'active'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM refresh_tokens WHERE state = 'active'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM recovery_requests WHERE state = 'completed'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM recovery_code_entries WHERE used_at IS NOT NULL"
+        )
+        .await,
+        1
+    );
     assert_eq!(
         scalar_i64(e.pool(), "SELECT count(*) FROM outbox WHERE event_type = 'identity.session.revoked' AND position(convert_to('recovery', 'UTF8') in payload) > 0").await,
         2
     );
-    assert_eq!(scalar_i64(e.pool(), "SELECT count(*) FROM outbox WHERE event_type = 'identity.recovery.completed'").await, 1);
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM outbox WHERE event_type = 'identity.recovery.completed'"
+        )
+        .await,
+        1
+    );
     for h in [&h1, &h2] {
         let (s, _, _) = e.refresh(&rt_of(h)).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
@@ -921,15 +1165,26 @@ async fn recovery_by_code_and_r5_completion() {
     // Grant reuse and code reuse.
     let (s, _, v) = register_with(&e, t, &grant, "again", None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "{v}");
-    let (s, _, _) = e.post("/api/v2/auth/recovery/start", start(&ts, LOGIN, &code)).await;
+    let (s, _, _) = e
+        .post("/api/v2/auth/recovery/start", start(&ts, LOGIN, &code))
+        .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     // An expired grant is refused and moves the request to expired.
     let code2 = c["codes"][1].as_str().unwrap();
-    let (_, _, g) = e.post("/api/v2/auth/recovery/start", start(&ts, LOGIN, code2)).await;
+    let (_, _, g) = e
+        .post("/api/v2/auth/recovery/start", start(&ts, LOGIN, code2))
+        .await;
     exec(e.pool(), "UPDATE recovery_requests SET grant_expires_at = now() - interval '1 second' WHERE state = 'granted'").await;
     let (s, _, _) = register_with(&e, t, g["grant"].as_str().unwrap(), "x", None).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
-    assert_eq!(scalar_i64(e.pool(), "SELECT count(*) FROM recovery_requests WHERE state = 'expired'").await, 1);
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM recovery_requests WHERE state = 'expired'"
+        )
+        .await,
+        1
+    );
     e.t.cleanup().await;
 }
 
@@ -940,10 +1195,16 @@ async fn recovery_by_email_and_device_approval() {
     let Some(e) = env().await else { return };
     let t = alice(&e, "pw").await;
     let ts = t.as_uuid().to_string();
-    exec(e.pool(), "UPDATE users SET email = 'alice@mail.test', email_verified_at = now()").await;
+    exec(
+        e.pool(),
+        "UPDATE users SET email = 'alice@mail.test', email_verified_at = now()",
+    )
+    .await;
     let email = |login: &str| json!({"tenant": ts, "login": login, "method": "email"});
     let (s, _, a) = e.post("/api/v2/auth/recovery/start", email(LOGIN)).await;
-    let (s2, _, b) = e.post("/api/v2/auth/recovery/start", email("nobody@acme.test")).await;
+    let (s2, _, b) = e
+        .post("/api/v2/auth/recovery/start", email("nobody@acme.test"))
+        .await;
     assert_eq!((s, s2), (StatusCode::ACCEPTED, StatusCode::ACCEPTED));
     assert_eq!(a, json!({"state": "pending"}));
     assert_eq!(a, b);
@@ -952,79 +1213,166 @@ async fn recovery_by_email_and_device_approval() {
     assert_eq!(links[0].0, "alice@mail.test");
     let link = links[0].1.clone();
     // Before the waiting period: pending with available_at, no grant.
-    let (s, _, st) = e.post("/api/v2/auth/recovery/status", json!({"token": link})).await;
+    let (s, _, st) = e
+        .post("/api/v2/auth/recovery/status", json!({"token": link}))
+        .await;
     assert_eq!(s, StatusCode::OK, "{st}");
     assert_eq!(st["state"], "pending");
     assert!(st["available_at"].as_str().unwrap().ends_with('Z'));
     assert!(st.get("grant").is_none());
     // A forged link is unauthenticated.
     let (s, _, _) = e
-        .post("/api/v2/auth/recovery/status", json!({"token": format!("rt1.{}.{}", &link[4..26], "A".repeat(43))}))
+        .post(
+            "/api/v2/auth/recovery/status",
+            json!({"token": format!("rt1.{}.{}", &link[4..26], "A".repeat(43))}),
+        )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     // The user's session lists the request and can see the requester's User-Agent.
     let (_, _, v) = login(&e, &ts, LOGIN, "pw").await;
     let at = v["access_token"].as_str().unwrap().to_owned();
-    let (_, _, l) = e.req("GET", "/api/v2/me/recovery-requests", Some(&at), None, &[]).await;
+    let (_, _, l) = e
+        .req("GET", "/api/v2/me/recovery-requests", Some(&at), None, &[])
+        .await;
     assert_eq!(l["items"].as_array().unwrap().len(), 1, "{l}");
     assert_eq!(l["items"][0]["method"], "email");
     // MFA user (passkey-free but policy 1 via tenant override) must add a recovery code.
-    let (_, _, c) = e.req("POST", "/api/v2/me/recovery-codes", Some(&at), None, &[]).await;
-    exec(e.pool(), "UPDATE tenants SET policy = '\\xa16c6d66615f726571756972656401'::bytea").await;
-    exec(e.pool(), "UPDATE recovery_requests SET not_before = now() - interval '1 second'").await;
-    let (s, _, v) = e.post("/api/v2/auth/recovery/status", json!({"token": link})).await;
-    assert_eq!((s, code_of(&v)), (StatusCode::UNAUTHORIZED, Some("mfa_required")), "{v}");
+    let (_, _, c) = e
+        .req("POST", "/api/v2/me/recovery-codes", Some(&at), None, &[])
+        .await;
+    exec(
+        e.pool(),
+        "UPDATE tenants SET policy = '\\xa16c6d66615f726571756972656401'::bytea",
+    )
+    .await;
+    exec(
+        e.pool(),
+        "UPDATE recovery_requests SET not_before = now() - interval '1 second'",
+    )
+    .await;
+    let (s, _, v) = e
+        .post("/api/v2/auth/recovery/status", json!({"token": link}))
+        .await;
+    assert_eq!(
+        (s, code_of(&v)),
+        (StatusCode::UNAUTHORIZED, Some("mfa_required")),
+        "{v}"
+    );
     let (s, _, g) = e
-        .post("/api/v2/auth/recovery/status", json!({"token": link, "code": c["codes"][0]}))
+        .post(
+            "/api/v2/auth/recovery/status",
+            json!({"token": link, "code": c["codes"][0]}),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{g}");
     assert_eq!(g["state"], "granted");
     assert_eq!(g["grant_expires_in"], 900);
     // Asking again replaces the grant (the first one no longer works) without extending it.
     let (_, _, g2) = e
-        .post("/api/v2/auth/recovery/status", json!({"token": link, "code": c["codes"][0]}))
+        .post(
+            "/api/v2/auth/recovery/status",
+            json!({"token": link, "code": c["codes"][0]}),
+        )
         .await;
     assert!(g2["grant_expires_in"].as_i64().unwrap() <= 900);
     let (s, _, _) = register_with(&e, t, g["grant"].as_str().unwrap(), "x", None).await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "replaced grant is not a grant any more");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "replaced grant is not a grant any more"
+    );
     exec(e.pool(), "UPDATE tenants SET policy = '\\xa0'::bytea").await;
 
     // Device approval: 202 with recovery_txn, also for unknown accounts.
     let dev = |login: &str| json!({"tenant": ts, "login": login, "method": "device_approval"});
     let (s, _, d) = e.post("/api/v2/auth/recovery/start", dev(LOGIN)).await;
-    let (s2, _, d2) = e.post("/api/v2/auth/recovery/start", dev("nobody@acme.test")).await;
+    let (s2, _, d2) = e
+        .post("/api/v2/auth/recovery/start", dev("nobody@acme.test"))
+        .await;
     assert_eq!((s, s2), (StatusCode::ACCEPTED, StatusCode::ACCEPTED));
     assert_eq!(d["state"], "pending");
     assert!(d2["recovery_txn"].as_str().unwrap().starts_with("rt1."));
-    let (_, _, p) = e.post("/api/v2/auth/recovery/status", json!({"recovery_txn": d2["recovery_txn"]})).await;
+    let (_, _, p) = e
+        .post(
+            "/api/v2/auth/recovery/status",
+            json!({"recovery_txn": d2["recovery_txn"]}),
+        )
+        .await;
     assert_eq!(p, json!({"state": "pending"}));
-    let (_, _, p) = e.post("/api/v2/auth/recovery/status", json!({"recovery_txn": d["recovery_txn"]})).await;
+    let (_, _, p) = e
+        .post(
+            "/api/v2/auth/recovery/status",
+            json!({"recovery_txn": d["recovery_txn"]}),
+        )
+        .await;
     assert_eq!(p, json!({"state": "pending"}));
-    let (_, _, l) = e.req("GET", "/api/v2/me/recovery-requests", Some(&at), None, &[]).await;
-    let item = l["items"].as_array().unwrap().iter().find(|i| i["method"] == "device_approval").unwrap().clone();
+    let (_, _, l) = e
+        .req("GET", "/api/v2/me/recovery-requests", Some(&at), None, &[])
+        .await;
+    let item = l["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["method"] == "device_approval")
+        .unwrap()
+        .clone();
     assert!(item["available_at"].is_null());
-    let approve = format!("/api/v2/me/recovery-requests/{}/approve", item["id"].as_str().unwrap());
+    let approve = format!(
+        "/api/v2/me/recovery-requests/{}/approve",
+        item["id"].as_str().unwrap()
+    );
     // Approval needs step-up.
-    exec(e.pool(), "UPDATE sessions SET last_strong_auth_at = now() - interval '1 hour'").await;
+    exec(
+        e.pool(),
+        "UPDATE sessions SET last_strong_auth_at = now() - interval '1 hour'",
+    )
+    .await;
     let (s, _, v) = e.req("POST", &approve, Some(&at), None, &[]).await;
-    assert_eq!((s, code_of(&v)), (StatusCode::UNAUTHORIZED, Some("step_up_required")));
+    assert_eq!(
+        (s, code_of(&v)),
+        (StatusCode::UNAUTHORIZED, Some("step_up_required"))
+    );
     exec(e.pool(), "UPDATE sessions SET last_strong_auth_at = now()").await;
     // Another user's session cannot approve it.
-    let u2 = e.admin.create_user(t, NewUser { login: "bob@acme.test".into(), kind: UserKind::Member, display_name: None }).await.unwrap();
+    let u2 = e
+        .admin
+        .create_user(
+            t,
+            NewUser {
+                login: "bob@acme.test".into(),
+                kind: UserKind::Member,
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
     let link2 = e.admin.issue_setup_link(t, u2.user_id).await.unwrap();
     let bob = register_bob(&e, t, link2.token.expose_secret()).await;
     let (s, _, _) = e.req("POST", &approve, Some(&bob), None, &[]).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     let (s, _, _) = e.req("POST", &approve, Some(&at), None, &[]).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let (_, _, p) = e.post("/api/v2/auth/recovery/status", json!({"recovery_txn": d["recovery_txn"]})).await;
+    let (_, _, p) = e
+        .post(
+            "/api/v2/auth/recovery/status",
+            json!({"recovery_txn": d["recovery_txn"]}),
+        )
+        .await;
     assert_eq!(p["state"], "granted", "{p}");
     assert!(p["grant"].as_str().unwrap().starts_with("rt1."));
     // Cancel: granted requests can be cancelled; status reports it.
-    let del = format!("/api/v2/me/recovery-requests/{}", item["id"].as_str().unwrap());
+    let del = format!(
+        "/api/v2/me/recovery-requests/{}",
+        item["id"].as_str().unwrap()
+    );
     let (s, _, _) = e.req("DELETE", &del, Some(&at), None, &[]).await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    let (_, _, p) = e.post("/api/v2/auth/recovery/status", json!({"recovery_txn": d["recovery_txn"]})).await;
+    let (_, _, p) = e
+        .post(
+            "/api/v2/auth/recovery/status",
+            json!({"recovery_txn": d["recovery_txn"]}),
+        )
+        .await;
     assert_eq!(p, json!({"state": "cancelled"}));
     let (s, _, _) = e.req("DELETE", &del, Some(&at), None, &[]).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
@@ -1039,11 +1387,25 @@ async fn register_bob(e: &Env, t: TenantId, link: &str) -> String {
         .post("/api/v2/auth/opaque/register/start",
               json!({"grant": link, "login": "bob@acme.test", "registration_request": b64(&c.message.serialize())}))
         .await;
-    let resp = RegistrationResponse::<Suite>::deserialize(&unb64(&v["registration_response"])).unwrap();
+    let resp =
+        RegistrationResponse::<Suite>::deserialize(&unb64(&v["registration_response"])).unwrap();
     let cid = client_identifier(&t.as_uuid().to_string(), "bob@acme.test");
     let k = ksf();
-    let fin = c.state.finish(&mut rng, pw.as_bytes(), resp,
-        ClientRegistrationFinishParameters::new(Identifiers { client: Some(cid.as_bytes()), server: None }, Some(&k))).unwrap();
+    let fin = c
+        .state
+        .finish(
+            &mut rng,
+            pw.as_bytes(),
+            resp,
+            ClientRegistrationFinishParameters::new(
+                Identifiers {
+                    client: Some(cid.as_bytes()),
+                    server: None,
+                },
+                Some(&k),
+            ),
+        )
+        .unwrap();
     let (s, _, _) = e
         .post("/api/v2/auth/opaque/register/finish",
               json!({"registration_txn": v["registration_txn"], "registration_upload": b64(&fin.message.serialize())}))
@@ -1063,7 +1425,9 @@ async fn me_sessions_list_and_revoke() {
     let (_, _, a) = login(&e, &ts, LOGIN, "pw").await;
     let (_, hb, b) = login(&e, &ts, LOGIN, "pw").await;
     let at = a["access_token"].as_str().unwrap().to_owned();
-    let (s, _, l) = e.req("GET", "/api/v2/me/sessions", Some(&at), None, &[]).await;
+    let (s, _, l) = e
+        .req("GET", "/api/v2/me/sessions", Some(&at), None, &[])
+        .await;
     assert_eq!(s, StatusCode::OK);
     let items = l["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
@@ -1072,30 +1436,90 @@ async fn me_sessions_list_and_revoke() {
     assert_eq!(items[0]["amr"], json!(["pwd"]));
     assert!(items[0]["created_at"].as_str().unwrap().ends_with('Z'));
     // Another user's session: 404, like a missing one.
-    let u2 = e.admin.create_user(t, NewUser { login: "bob@acme.test".into(), kind: UserKind::Member, display_name: None }).await.unwrap();
+    let u2 = e
+        .admin
+        .create_user(
+            t,
+            NewUser {
+                login: "bob@acme.test".into(),
+                kind: UserKind::Member,
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
     let link2 = e.admin.issue_setup_link(t, u2.user_id).await.unwrap();
     let bob = register_bob(&e, t, link2.token.expose_secret()).await;
     let bob_sid = claims_of(&bob)["sid"].as_str().unwrap().to_owned();
-    let (s, _, _) = e.req("DELETE", &format!("/api/v2/me/sessions/{bob_sid}"), Some(&at), None, &[]).await;
+    let (s, _, _) = e
+        .req(
+            "DELETE",
+            &format!("/api/v2/me/sessions/{bob_sid}"),
+            Some(&at),
+            None,
+            &[],
+        )
+        .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
     let (s, _, _) = e.req("GET", "/api/v2/me", Some(&bob), None, &[]).await;
     assert_eq!(s, StatusCode::OK, "bob's session untouched");
     // Other own session: step-up required.
     let other = b["session_id"].as_str().unwrap().to_owned();
-    exec(e.pool(), "UPDATE sessions SET last_strong_auth_at = now() - interval '1 hour'").await;
-    let (s, _, v) = e.req("DELETE", &format!("/api/v2/me/sessions/{other}"), Some(&at), None, &[]).await;
-    assert_eq!((s, code_of(&v)), (StatusCode::UNAUTHORIZED, Some("step_up_required")));
+    exec(
+        e.pool(),
+        "UPDATE sessions SET last_strong_auth_at = now() - interval '1 hour'",
+    )
+    .await;
+    let (s, _, v) = e
+        .req(
+            "DELETE",
+            &format!("/api/v2/me/sessions/{other}"),
+            Some(&at),
+            None,
+            &[],
+        )
+        .await;
+    assert_eq!(
+        (s, code_of(&v)),
+        (StatusCode::UNAUTHORIZED, Some("step_up_required"))
+    );
     exec(e.pool(), "UPDATE sessions SET last_strong_auth_at = now()").await;
-    let (s, _, _) = e.req("DELETE", &format!("/api/v2/me/sessions/{other}"), Some(&at), None, &[]).await;
+    let (s, _, _) = e
+        .req(
+            "DELETE",
+            &format!("/api/v2/me/sessions/{other}"),
+            Some(&at),
+            None,
+            &[],
+        )
+        .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
     let (s, _, _) = e.refresh(&rt_of(&hb)).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     // Current session: logout semantics, cookie cleared, no step-up needed.
-    exec(e.pool(), "UPDATE sessions SET last_strong_auth_at = now() - interval '1 hour'").await;
+    exec(
+        e.pool(),
+        "UPDATE sessions SET last_strong_auth_at = now() - interval '1 hour'",
+    )
+    .await;
     let mine = a["session_id"].as_str().unwrap().to_owned();
-    let (s, h, _) = e.req("DELETE", &format!("/api/v2/me/sessions/{mine}"), Some(&at), None, &[]).await;
+    let (s, h, _) = e
+        .req(
+            "DELETE",
+            &format!("/api/v2/me/sessions/{mine}"),
+            Some(&at),
+            None,
+            &[],
+        )
+        .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
-    assert!(h.get(header::SET_COOKIE).unwrap().to_str().unwrap().contains("Max-Age=0"));
+    assert!(
+        h.get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0")
+    );
     let (s, _, _) = e.req("GET", "/api/v2/me", Some(&at), None, &[]).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     e.t.cleanup().await;
@@ -1108,7 +1532,12 @@ async fn rate_limits_thresholds_identical_for_unknown_accounts() {
     let Some(e) = env().await else { return };
     let t = alice(&e, "pw").await;
     let ts = t.as_uuid().to_string();
-    let limits = RateLimits { source: 1000, account: 3, tenant: 100_000, node_count: 1 };
+    let limits = RateLimits {
+        source: 1000,
+        account: 3,
+        tenant: 100_000,
+        node_count: 1,
+    };
     let e = e.with(SessionPolicy::default(), RateLimiter::local_only(limits));
     let start = |login: &str| {
         let c = ClientLogin::<Suite>::start(&mut rand_core_06::OsRng, b"pw").unwrap();
@@ -1117,10 +1546,14 @@ async fn rate_limits_thresholds_identical_for_unknown_accounts() {
     let mut over = vec![];
     for login in [LOGIN, "nobody@acme.test"] {
         for _ in 0..3 {
-            let (s, _, _) = e.post("/api/v2/auth/opaque/login/start", start(login)).await;
+            let (s, _, _) = e
+                .post("/api/v2/auth/opaque/login/start", start(login))
+                .await;
             assert_eq!(s, StatusCode::OK);
         }
-        let (s, h, v) = e.post("/api/v2/auth/opaque/login/start", start(login)).await;
+        let (s, h, v) = e
+            .post("/api/v2/auth/opaque/login/start", start(login))
+            .await;
         assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
         assert!(h.get(header::RETRY_AFTER).is_some());
         assert!(v["retry_after_ms"].as_u64().unwrap() <= 60_000);
@@ -1132,26 +1565,65 @@ async fn rate_limits_thresholds_identical_for_unknown_accounts() {
     assert_eq!(over[0]["code"], "rate_limited");
     // Recovery is limited per account too.
     for _ in 0..3 {
-        let (s, _, _) = e.post("/api/v2/auth/recovery/start", json!({"tenant": ts, "login": LOGIN, "method": "email"})).await;
+        let (s, _, _) = e
+            .post(
+                "/api/v2/auth/recovery/start",
+                json!({"tenant": ts, "login": LOGIN, "method": "email"}),
+            )
+            .await;
         assert_eq!(s, StatusCode::ACCEPTED);
     }
-    let (s, _, _) = e.post("/api/v2/auth/recovery/start", json!({"tenant": ts, "login": LOGIN, "method": "email"})).await;
+    let (s, _, _) = e
+        .post(
+            "/api/v2/auth/recovery/start",
+            json!({"tenant": ts, "login": LOGIN, "method": "email"}),
+        )
+        .await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
     // Per source.
-    let src = RateLimits { source: 5, account: 100, tenant: 100_000, node_count: 1 };
+    let src = RateLimits {
+        source: 5,
+        account: 100,
+        tenant: 100_000,
+        node_count: 1,
+    };
     let e = e.with(SessionPolicy::default(), RateLimiter::local_only(src));
     for i in 0..5 {
-        let (s, _, _) = e.post("/api/v2/auth/opaque/login/start", start(&format!("u{i}@acme.test"))).await;
+        let (s, _, _) = e
+            .post(
+                "/api/v2/auth/opaque/login/start",
+                start(&format!("u{i}@acme.test")),
+            )
+            .await;
         assert_eq!(s, StatusCode::OK);
     }
-    let (s, _, _) = e.post("/api/v2/auth/webauthn/login/start", json!({"tenant": ts})).await;
-    assert_eq!(s, StatusCode::OK, "other endpoint class has its own source bucket");
-    let (s, _, _) = e.post("/api/v2/auth/opaque/login/start", start("u9@acme.test")).await;
+    let (s, _, _) = e
+        .post("/api/v2/auth/webauthn/login/start", json!({"tenant": ts}))
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "other endpoint class has its own source bucket"
+    );
+    let (s, _, _) = e
+        .post("/api/v2/auth/opaque/login/start", start("u9@acme.test"))
+        .await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
 
     // Valkey-backed counters (shared across nodes), and the fallback when Valkey is down.
-    let lim = RateLimits { source: 1000, account: 4, tenant: 100_000, node_count: 2 };
-    let key = |acct: &str| vec![Key::new(Dimension::Account, "test", &[ts.as_bytes(), acct.as_bytes(), &rand16()])];
+    let lim = RateLimits {
+        source: 1000,
+        account: 4,
+        tenant: 100_000,
+        node_count: 2,
+    };
+    let key = |acct: &str| {
+        vec![Key::new(
+            Dimension::Account,
+            "test",
+            &[ts.as_bytes(), acct.as_bytes(), &rand16()],
+        )]
+    };
     if let Ok(url) = std::env::var("CS_TEST_VALKEY_URL") {
         let a = RateLimiter::new(lim, Some(&url)).unwrap();
         let b = RateLimiter::new(lim, Some(&url)).unwrap();
@@ -1160,7 +1632,10 @@ async fn rate_limits_thresholds_identical_for_unknown_accounts() {
         assert_eq!(b.check(&k).await.unwrap(), Backend::Valkey);
         a.check(&k).await.unwrap();
         b.check(&k).await.unwrap();
-        assert!(a.check(&k).await.is_err(), "the limit is shared between nodes");
+        assert!(
+            a.check(&k).await.is_err(),
+            "the limit is shared between nodes"
+        );
     }
     let down = RateLimiter::new(lim, Some("redis://127.0.0.1:1")).unwrap();
     let k = key("y");
@@ -1177,7 +1652,10 @@ async fn dpop_first_party_required_policy() {
     let t = alice(&e, "pw").await;
     let ts = t.as_uuid().to_string();
     let (_, h, _) = login(&e, &ts, LOGIN, "pw").await;
-    let policy = SessionPolicy { dpop_required: true, ..SessionPolicy::default() };
+    let policy = SessionPolicy {
+        dpop_required: true,
+        ..SessionPolicy::default()
+    };
     let e = e.with(policy, RateLimiter::local_only(generous()));
     let (s, _, v) = login(&e, &ts, LOGIN, "pw").await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "{v}");
@@ -1185,9 +1663,14 @@ async fn dpop_first_party_required_policy() {
     let (s, _, _) = e.refresh(&rt_of(&h)).await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     // Passwordless and MFA completion follow the same rule.
-    let (_, _, st) = e.post("/api/v2/auth/webauthn/login/start", json!({"tenant": ts})).await;
+    let (_, _, st) = e
+        .post("/api/v2/auth/webauthn/login/start", json!({"tenant": ts}))
+        .await;
     let (s, _, _) = e
-        .post("/api/v2/auth/webauthn/login/finish", json!({"login_txn": st["login_txn"], "credential": {}}))
+        .post(
+            "/api/v2/auth/webauthn/login/finish",
+            json!({"login_txn": st["login_txn"], "credential": {}}),
+        )
         .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED);
     e.t.cleanup().await;
