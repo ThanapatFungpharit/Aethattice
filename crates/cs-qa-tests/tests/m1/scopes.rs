@@ -26,6 +26,27 @@ pub const AUTHED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/v2/me/recovery-requests/{id}/approve"),
 ];
 
+/// A request for route `(m, p)` with `{id}` = `id` and a well-formed body, so a body-parse
+/// rejection cannot mask an authentication or scope check.
+pub fn route_req(m: &str, p: &str, id: &str) -> Req {
+    let path = p.replace("{id}", id);
+    let mut r = Req::new(m, &path);
+    if m == "POST" {
+        let txn = format!("rt1.{}.{}", b64(&rand_bytes::<16>()), b64(&rand_bytes::<32>()));
+        let msg = b64(&rand_bytes::<32>());
+        let body = match p {
+            "/api/v2/auth/opaque/reauth/start" => json!({"credential_request": msg}),
+            "/api/v2/auth/opaque/reauth/finish" => json!({"reauth_txn": txn, "credential_finalization": msg}),
+            "/api/v2/auth/opaque/register/start" => json!({"purpose": "password_change", "registration_request": msg}),
+            "/api/v2/auth/opaque/register/finish" => json!({"registration_txn": txn, "registration_upload": msg}),
+            "/api/v2/auth/webauthn/assert/finish" => json!({"assert_txn": txn, "credential": {"id": msg, "rawId": msg, "type": "public-key", "response": {"authenticatorData": msg, "clientDataJSON": msg, "signature": msg}, "clientExtensionResults": {}}}),
+            _ => json!({}),
+        };
+        r = r.json(body);
+    }
+    r
+}
+
 fn is_step_up(r: &Resp) -> bool {
     r.status == 401 && r.err_codes().iter().any(|c| c == "step_up_required")
 }
@@ -158,25 +179,10 @@ async fn enrolment_only_scope_on_every_route() {
         if allowed.contains(&(*m, *p)) {
             continue;
         }
-        let path = p.replace("{id}", &fake);
-        let mut r = Req::new(m, &path);
-        if *m == "POST" {
-            // Well-formed bodies, so a body-parse rejection cannot mask the scope check.
-            let txn = format!("rt1.{}.{}", b64(&rand_bytes::<16>()), b64(&rand_bytes::<32>()));
-            let msg = b64(&rand_bytes::<32>());
-            let body = match *p {
-                "/api/v2/auth/opaque/reauth/start" => json!({"credential_request": msg}),
-                "/api/v2/auth/opaque/reauth/finish" => json!({"reauth_txn": txn, "credential_finalization": msg}),
-                "/api/v2/auth/opaque/register/start" => json!({"purpose": "password_change", "registration_request": msg}),
-                "/api/v2/auth/opaque/register/finish" => json!({"registration_txn": txn, "registration_upload": msg}),
-                "/api/v2/auth/webauthn/assert/finish" => json!({"assert_txn": txn, "credential": {"id": msg, "rawId": msg, "type": "public-key", "response": {"authenticatorData": msg, "clientDataJSON": msg, "signature": msg}, "clientExtensionResults": {}}}),
-                _ => json!({}),
-            };
-            r = r.json(body);
-        }
+        let r = route_req(m, p, &fake);
         let resp = e.call(s.req(r)).await;
         if !(resp.status == 401 && resp.err_codes().iter().any(|c| c == "mfa_required")) {
-            leaks.push(format!("{m} {path}: {} {}", resp.status, resp.body));
+            leaks.push(format!("{m} {p}: {} {}", resp.status, resp.body));
         }
     }
     assert!(leaks.is_empty(), "enrolment-only token accepted outside its routes:\n{}", leaks.join("\n"));

@@ -272,3 +272,39 @@ async fn rt1_tenant_segment_swap_and_malformed_tokens() {
     e.call(a.refresh_req(&k())).await.expect(200);
     e.finish().await;
 }
+
+/// F-3 (rev 14): a revoked session must not keep working through its still-unexpired access
+/// token on ANY authenticated route (spec §5.5 "revokes the whole session"). The routes are
+/// `scopes::AUTHED_ROUTES`, the complete list of token-authenticated M1 routes (axum offers no
+/// public route enumeration; the list is checked against `cs_identity::http::routes` by
+/// review in docs/qa/M1-gate.md). Covered revocations: logout and [R5]-style reuse.
+#[tokio::test]
+async fn revoked_session_access_token_refused_on_every_route() {
+    let Some(e) = Env::default().await else { return };
+    let mut accepted = Vec::new();
+    for how in ["logout", "refresh reuse"] {
+        let (_, s) = sess(&e).await;
+        match how {
+            "logout" => {
+                e.call(s.req(crate::fx::Req::post("/api/v2/auth/logout"))).await.expect(204);
+            }
+            _ => {
+                e.call(s.refresh_req(&k())).await.expect(200);
+                e.call(s.refresh_req(&k())).await.expect_unauth();
+            }
+        }
+        let fake = uuid::Uuid::now_v7().to_string();
+        for (m, p) in crate::scopes::AUTHED_ROUTES {
+            let r = e.call(s.req(crate::scopes::route_req(m, p, &fake))).await;
+            if r.status != 401 || r.code() != "unauthenticated" {
+                accepted.push(format!("after {how}: {m} {p}: {} {}", r.status, r.code()));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "access token of a revoked session not refused with 401:\n{}",
+        accepted.join("\n")
+    );
+    e.finish().await;
+}
