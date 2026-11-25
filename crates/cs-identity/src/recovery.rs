@@ -581,9 +581,14 @@ impl AuthService {
                 let link = self
                     .create_email_request(tenant_id, user, ua, "email")
                     .await?;
-                if let Err(e) = self.notifier.recovery_link(&email, &link).await {
-                    tracing::warn!(error = %e.code(), "recovery link delivery failed");
-                }
+                // Rev 13 (QA F-2): never await the Notifier on the request path, so the 202
+                // takes the same time for known and unknown accounts whatever delivery costs.
+                let notifier = self.notifier.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = notifier.recovery_link(&email, &link).await {
+                        tracing::warn!(error = %e.code(), "recovery link hand-off failed");
+                    }
+                });
                 Ok(RecoveryStart::Pending { recovery_txn: None })
             }
             _ => {

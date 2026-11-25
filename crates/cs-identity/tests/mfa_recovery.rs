@@ -1192,6 +1192,49 @@ async fn recovery_by_code_and_r5_completion() {
     e.t.cleanup().await;
 }
 
+/// Rev 14 (QA F-3): every authenticated route checks the session at `sgen`, not only the
+/// JWT. A revoked session, or one whose generation moved on, is refused on `/me` and every
+/// `/me/*` route while its access token is still unexpired.
+#[tokio::test]
+async fn revoked_session_access_token_refused_on_every_me_route() {
+    let Some(e) = env().await else { return };
+    let t = alice(&e, "pw").await;
+    let ts = t.as_uuid().to_string();
+    let routes = [
+        "/api/v2/me",
+        "/api/v2/me/sessions",
+        "/api/v2/me/passkeys",
+        "/api/v2/me/recovery-codes",
+        "/api/v2/me/recovery-requests",
+    ];
+    let (_, _, v) = login(&e, &ts, LOGIN, "pw").await;
+    let at = v["access_token"].as_str().unwrap().to_owned();
+    for r in routes {
+        let (s, _, b) = e.req("GET", r, Some(&at), None, &[]).await;
+        assert_eq!(s, StatusCode::OK, "{r}: {b}");
+    }
+    // Generation moved on (refresh rotation): the old token is refused everywhere.
+    exec(e.pool(), "UPDATE sessions SET generation = generation + 1").await;
+    for r in routes {
+        let (s, _, b) = e.req("GET", r, Some(&at), None, &[]).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{r} after generation bump: {b}");
+        assert_eq!(b["code"], "unauthenticated");
+    }
+    // Revoked session.
+    let (_, _, v) = login(&e, &ts, LOGIN, "pw").await;
+    let at = v["access_token"].as_str().unwrap().to_owned();
+    exec(e.pool(), "UPDATE sessions SET state = 'revoked'").await;
+    for r in routes {
+        let (s, _, b) = e.req("GET", r, Some(&at), None, &[]).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{r} after revocation: {b}");
+    }
+    let (s, _, _) = e
+        .req("POST", "/api/v2/me/recovery-codes", Some(&at), None, &[])
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    e.t.cleanup().await;
+}
+
 /// Rev 13: the email recovery link goes through the SMTP relay. `recovery/start` answers 202
 /// without waiting for SMTP (the fake server greets only after 3 s), and the delivered link
 /// works with `recovery/status`.
@@ -1265,7 +1308,22 @@ async fn recovery_by_email_and_device_approval() {
     assert_eq!((s, s2), (StatusCode::ACCEPTED, StatusCode::ACCEPTED));
     assert_eq!(a, json!({"state": "pending"}));
     assert_eq!(a, b);
-    let links = e.mail.0.lock().unwrap().clone();
+    // The hand-off runs off the request path (rev 13, QA F-2): wait for it.
+    let mut links = Vec::new();
+    for _ in 0..100 {
+        links = e.mail.0.lock().unwrap().clone();
+        if !links.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Let a (wrong) second link for the unknown account surface too.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let links = if links.is_empty() {
+        links
+    } else {
+        e.mail.0.lock().unwrap().clone()
+    };
     assert_eq!(links.len(), 1, "only the real account gets a link");
     assert_eq!(links[0].0, "alice@mail.test");
     let link = links[0].1.clone();

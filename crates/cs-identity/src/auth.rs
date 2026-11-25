@@ -498,7 +498,7 @@ impl AuthService {
             keys: OnceCell::new(),
             policy,
             last_sweep: AtomicI64::new(0),
-            replay: ReplayStore::table_only(pool_for_replay),
+            replay: ReplayStore::new(pool_for_replay),
             webauthn: crate::webauthn::relying_party(deployment_domain),
             limiter: Arc::new(RateLimiter::local_only(RateLimits::default())),
             notifier: Arc::new(crate::notify::Discard),
@@ -516,13 +516,6 @@ impl AuthService {
     pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
         self.notifier = notifier;
         self
-    }
-
-    /// Use Valkey (`[valkey] url`) as the primary DPoP replay store `[R6]`; without it the
-    /// `dpop_jti` table is used alone.
-    pub fn with_valkey(mut self, url: &str) -> AuthResult<Self> {
-        self.replay = ReplayStore::new(self.pool.clone(), Some(url))?;
-        Ok(self)
     }
 
     /// Replace the replay store (tests: unreachable stores).
@@ -559,27 +552,15 @@ impl AuthService {
 
     /// Authenticate a request by its access token (contract rev 8): a `cnf`-bound token must
     /// come as `Authorization: DPoP <token>` with a fresh proof of the bound key carrying
-    /// `ath`; an unbound token comes as `Bearer`. Anything else is `unauthenticated`.
+    /// `ath`; an unbound token comes as `Bearer`. Anything else is `unauthenticated`. The
+    /// token's session must be active at `sgen` (rev 14).
     pub async fn authorize(
         &self,
         authorization: Option<&str>,
         ctx: &RequestCtx<'_>,
     ) -> AuthResult<AccessClaims> {
-        let claims = self.authorize_token(authorization, ctx).await?;
-        // rev 11: an enrolment-only session may call only the enrolment routes.
-        if claims.scp.as_deref() == Some(session::SCOPE_MFA_ENROLMENT)
-            && !enrolment_allowed(ctx.method, ctx.path)
-        {
-            return Err(mfa_required_error());
-        }
-        Ok(claims)
-    }
-
-    async fn authorize_token(
-        &self,
-        authorization: Option<&str>,
-        ctx: &RequestCtx<'_>,
-    ) -> AuthResult<AccessClaims> {
+        // Rev 14 (QA F-3): the one authenticated-principal check used by every authenticated
+        // route, in this order: JWT → session active at `sgen` → scope → DPoP binding.
         let (scheme, token) = authorization
             .and_then(|v| v.split_once(' '))
             .map(|(s, t)| (s, t.trim()))
@@ -589,11 +570,57 @@ impl AuthService {
                 )
             })?;
         let claims = self.tokens.verify(token, unix_now()).await?;
+        self.require_active_session(&claims).await?;
+        // rev 11: an enrolment-only session may call only the enrolment routes.
+        if claims.scp.as_deref() == Some(session::SCOPE_MFA_ENROLMENT)
+            && !enrolment_allowed(ctx.method, ctx.path)
+        {
+            return Err(mfa_required_error());
+        }
+        self.require_binding(scheme, token, &claims, ctx).await?;
+        Ok(claims)
+    }
+
+    /// Rev 14: the token's session must exist, be `active` and be at generation `sgen`
+    /// (revocation and refresh rotation take effect before the token expires).
+    async fn require_active_session(&self, claims: &AccessClaims) -> AuthResult<()> {
+        let (tenant, user, session) = Self::subject(claims)?;
+        let sgen = claims.sgen;
+        let found: Option<i32> = self
+            .pool
+            .read_snapshot(move |tx| {
+                Box::pin(async move {
+                    Ok(sqlx::query_scalar(
+                        "SELECT 1 FROM sessions \
+                         WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3 \
+                           AND state = 'active' AND generation = $4",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(session.as_uuid())
+                    .bind(user.as_uuid())
+                    .bind(sgen)
+                    .fetch_optional(tx.conn())
+                    .await?)
+                })
+            })
+            .await?;
+        found.map(|_| ()).ok_or_else(unauthenticated)
+    }
+
+    /// Token binding: `Bearer` only for unbound tokens; `DPoP` needs a proof for the bound key,
+    /// recorded once in `dpop_jti` (`[R6]`, rev 14).
+    async fn require_binding(
+        &self,
+        scheme: &str,
+        token: &str,
+        claims: &AccessClaims,
+        ctx: &RequestCtx<'_>,
+    ) -> AuthResult<()> {
         if scheme.eq_ignore_ascii_case("bearer") {
             return if claims.cnf.is_some() {
                 Err(unauthenticated())
             } else {
-                Ok(claims)
+                Ok(())
             };
         }
         if !scheme.eq_ignore_ascii_case("dpop") {
@@ -611,9 +638,8 @@ impl AuthService {
         if v.jkt_b64() != cnf.jkt {
             return Err(unauthenticated());
         }
-        let (tenant, _, _) = Self::subject(&claims)?;
-        self.replay.require_fresh(tenant, &v).await?;
-        Ok(claims)
+        let (tenant, _, _) = Self::subject(claims)?;
+        self.replay.require_fresh(tenant, &v).await
     }
 
     /// Step-up guard (contract §2.3 `[R2]`, spec §5.5): the session of `claims` must be

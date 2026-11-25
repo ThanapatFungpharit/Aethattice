@@ -339,18 +339,8 @@ async fn serve(path: &Path, dev: bool) -> Result<(), String> {
                 &api.deployment_domain,
                 cs_identity::session::SessionPolicy::from_policy(&cfg.policy),
             );
-            // DPoP replay store (M1 contract §3 [R6]): Valkey first, dpop_jti table fallback.
-            let auth = match &cfg.valkey {
-                Some(v) => auth
-                    .with_valkey(v.url.expose_secret())
-                    .map_err(|e| format!("cs: invalid valkey.url: {e}"))?,
-                None => {
-                    tracing::warn!(
-                        "[valkey] not configured: the DPoP replay check runs on the database (dpop_jti) only"
-                    );
-                    auth
-                }
-            };
+            // DPoP replay store (M1 contract §3 [R6], rev 14): dpop_jti only; Valkey serves
+            // rate limits alone.
             // Rate limits (M1 contract §5, rev 11): Valkey counters, local buckets at limit/N
             // ([cluster] node_count) when Valkey is unavailable; never unlimited.
             let limits = cs_identity::ratelimit::RateLimits::from_policy(

@@ -444,8 +444,8 @@ pub struct KmsConfig {
     pub keystore_path: Option<PathBuf>,
 }
 
-/// Valkey connection (M1 contract §3 `[R6]`: shared DPoP replay store). Optional: when absent,
-/// replay checks use the identity `dpop_jti` table only.
+/// Valkey connection (M1 contract §5: rate-limit counters; rev 14 took it off the DPoP replay
+/// path, which is `dpop_jti` only). Optional: without it rate limits use local buckets.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValkeyConfig {

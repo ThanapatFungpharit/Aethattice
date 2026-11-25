@@ -1413,7 +1413,7 @@ async fn dpop_bound_access_token_proof_checks() {
         me_dpop(&e, &at, key.sign_raw(&key.header(), &c)).await,
         StatusCode::OK
     );
-    // Replay of the same proof (shared dpop_jti table here: Valkey not configured).
+    // Replay of the same proof (the shared dpop_jti table, rev 14).
     let p = good();
     assert_eq!(me_dpop(&e, &at, p.clone()).await, StatusCode::OK);
     assert_eq!(me_dpop(&e, &at, p).await, StatusCode::UNAUTHORIZED);
@@ -1702,19 +1702,6 @@ async fn dpop_bound_refresh_requires_the_same_key() {
     e.cleanup().await;
 }
 
-fn valkey_url() -> Option<String> {
-    match std::env::var("CS_TEST_VALKEY_URL") {
-        Ok(u) if !u.is_empty() => Some(u),
-        _ => {
-            assert!(
-                std::env::var("CS_REQUIRE_DB").as_deref() != Ok("1"),
-                "CS_REQUIRE_DB=1 but CS_TEST_VALKEY_URL is not set"
-            );
-            None
-        }
-    }
-}
-
 fn dead_pool() -> DomainPool {
     let cfg = cs_common::config::DomainConfig {
         url: cs_common::Secret::new("postgres://yugabyte@127.0.0.1:1/cs_identity".to_owned()),
@@ -1736,81 +1723,17 @@ fn dead_pool() -> DomainPool {
     .unwrap()
 }
 
-/// `[R6]`: Valkey SET NX first; Valkey down → the shared dpop_jti table; both down → 503.
+/// `[R6]` rev 14: `dpop_jti` is the only replay record, shared by every node; table
+/// unreachable → 503 (fail closed).
 #[tokio::test]
-async fn dpop_replay_store_valkey_table_fallback_and_fail_closed() {
-    use cs_identity::dpop::{ReplayBackend, ReplayStore, ReplayVerdict, verify_proof};
-    let Some(e) = env().await else { return };
+async fn dpop_replay_store_dpop_jti_only_and_fail_closed() {
     let tenant = TenantId::generate().unwrap();
-    let key = PKey::es256();
-    let path = "/api/v2/me";
-    let proof = || {
-        verify_proof(
-            &key.proof("GET", &htu(path), None),
-            "GET",
-            &htu(path),
-            None,
-            now(),
-        )
-        .unwrap()
-    };
-
-    // Valkey up.
-    if let Some(url) = valkey_url() {
-        let store = ReplayStore::new(e.pool().clone(), Some(&url)).unwrap();
-        let p = proof();
-        assert_eq!(
-            store.check(tenant, &p).await.unwrap(),
-            (ReplayVerdict::Fresh, ReplayBackend::Valkey)
-        );
-        assert_eq!(
-            store.check(tenant, &p).await.unwrap(),
-            (ReplayVerdict::Replayed, ReplayBackend::Valkey)
-        );
-        // Shared across nodes: a second store (another node) sees the same entry.
-        let other = ReplayStore::new(e.pool().clone(), Some(&url)).unwrap();
-        assert_eq!(
-            other.check(tenant, &p).await.unwrap().0,
-            ReplayVerdict::Replayed
-        );
-        // Same jti under another tenant is a different entry.
-        let t2 = TenantId::generate().unwrap();
-        assert_eq!(other.check(t2, &p).await.unwrap().0, ReplayVerdict::Fresh);
-        // Through HTTP with Valkey configured: replayed proof refused.
-        let auth = Arc::new(
-            AuthService::new(
-                e.pool().clone(),
-                e.kms.clone(),
-                DOMAIN,
-                SessionPolicy::default(),
-            )
-            .with_valkey(&url)
-            .unwrap(),
-        );
-        let e2 = env_with(e, auth);
-        let t = alice(&e2, "pw").await;
-        let (v, _, _) = login_with(&e2, t, "alice@acme.test", "pw", Some(&key))
-            .await
-            .unwrap();
-        let at = v["access_token"].as_str().unwrap();
-        let pr = key.proof("GET", &htu(path), Some(at));
-        assert_eq!(me_dpop(&e2, at, pr.clone()).await, StatusCode::OK);
-        assert_eq!(me_dpop(&e2, at, pr).await, StatusCode::UNAUTHORIZED);
-        // Valkey answered: nothing went to the table.
-        assert_eq!(
-            scalar_i64(e2.pool(), "SELECT count(*) FROM dpop_jti").await,
-            0
-        );
-        e2.cleanup().await;
-        return dpop_fallback_part(tenant).await;
-    }
-    e.cleanup().await;
     dpop_fallback_part(tenant).await;
 }
 
-/// Second half of the replay-store test (fresh database): table fallback and fail-closed.
+/// Replay store on `dpop_jti`: shared across nodes, purged by the sweep, fail-closed.
 async fn dpop_fallback_part(tenant: TenantId) {
-    use cs_identity::dpop::{ReplayBackend, ReplayStore, ReplayVerdict, verify_proof};
+    use cs_identity::dpop::{ReplayStore, ReplayVerdict, verify_proof};
     let Some(e) = env().await else { return };
     let key = PKey::es256();
     let path = "/api/v2/me";
@@ -1824,17 +1747,27 @@ async fn dpop_fallback_part(tenant: TenantId) {
         )
         .unwrap()
     };
-    // Valkey down (nothing listens on port 1) → dpop_jti table.
-    let store = ReplayStore::new(e.pool().clone(), Some("redis://127.0.0.1:1")).unwrap();
+    let store = ReplayStore::new(e.pool().clone());
     let p = proof();
+    assert_eq!(store.check(tenant, &p).await.unwrap(), ReplayVerdict::Fresh);
     assert_eq!(
         store.check(tenant, &p).await.unwrap(),
-        (ReplayVerdict::Fresh, ReplayBackend::Table)
+        ReplayVerdict::Replayed
     );
+    // Shared across nodes: another node's store sees the same record.
+    let other = ReplayStore::new(e.pool().clone());
     assert_eq!(
-        store.check(tenant, &p).await.unwrap(),
-        (ReplayVerdict::Replayed, ReplayBackend::Table)
+        other.check(tenant, &p).await.unwrap(),
+        ReplayVerdict::Replayed
     );
+    // Same jti under another tenant is a different entry.
+    let t2 = TenantId::generate().unwrap();
+    assert_eq!(other.check(t2, &p).await.unwrap(), ReplayVerdict::Fresh);
+    exec(
+        e.pool(),
+        "DELETE FROM dpop_jti WHERE tenant_id <> (SELECT min(tenant_id) FROM dpop_jti)",
+    )
+    .await;
     // Rows carry their expiry bucket and are purged by the bounded sweep once expired.
     assert_eq!(
         scalar_i64(
@@ -1854,8 +1787,8 @@ async fn dpop_fallback_part(tenant: TenantId) {
         cs_identity::dpop::sweep_expired_jti(e.pool(), 500, 20).await,
         1
     );
-    // Valkey down and the table unreachable → 503 unavailable (fail closed).
-    let dead = ReplayStore::new(dead_pool(), Some("redis://127.0.0.1:1")).unwrap();
+    // Table unreachable → 503 unavailable (fail closed).
+    let dead = ReplayStore::new(dead_pool());
     let err = dead.check(tenant, &proof()).await.unwrap_err();
     assert_eq!(err.status(), 503);
     // Through HTTP: a DPoP-bound request fails closed with 503.
@@ -1866,9 +1799,7 @@ async fn dpop_fallback_part(tenant: TenantId) {
             DOMAIN,
             SessionPolicy::default(),
         )
-        .with_replay_store(
-            ReplayStore::new(e.pool().clone(), Some("redis://127.0.0.1:1")).unwrap(),
-        ),
+        .with_replay_store(ReplayStore::new(e.pool().clone())),
     );
     let e2 = env_with(e, auth);
     let t = alice(&e2, "pw").await;
@@ -1886,7 +1817,7 @@ async fn dpop_fallback_part(tenant: TenantId) {
             DOMAIN,
             SessionPolicy::default(),
         )
-        .with_replay_store(ReplayStore::new(dead_pool(), Some("redis://127.0.0.1:1")).unwrap()),
+        .with_replay_store(ReplayStore::new(dead_pool())),
     );
     let e3 = env_with(e2, down);
     let (s, h, v) = with_at(
