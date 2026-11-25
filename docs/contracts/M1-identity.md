@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 11)
+# M1 Contracts: Identity (FROZEN rev 12)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -212,6 +212,12 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
     - `rate_limit_account_per_min` 10 (3–100);
     - `rate_limit_tenant_per_min` 600 (60–100000), all over fixed 60 s windows.
     The rate-limit fallback is local buckets at limit/N per §5, using `[cluster] node_count` (≥ 1, checked by `check-config`).
+- (rev 12) **Implementation notes accepted from backend slice 4:**
+  - **WebAuthn ceremonies:** their state is kept in a separate `auth_ceremonies` table (5 min, single use, bound like `auth_txns`). Widening the `auth_txns` CHECK constraints would need a contract migration.
+  - **`cs admin recovery start`:** prints the recovery link token once, like `setup-link`, because the CLI has no `Notifier`. The operator delivers it out of band.
+  - **`me/recovery-requests`:** lists only `email` and `device_approval` requests. Recovery-code requests are granted immediately and never pending.
+  - **Polling a granted request:** each `status` poll issues a fresh grant and invalidates the previous one, but the grant keeps the request's original `grant_expires_at`. Polling never extends the 15 min.
+  - **Still to build in M1:** the SMTP relay `Notifier`, and wiring the dev log sink into `cs serve --dev` and `check-config` ([R7]).
 - (rev 10) **Timestamps and recovery requests.**
   - Every timestamp field in M1 JSON bodies is an RFC 3339 UTC string, for example `created_at`, `last_seen_at`, `last_used_at` and `available_at`. JWT claims and the `auth_time` mirrored from them stay in unix seconds (RFC 7519).
   - `GET /api/v2/me/recovery-requests` → `{items: [{id, method: "email"|"device_approval", state: "pending"|"granted", created_at, available_at, requester_user_agent}]}`. It is bounded and not paginated. `requester_user_agent` may be null; it helps the user tell whether a request is their own.
@@ -302,3 +308,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-26 rev 10 addendum: RFC 3339 timestamps in bodies; `me/recovery-requests` item shape; `status` body and response.
 - 2026-11-26 rev 11 (TL, backend proposals): recovery-code sets, user email, session and passkey columns, MFA definition and the enrolment-only session, `mfa_required` response and 5 min `auth_txn`, new policy keys (ranges pending owner approval, C13).
 - 2026-11-26 rev 11 addendum: `reregister` on MFA completion, and bounded client-side retention of the password bytes.
+- 2026-11-26 rev 12 (TL): implementation notes from backend slice 4 (`auth_ceremonies` table, CLI recovery token, recovery-request listing, grant rotation on polling).
