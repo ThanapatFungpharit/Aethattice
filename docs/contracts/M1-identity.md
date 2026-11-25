@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 12)
+# M1 Contracts: Identity (FROZEN rev 13)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -212,6 +212,18 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
     - `rate_limit_account_per_min` 10 (3–100);
     - `rate_limit_tenant_per_min` 600 (60–100000), all over fixed 60 s windows.
     The rate-limit fallback is local buckets at limit/N per §5, using `[cluster] node_count` (≥ 1, checked by `check-config`).
+- (rev 13) **Recovery email delivery in M1 is best effort and not durable.**
+  - The `rt1` link is a bearer secret, so it never goes into the outbox or any other durable queue.
+  - After the request commits, the handler hands the link to a **bounded in-memory queue** on that node and returns `202` immediately. Response timing therefore never depends on SMTP.
+  - A background worker sends through the SMTP relay (`lettre`), with at most 5 attempts and exponential backoff capped at 30 s. It logs only error class and attempt number, never the token or the address.
+  - If the queue is full, the link is dropped and counted in a metric, and the response is still `202`. If the node crashes before sending, the link is lost and the user starts again. No delivery guarantee is claimed.
+  - Device notifications about completion stay outbox events, delivered in M4.
+  - **M4 follow-up:** durable delivery. The outbox carries only `request_id`, and the sender mints the link token at send time, storing its hash by CAS.
+  - **Config:** `[notifier] kind = "smtp" | "dev_log"`.
+    - `[notifier.smtp]` takes `host`, `port`, `tls = "tls" | "starttls" | "none"` (`none` only for loopback hosts), optional `username` and `password` as Secrets (both or neither), and `from`.
+    - `dev_log` requires `--dev` on both `cs serve` and `cs check-config`.
+    - Without a notifier, nothing is sent, and `cs serve` logs a startup warning that email recovery cannot deliver links.
+  - Link format: `https://<deployment domain>/#/recover/<token>`.
 - (rev 12) **Implementation notes accepted from backend slice 4:**
   - **WebAuthn ceremonies:** their state is kept in a separate `auth_ceremonies` table (5 min, single use, bound like `auth_txns`). Widening the `auth_txns` CHECK constraints would need a contract migration.
   - **`cs admin recovery start`:** prints the recovery link token once, like `setup-link`, because the CLI has no `Notifier`. The operator delivers it out of band.
@@ -309,3 +321,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-26 rev 11 (TL, backend proposals): recovery-code sets, user email, session and passkey columns, MFA definition and the enrolment-only session, `mfa_required` response and 5 min `auth_txn`, new policy keys (ranges pending owner approval, C13).
 - 2026-11-26 rev 11 addendum: `reregister` on MFA completion, and bounded client-side retention of the password bytes.
 - 2026-11-26 rev 12 (TL): implementation notes from backend slice 4 (`auth_ceremonies` table, CLI recovery token, recovery-request listing, grant rotation on polling).
+- 2026-11-26 rev 13 (TL, backend question): recovery email delivery is best effort through a bounded in-memory queue (no bearer secret in the outbox, no durability claim; durable delivery in M4); notifier config.
