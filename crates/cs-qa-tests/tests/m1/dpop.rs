@@ -52,8 +52,9 @@ async fn bound_token_proof_checks() {
     ];
     c["iat"] = json!(n - 61);
     cases.push(("stale iat (-61 s)", me_with(&at, "DPoP", Some(key.sign_raw(&key.header(), &c)))));
-    c["iat"] = json!(n + 61);
-    cases.push(("future iat (+61 s)", me_with(&at, "DPoP", Some(key.sign_raw(&key.header(), &c)))));
+    // +62 s: the request reaches the server within a second, so the skew stays > 60 s.
+    c["iat"] = json!(n + 62);
+    cases.push(("future iat (+62 s)", me_with(&at, "DPoP", Some(key.sign_raw(&key.header(), &c)))));
     let mut c2 = key.claims("GET", &u, Some(&at));
     c2.as_object_mut().unwrap().remove("jti");
     cases.push(("no jti", me_with(&at, "DPoP", Some(key.sign_raw(&key.header(), &c2)))));

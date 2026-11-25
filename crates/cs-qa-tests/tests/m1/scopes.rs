@@ -161,7 +161,18 @@ async fn enrolment_only_scope_on_every_route() {
         let path = p.replace("{id}", &fake);
         let mut r = Req::new(m, &path);
         if *m == "POST" {
-            r = r.json(json!({}));
+            // Well-formed bodies, so a body-parse rejection cannot mask the scope check.
+            let txn = format!("rt1.{}.{}", b64(&rand_bytes::<16>()), b64(&rand_bytes::<32>()));
+            let msg = b64(&rand_bytes::<32>());
+            let body = match *p {
+                "/api/v2/auth/opaque/reauth/start" => json!({"credential_request": msg}),
+                "/api/v2/auth/opaque/reauth/finish" => json!({"reauth_txn": txn, "credential_finalization": msg}),
+                "/api/v2/auth/opaque/register/start" => json!({"purpose": "password_change", "registration_request": msg}),
+                "/api/v2/auth/opaque/register/finish" => json!({"registration_txn": txn, "registration_upload": msg}),
+                "/api/v2/auth/webauthn/assert/finish" => json!({"assert_txn": txn, "credential": {"id": msg, "rawId": msg, "type": "public-key", "response": {"authenticatorData": msg, "clientDataJSON": msg, "signature": msg}, "clientExtensionResults": {}}}),
+                _ => json!({}),
+            };
+            r = r.json(body);
         }
         let resp = e.call(s.req(r)).await;
         if !(resp.status == 401 && resp.err_codes().iter().any(|c| c == "mfa_required")) {

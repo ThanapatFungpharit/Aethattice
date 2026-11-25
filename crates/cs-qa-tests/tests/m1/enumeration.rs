@@ -149,8 +149,9 @@ async fn recovery_start_indistinguishable() {
     assert_eq!(ok.body["state"], "granted");
     let wrong = codes[1][..9].to_owned() + &"A".repeat(20);
     let ut = uuid::Uuid::now_v7().to_string();
+    // A code is consumed only at [R5] completion (r5_completion_is_atomic covers the consumed
+    // code); starting again with it before completion is not a "used code".
     let fails = vec![
-        ("used code", e.call(start(ts.clone(), "rec", "recovery_code", Some(&codes[0]))).await),
         ("wrong secret", e.call(start(ts.clone(), "rec", "recovery_code", Some(&wrong))).await),
         ("unknown code id", e.call(start(ts.clone(), "rec", "recovery_code", Some("AAAAAAAA-AAAAAAAAAAAAAAAAAAAA"))).await),
         ("unknown account", e.call(start(ts.clone(), "ghost", "recovery_code", Some(&codes[1]))).await),
@@ -159,7 +160,7 @@ async fn recovery_start_indistinguishable() {
     ];
     for (n, r) in &fails {
         r.expect_unauth();
-        assert_eq!(shape(r), shape(&fails[0].1), "recovery_code {n} differs from 'used code'");
+        assert_eq!(shape(r), shape(&fails[0].1), "recovery_code {n} differs from 'wrong secret'");
     }
     let _ = noemail;
     for method in ["email", "device_approval"] {
@@ -299,5 +300,48 @@ async fn register_without_valid_grant() {
     e.register(&e.nodes[0], &link, "newbie", "pw-enum-7").await.expect(204);
     let used = e.register(&e.nodes[0], &link, "newbie", "pw-enum-8").await;
     assert_eq!(used.status, 403, "used setup link: {}", used.body);
+    e.finish().await;
+}
+
+/// rev 13: email recovery start answers 202 without waiting for delivery. With a notifier
+/// that takes 3 s per link, a known account answers as fast as an unknown one (no timing
+/// oracle), and the body is identical.
+#[tokio::test]
+async fn recovery_email_202_independent_of_delivery_time() {
+    let Some(e) = Env::new(Opts {
+        notify_delay_ms: 3000,
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let t = e.tenant().await;
+    let u = e.user(t, "mail", "pw-enum-9").await;
+    e.admin.set_email(t, u.id, "mail@qa.example", true).await.unwrap();
+    let mut known = Vec::new();
+    let mut unknown = Vec::new();
+    for i in 0..3 {
+        for (login, out) in [("mail", &mut known), ("ghost", &mut unknown)] {
+            let t0 = Instant::now();
+            let r = e
+                .call(Req::post("/api/v2/auth/recovery/start")
+                    .json(json!({"tenant": u.t(), "login": login, "method": "email"}))
+                    .from(&format!("203.0.113.{}", 100 + i)))
+                .await;
+            out.push((t0.elapsed().as_millis(), r.status, shape(&r)));
+        }
+    }
+    eprintln!(
+        "QA timing recovery/start email ms: known={:?} unknown={:?}",
+        known.iter().map(|k| k.0).collect::<Vec<_>>(),
+        unknown.iter().map(|k| k.0).collect::<Vec<_>>()
+    );
+    for (k, u) in known.iter().zip(unknown.iter()) {
+        assert_eq!(k.1, 202);
+        assert_eq!(u.1, 202);
+        assert_eq!(k.2, u.2, "body differs");
+        assert!(k.0 < 1500, "known account waited for delivery: {} ms (notifier takes 3000 ms)", k.0);
+    }
     e.finish().await;
 }

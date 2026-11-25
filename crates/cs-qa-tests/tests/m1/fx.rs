@@ -44,8 +44,10 @@ use tower::ServiceExt as _;
 
 use crate::support::db::TestDb;
 
-pub const DOMAIN: &str = "qa-m1.example";
-pub const ORIGIN: &str = "https://qa-m1.example";
+/// Same deployment domain as the M0 adapter (`contract::DEPLOYMENT_DOMAIN`), so proofs built
+/// here are valid against the `cs` binary started by the shared harness.
+pub const DOMAIN: &str = "qa.example";
+pub const ORIGIN: &str = "https://qa.example";
 pub const ID: DomainId = DomainId::Identity;
 
 pub fn htu(path: &str) -> String {
@@ -478,7 +480,7 @@ pub struct Outbox {
 }
 
 #[derive(Debug)]
-struct CapturingNotifier(Arc<Outbox>);
+struct CapturingNotifier(Arc<Outbox>, u64);
 
 #[async_trait::async_trait]
 impl cs_identity::notify::Notifier for CapturingNotifier {
@@ -488,6 +490,10 @@ impl cs_identity::notify::Notifier for CapturingNotifier {
         token: &Secret<String>,
     ) -> Result<(), cs_common::error::Error> {
         secret("recovery link", token.expose_secret());
+        if self.1 > 0 {
+            // A slow SMTP relay (rev 13: response timing must never depend on delivery).
+            tokio::time::sleep(Duration::from_millis(self.1)).await;
+        }
         self.0
             .links
             .lock()
@@ -521,6 +527,8 @@ pub struct Opts {
     pub nodes: Vec<Valkey>,
     /// Rate limits; `None` = generous local limits (rate limiting tested separately).
     pub limits: Option<(RateLimits, Valkey)>,
+    /// Delay of every recovery-link delivery (simulated slow SMTP relay).
+    pub notify_delay_ms: u64,
 }
 
 impl Default for Opts {
@@ -529,6 +537,7 @@ impl Default for Opts {
             policy: SessionPolicy::default(),
             nodes: vec![Valkey::Real],
             limits: None,
+            notify_delay_ms: 0,
         }
     }
 }
@@ -637,7 +646,7 @@ impl Env {
         };
         let mut auth = AuthService::new(pool.clone(), kms.clone(), DOMAIN, o.policy)
             .with_rate_limiter(limiter)
-            .with_notifier(Arc::new(CapturingNotifier(outbox.clone())));
+            .with_notifier(Arc::new(CapturingNotifier(outbox.clone(), o.notify_delay_ms)));
         auth = match v {
             Valkey::None => auth,
             Valkey::Real => auth.with_valkey(&valkey_url()).unwrap(),

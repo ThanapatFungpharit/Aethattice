@@ -147,7 +147,7 @@ async fn cs_binary_logs_contain_no_secrets() {
     let grant = g.body["grant"].as_str().unwrap().to_owned();
     let bad = r
         .call(Req::post("/api/v2/auth/recovery/start")
-            .json(json!({"tenant": t, "login": "logan", "method": "recovery_code", "code": code})))
+            .json(json!({"tenant": t, "login": "logan", "method": "recovery_code", "code": format!("{}{}", &code[..9], "A".repeat(20))})))
         .await;
     bad.expect_unauth();
     let pw2 = "pw-logscan-2";
