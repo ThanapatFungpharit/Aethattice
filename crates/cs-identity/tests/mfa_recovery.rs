@@ -1242,6 +1242,7 @@ async fn recovery_email_through_smtp_relay_never_waits_for_smtp() {
         .await;
     assert_eq!(s, StatusCode::OK, "{st}");
     assert_eq!(st["state"], "pending");
+    e.t.cleanup().await;
 }
 
 /// rev 10 email method (waiting period, identical 202, link only through the Notifier, MFA
