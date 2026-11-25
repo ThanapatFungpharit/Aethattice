@@ -43,6 +43,11 @@ Approved by the project owner on 2026-11-24 (M0 gate follow-up, owner form). C11
 | Group nesting depth (max) | 32 | 4–64 | M1 contract (design; owner 2026-11-24) |
 | Group closure size (max members) | 10,000 | 1,000–100,000 | M1 contract (design; owner 2026-11-24) |
 | Setup-link lifetime | 24 h | 15 min–7 d | M1 contract (design; owner 2026-11-24) |
+| MFA required (`mfa_required`, tenant-overridable) | off (0) | 0–1 | M1 contract rev 11 (owner 2026-11-26) |
+| DPoP required for first-party clients (`dpop_first_party_required`) | off (0) | 0–1 | M1 contract rev 11 (owner 2026-11-26) |
+| Sign-in rate limit per source (IPv4 /32, IPv6 /64) | 30 / min | 5–1000 / min | M1 contract rev 11 (owner 2026-11-26) |
+| Sign-in rate limit per account | 10 / min | 3–100 / min | M1 contract rev 11 (owner 2026-11-26) |
+| Sign-in rate limit per tenant | 600 / min | 60–100,000 / min | M1 contract rev 11 (owner 2026-11-26) |
 
 ## Process for future errata
 

@@ -205,7 +205,7 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
   - **`reregister` with MFA:** for MFA users the flag is set on the §2.4 result of `webauthn/assert/finish` (MFA) and `mfa/recovery-code`, never on the `mfa_required` body.
     - The client may keep the password only as bytes (`Uint8Array`), never as a string. It keeps them only while the MFA prompt is open, at most for the `auth_txn` lifetime.
     - It runs `ksf_upgrade` immediately after MFA succeeds, then zeroes the bytes. It also zeroes them on cancel, failure or timeout.
-  - **New policy keys** (ranges are provisional until the owner records them in erratum C13):
+  - **New policy keys** (owner-approved 2026-11-26, recorded in erratum C13):
     - `mfa_required` 0 (0–1);
     - `dpop_first_party_required` 0 (0–1);
     - `rate_limit_source_per_min` 30 (5–1000);
