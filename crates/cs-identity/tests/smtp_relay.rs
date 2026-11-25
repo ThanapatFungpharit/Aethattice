@@ -43,7 +43,11 @@ async fn enqueue_returns_before_smtp_completes() {
         .recovery_link("alice@mail.test", &Secret::new(TOKEN.to_owned()))
         .await
         .unwrap();
-    assert!(t0.elapsed() < Duration::from_millis(500), "{:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t0.elapsed()
+    );
     assert!(s.mails.lock().unwrap().is_empty());
     assert_eq!(s.wait_for(1, Duration::from_secs(15)).await.len(), 1);
     assert!(t0.elapsed() >= Duration::from_secs(3));

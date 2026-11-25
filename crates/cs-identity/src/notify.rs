@@ -28,8 +28,8 @@ use async_trait::async_trait;
 use cs_common::config::{NotifierConfig, NotifierKind, SmtpConfig, SmtpTls};
 use cs_common::error::{Error, ErrorCode};
 use cs_common::secret::Secret;
-use lettre::message::header::ContentType;
 use lettre::message::Mailbox;
+use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::transport::smtp::extension::ClientId;
@@ -144,9 +144,7 @@ impl Mailer for AsyncSmtpTransport<Tokio1Executor> {
 }
 
 fn classify(e: &lettre::transport::smtp::Error) -> MailError {
-    let status = e
-        .status()
-        .and_then(|c| c.to_string().parse::<u16>().ok());
+    let status = e.status().and_then(|c| c.to_string().parse::<u16>().ok());
     let (class, permanent) = if e.is_permanent() {
         ("permanent", true)
     } else if e.is_transient() {
@@ -213,7 +211,10 @@ pub struct SmtpRelay {
 impl std::fmt::Debug for SmtpRelay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SmtpRelay")
-            .field("queued", &(self.queue.max_capacity() - self.queue.capacity()))
+            .field(
+                "queued",
+                &(self.queue.max_capacity() - self.queue.capacity()),
+            )
             .finish()
     }
 }
@@ -298,7 +299,7 @@ impl SmtpRelay {
 
     /// Put the link on the queue; never waits. A full queue drops it (counted, still `Ok`, so
     /// the API answer stays the identical `202`).
-    fn enqueue(&self, to: &str, token: &Secret<String>) -> Result<(), Error> {
+    fn enqueue(&self, to: &str, token: &Secret<String>) -> Result<(), Box<Error>> {
         let job = Job {
             to: to.to_owned(),
             token: token.clone(),
@@ -316,7 +317,9 @@ impl SmtpRelay {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 metrics::counter!("cs_notifier_dropped_total", "reason" => "closed").increment(1);
-                Err(Error::new(ErrorCode::Unavailable).with_detail("notifier worker stopped"))
+                Err(Box::new(
+                    Error::new(ErrorCode::Unavailable).with_detail("notifier worker stopped"),
+                ))
             }
         }
     }
@@ -325,7 +328,7 @@ impl SmtpRelay {
 #[async_trait]
 impl Notifier for SmtpRelay {
     async fn recovery_link(&self, to: &str, token: &Secret<String>) -> Result<(), Error> {
-        self.enqueue(to, token)
+        self.enqueue(to, token).map_err(|e| *e)
     }
 }
 
@@ -347,7 +350,10 @@ async fn worker(mut rx: mpsc::Receiver<Job>, shared: Arc<Shared>) {
 async fn deliver(shared: &Shared, job: Job) -> u32 {
     let Ok(to) = job.to.parse::<Mailbox>() else {
         metrics::counter!("cs_notifier_failed_total", "class" => "recipient").increment(1);
-        tracing::warn!(class = "recipient", "recovery link not sent: invalid recipient address");
+        tracing::warn!(
+            class = "recipient",
+            "recovery link not sent: invalid recipient address"
+        );
         return 0;
     };
     let body = format!(
@@ -368,7 +374,10 @@ async fn deliver(shared: &Shared, job: Job) -> u32 {
         let msg = match msg {
             Ok(m) => m,
             Err(_) => {
-                tracing::warn!(class = "message", "recovery link not sent: cannot build the message");
+                tracing::warn!(
+                    class = "message",
+                    "recovery link not sent: cannot build the message"
+                );
                 return attempt;
             }
         };
@@ -389,8 +398,7 @@ async fn deliver(shared: &Shared, job: Job) -> u32 {
                     "recovery link delivery failed"
                 );
                 if last {
-                    metrics::counter!("cs_notifier_failed_total", "class" => e.class)
-                        .increment(1);
+                    metrics::counter!("cs_notifier_failed_total", "class" => e.class).increment(1);
                     return attempt;
                 }
                 tokio::time::sleep(shared.retry.delay(attempt)).await;
@@ -449,7 +457,10 @@ impl DevLogSink {
 impl Notifier for DevLogSink {
     async fn recovery_link(&self, to: &str, token: &Secret<String>) -> Result<(), Error> {
         // One line, always prefixed: control characters in the address cannot start a new one.
-        let to: String = to.chars().map(|c| if c.is_control() { '?' } else { c }).collect();
+        let to: String = to
+            .chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect();
         let line = format!(
             "{DEV_PREFIX} recovery link for {to}: {}\n",
             recovery_url(&self.domain, token)
@@ -560,15 +571,17 @@ mod tests {
     fn dev_sink_needs_dev_profile() {
         assert!(DevLogSink::new(false, "cs.example.com").is_err());
         assert!(DevLogSink::new(true, "cs.example.com").is_ok());
-        assert!(validate_config(
-            Some(&NotifierConfig {
-                kind: NotifierKind::DevLog,
-                smtp: None
-            }),
-            "cs.example.com",
-            false
-        )
-        .is_err());
+        assert!(
+            validate_config(
+                Some(&NotifierConfig {
+                    kind: NotifierKind::DevLog,
+                    smtp: None
+                }),
+                "cs.example.com",
+                false
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -577,7 +590,9 @@ mod tests {
         let sink = DevLogSink::with_writer(true, "cs.example.com", Box::new(buf.clone())).unwrap();
         let t = Secret::new(TOKEN.to_owned());
         sink.recovery_link(ADDR, &t).await.unwrap();
-        sink.recovery_link("evil@example.org\nforged line", &t).await.unwrap();
+        sink.recovery_link("evil@example.org\nforged line", &t)
+            .await
+            .unwrap();
         let text = buf.text();
         assert_eq!(text.lines().count(), 2);
         assert!(text.lines().all(|l| l.starts_with(DEV_PREFIX)), "{text}");
@@ -628,10 +643,32 @@ mod tests {
         }
     }
     impl metrics::Recorder for Drops {
-        fn describe_counter(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
-        fn describe_gauge(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
-        fn describe_histogram(&self, _: metrics::KeyName, _: Option<metrics::Unit>, _: metrics::SharedString) {}
-        fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
             if key.name() == "cs_notifier_dropped_total" {
                 metrics::Counter::from_arc(Arc::new(DropCounter(self.0.clone())))
             } else {
@@ -641,7 +678,11 @@ mod tests {
         fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
             metrics::Gauge::noop()
         }
-        fn register_histogram(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Histogram {
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
             metrics::Histogram::noop()
         }
     }

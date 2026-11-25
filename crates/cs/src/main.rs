@@ -294,7 +294,11 @@ async fn shutdown_signal() {
 /// Profile-dependent checks shared by `serve` and `check-config` (M1 contract §4 rev 13, [R7]).
 fn check_profile(cfg: &Config, dev: bool) -> Result<(), String> {
     cfg.check_profile(dev).map_err(|e| format!("cs: {e}"))?;
-    let domain = cfg.api.as_ref().map(|a| a.deployment_domain.as_str()).unwrap_or("");
+    let domain = cfg
+        .api
+        .as_ref()
+        .map(|a| a.deployment_domain.as_str())
+        .unwrap_or("");
     cs_identity::notify::validate_config(cfg.notifier.as_ref(), domain, dev)
         .map_err(|e| format!("cs: invalid [notifier]: {}", admin_error(&e)))
 }

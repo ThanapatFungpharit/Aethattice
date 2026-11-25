@@ -1208,9 +1208,14 @@ async fn recovery_email_through_smtp_relay_never_waits_for_smtp() {
     let smtp = common::fake_smtp::FakeSmtp::start(Duration::from_secs(3), 0).await;
     let relay = cs_identity::notify::SmtpRelay::start(&smtp.config(), DOMAIN).unwrap();
     let auth = Arc::new(
-        AuthService::new(e.pool().clone(), e.kms.clone(), DOMAIN, SessionPolicy::default())
-            .with_rate_limiter(RateLimiter::local_only(generous()))
-            .with_notifier(Arc::new(relay)),
+        AuthService::new(
+            e.pool().clone(),
+            e.kms.clone(),
+            DOMAIN,
+            SessionPolicy::default(),
+        )
+        .with_rate_limiter(RateLimiter::local_only(generous()))
+        .with_notifier(Arc::new(relay)),
     );
     e.app = app(auth);
     let t0 = std::time::Instant::now();
@@ -1222,7 +1227,10 @@ async fn recovery_email_through_smtp_relay_never_waits_for_smtp() {
         .await;
     let elapsed = t0.elapsed();
     assert_eq!((s, a), (StatusCode::ACCEPTED, json!({"state": "pending"})));
-    assert!(elapsed < Duration::from_secs(3), "start waited for SMTP: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "start waited for SMTP: {elapsed:?}"
+    );
     assert!(smtp.mails.lock().unwrap().is_empty());
     let mails = smtp.wait_for(1, Duration::from_secs(20)).await;
     assert_eq!(mails.len(), 1);

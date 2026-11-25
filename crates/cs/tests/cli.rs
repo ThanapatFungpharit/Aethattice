@@ -105,12 +105,18 @@ fn invalid_configuration_is_rejected_before_anything_starts() {
 fn dev_log_notifier_needs_dev_and_smtp_config_is_validated() {
     let d = tempfile::tempdir().unwrap();
     let dev = "\n[notifier]\nkind = \"dev_log\"\n";
-    let p = write(d.path(), &config("\"api\"", "", free_port(), free_port(), dev));
+    let p = write(
+        d.path(),
+        &config("\"api\"", "", free_port(), free_port(), dev),
+    );
     let path = p.to_str().unwrap();
     for cmd in ["check-config", "serve"] {
         let (code, _, err) = run(&[cmd, "--config", path]);
         assert_ne!(code, 0, "{cmd}");
-        assert!(err.contains("--dev") && err.contains("dev_log"), "{cmd}: {err}");
+        assert!(
+            err.contains("--dev") && err.contains("dev_log"),
+            "{cmd}: {err}"
+        );
     }
     let (code, out, err) = run(&["check-config", "--config", path, "--dev"]);
     assert_eq!(code, 0, "{err}");
@@ -121,15 +127,31 @@ fn dev_log_notifier_needs_dev_and_smtp_config_is_validated() {
             "\n[notifier]\nkind = \"smtp\"\n[notifier.smtp]\nhost = \"{host}\"\nport = 587\ntls = \"{tls}\"\nusername = \"relay\"\npassword = \"pw-hunter3\"\nfrom = \"{from}\"\n"
         )
     };
-    let ok = smtp("starttls", "smtp.example.com", "Cloud System <no-reply@example.com>");
-    let p = write(d.path(), &config("\"api\"", "", free_port(), free_port(), &ok));
+    let ok = smtp(
+        "starttls",
+        "smtp.example.com",
+        "Cloud System <no-reply@example.com>",
+    );
+    let p = write(
+        d.path(),
+        &config("\"api\"", "", free_port(), free_port(), &ok),
+    );
     let (code, _, err) = run(&["check-config", "--config", p.to_str().unwrap()]);
     assert_eq!(code, 0, "{err}");
     for (bad, what) in [
-        (smtp("none", "smtp.example.com", "a@example.com"), "loopback"),
-        (smtp("tls", "smtp.example.com", "no-reply@@example.com"), "from"),
+        (
+            smtp("none", "smtp.example.com", "a@example.com"),
+            "loopback",
+        ),
+        (
+            smtp("tls", "smtp.example.com", "no-reply@@example.com"),
+            "from",
+        ),
     ] {
-        let p = write(d.path(), &config("\"api\"", "", free_port(), free_port(), &bad));
+        let p = write(
+            d.path(),
+            &config("\"api\"", "", free_port(), free_port(), &bad),
+        );
         let (code, _, err) = run(&["check-config", "--config", p.to_str().unwrap()]);
         assert_ne!(code, 0, "{what}");
         assert!(err.contains(what), "{what}: {err}");

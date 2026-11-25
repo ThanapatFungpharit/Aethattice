@@ -514,21 +514,18 @@ fn validate_notifier(n: &NotifierConfig, has_api: bool, errs: &mut Vec<String>) 
         (NotifierKind::Smtp, None) => {
             errs.push("notifier.smtp: section required when notifier.kind = \"smtp\"".to_owned())
         }
-        (NotifierKind::DevLog, Some(_)) => errs.push(
-            "notifier.smtp: not allowed when notifier.kind = \"dev_log\"".to_owned(),
-        ),
+        (NotifierKind::DevLog, Some(_)) => {
+            errs.push("notifier.smtp: not allowed when notifier.kind = \"dev_log\"".to_owned())
+        }
         _ => {}
     }
     if !has_api {
-        errs.push(
-            "notifier: needs the [api] section (links use api.deployment_domain)".to_owned(),
-        );
+        errs.push("notifier: needs the [api] section (links use api.deployment_domain)".to_owned());
     }
     let Some(s) = &n.smtp else { return };
     let host_ok = !s.host.is_empty()
         && s.host.len() <= 253
-        && s
-            .host
+        && s.host
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b':' | b'[' | b']'));
     if !host_ok {
@@ -547,14 +544,16 @@ fn validate_notifier(n: &NotifierConfig, has_api: bool, errs: &mut Vec<String>) 
         (Some(u), Some(_)) if u.expose_secret().is_empty() => {
             errs.push("notifier.smtp.username: must not be empty".to_owned())
         }
-        (Some(_), None) | (None, Some(_)) => errs.push(
-            "notifier.smtp: username and password must be given together".to_owned(),
-        ),
+        (Some(_), None) | (None, Some(_)) => {
+            errs.push("notifier.smtp: username and password must be given together".to_owned())
+        }
         _ => {}
     }
     let f = &s.from;
     if f.is_empty() || f.len() > 320 || !f.contains('@') || f.chars().any(char::is_control) {
-        errs.push("notifier.smtp.from: must be a mailbox such as `Name <user@example.com>`".to_owned());
+        errs.push(
+            "notifier.smtp.from: must be a mailbox such as `Name <user@example.com>`".to_owned(),
+        );
     }
 }
 
@@ -1151,10 +1150,8 @@ policy = ["idempotency_retention_hours"]
                 "{g}\n[notifier]\nkind = \"smtp\"\n[notifier.smtp]\nhost = \"smtp.example.com\"\nport = 587\ntls = \"starttls\"\nfrom = \"Cloud System <no-reply@example.com>\"\n{extra}"
             )
         };
-        let c = Config::from_toml_str(&smtp(
-            "username = \"relay\"\npassword = \"pw-s3cr3t\"\n",
-        ))
-        .unwrap();
+        let c = Config::from_toml_str(&smtp("username = \"relay\"\npassword = \"pw-s3cr3t\"\n"))
+            .unwrap();
         let s = c.notifier.as_ref().unwrap().smtp.as_ref().unwrap();
         assert_eq!((s.port, s.tls), (587, SmtpTls::Starttls));
         assert!(!format!("{c:?}").contains("pw-s3cr3t"));
@@ -1170,11 +1167,17 @@ policy = ["idempotency_retention_hours"]
             assert!(Config::from_toml_str(&doc).is_ok(), "{host}");
         }
         assert!(invalid(&smtp("").replace("port = 587", "port = 0")).contains("port"));
-        assert!(invalid(&smtp("").replace("Cloud System <no-reply@example.com>", "nobody")).contains("from"));
+        assert!(
+            invalid(&smtp("").replace("Cloud System <no-reply@example.com>", "nobody"))
+                .contains("from")
+        );
         assert!(invalid(&smtp("").replace("smtp.example.com", "bad host")).contains("host"));
         assert!(invalid(&smtp("timeout = 1\n")).contains("unknown field"));
         assert!(invalid(&format!("{g}\n[notifier]\nkind = \"smtp\"\n")).contains("notifier.smtp"));
-        assert!(invalid(&format!("{g}\n[notifier]\nkind = \"carrier_pigeon\"\n")).contains("unknown variant"));
+        assert!(
+            invalid(&format!("{g}\n[notifier]\nkind = \"carrier_pigeon\"\n"))
+                .contains("unknown variant")
+        );
         // [R7] dev_log: accepted by the parser, refused by the profile check without --dev
         let dev = Config::from_toml_str(&format!("{g}\n[notifier]\nkind = \"dev_log\"\n")).unwrap();
         let e = dev.check_profile(false).unwrap_err().to_string();
