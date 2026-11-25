@@ -52,14 +52,24 @@ fn ksf(params: KsfParams) -> Result<argon2::Argon2<'static>, ClientError> {
     params.argon2().map_err(|e| ClientError::new(e.to_string()))
 }
 
-/// Registration refuses KSF parameters below the contract default (rev 5: the server rejects them too), so a
-/// misbehaving server cannot make the client store a cheaper-to-attack record.
-pub fn check_registration_ksf(params: KsfParams) -> Result<KsfParams, ClientError> {
-    if params.meets_minimum() {
+/// The client refuses KSF parameters outside the rev 7 bounds (`65536 ≤ m_kib ≤ 262144`, `3 ≤ t ≤ 10`,
+/// `1 ≤ p ≤ 4`) before Argon2id runs, so a hostile or broken server cannot make it exhaust memory or time.
+pub fn check_ksf_bounds(params: KsfParams) -> Result<KsfParams, ClientError> {
+    if params.is_valid() {
         Ok(params)
     } else {
-        Err(ClientError::new("ksf_params below the minimum"))
+        Err(ClientError::new("ksf_params outside the contract bounds"))
     }
+}
+
+/// Registration refuses KSF parameters below the contract default (rev 5: the server rejects them too), so a
+/// misbehaving server cannot make the client store a cheaper-to-attack record, and anything above the rev 7
+/// upper bounds.
+pub fn check_registration_ksf(params: KsfParams) -> Result<KsfParams, ClientError> {
+    if !params.meets_minimum() {
+        return Err(ClientError::new("ksf_params below the minimum"));
+    }
+    check_ksf_bounds(params)
 }
 
 /// Registration in progress: holds the client state between `register/start` and `register/finish`.
@@ -216,7 +226,8 @@ impl LoginClient {
         t: u32,
         p: u32,
     ) -> Result<Vec<u8>, JsError> {
-        self.complete(password, response, KsfParams { m_kib, t, p })
+        check_ksf_bounds(KsfParams { m_kib, t, p })
+            .and_then(|k| self.complete(password, response, k))
             .map_err(|e| JsError::new(&e.0))
     }
 }
@@ -390,6 +401,57 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn ksf_outside_rev7_bounds_refused_before_argon2() {
+        assert_eq!(check_ksf_bounds(KsfParams::DEFAULT), Ok(KsfParams::DEFAULT));
+        let max = KsfParams {
+            m_kib: 262_144,
+            t: 10,
+            p: 4,
+        };
+        assert_eq!(check_ksf_bounds(max), Ok(max));
+        for bad in [
+            KsfParams {
+                m_kib: 65_535,
+                t: 3,
+                p: 1,
+            },
+            KsfParams {
+                m_kib: 262_145,
+                t: 3,
+                p: 1,
+            },
+            KsfParams {
+                m_kib: 65_536,
+                t: 2,
+                p: 1,
+            },
+            KsfParams {
+                m_kib: 65_536,
+                t: 11,
+                p: 1,
+            },
+            KsfParams {
+                m_kib: 65_536,
+                t: 3,
+                p: 0,
+            },
+            KsfParams {
+                m_kib: 65_536,
+                t: 3,
+                p: 5,
+            },
+            KsfParams {
+                m_kib: u32::MAX,
+                t: u32::MAX,
+                p: u32::MAX,
+            },
+        ] {
+            assert!(check_ksf_bounds(bad).is_err(), "{bad:?}");
+            assert!(check_registration_ksf(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

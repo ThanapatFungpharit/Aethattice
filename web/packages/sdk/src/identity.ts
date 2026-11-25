@@ -19,7 +19,10 @@ export const OPAQUE_LOGIN_START_PATH = "/api/v2/auth/opaque/login/start";
 export const OPAQUE_LOGIN_FINISH_PATH = "/api/v2/auth/opaque/login/finish";
 export const OPAQUE_REGISTER_START_PATH = "/api/v2/auth/opaque/register/start";
 export const OPAQUE_REGISTER_FINISH_PATH = "/api/v2/auth/opaque/register/finish";
+export const OPAQUE_REAUTH_START_PATH = "/api/v2/auth/opaque/reauth/start";
+export const OPAQUE_REAUTH_FINISH_PATH = "/api/v2/auth/opaque/reauth/finish";
 export const LOGOUT_PATH = "/api/v2/auth/logout";
+export const ME_PATH = "/api/v2/me";
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -60,6 +63,48 @@ export function decodeRegisterStart(body: unknown): RegisterStartResponse {
     registration_txn: str(body, "registration_txn"),
     registration_response: bytes(body, "registration_response"),
     ksf_params: decodeKsfParams(body.ksf_params),
+  };
+}
+
+export interface ReauthStartResponse {
+  readonly reauth_txn: string;
+  readonly credential_response: Uint8Array;
+  readonly ksf_params: KsfParams;
+}
+
+export function decodeReauthStart(body: unknown): ReauthStartResponse {
+  if (!isRecord(body)) throw new TypeError("reauth/start: not an object");
+  return { reauth_txn: str(body, "reauth_txn"), credential_response: bytes(body, "credential_response"), ksf_params: decodeKsfParams(body.ksf_params) };
+}
+
+/** `GET /api/v2/me` (rev 7). */
+export interface Me {
+  readonly user_id: string;
+  readonly tenant_id: string;
+  readonly login: string;
+  readonly display_name: string;
+  readonly state: string;
+  readonly amr: readonly string[];
+  /** Unix seconds. */
+  readonly auth_time: number;
+  readonly sid: string;
+}
+
+export function decodeMe(body: unknown): Me {
+  if (!isRecord(body)) throw new TypeError("me: not an object");
+  const { amr, auth_time, display_name } = body;
+  if (!Array.isArray(amr) || !amr.every((m): m is string => typeof m === "string")) throw new TypeError("amr must be strings");
+  if (typeof auth_time !== "number" || !Number.isInteger(auth_time) || auth_time < 0) throw new TypeError("auth_time must be unix seconds");
+  if (typeof display_name !== "string") throw new TypeError("display_name missing");
+  return {
+    user_id: str(body, "user_id"),
+    tenant_id: str(body, "tenant_id"),
+    login: str(body, "login"),
+    display_name,
+    state: str(body, "state"),
+    amr,
+    auth_time,
+    sid: str(body, "sid"),
   };
 }
 
@@ -191,7 +236,11 @@ async function finishFlow(flow: OpaqueFlow, pw: Uint8Array, response: Uint8Array
 // ---- flows ----
 
 export interface IdentityDeps {
-  /** Client for the auth endpoints. It needs no auth hook; {@link signOut} uses `authedClient`. */
+  /**
+   * Client for the auth endpoints. It needs no auth hook; {@link signOut}, {@link reauthenticate} and
+   * {@link getMe} use `authedClient`. When the session is DPoP-bound (rev 8) its `dpop` prover must be the
+   * session's key manager, so that `login/finish` carries a proof.
+   */
   readonly client: ApiClient;
   readonly engine: OpaqueEngine;
   readonly session: AuthSession;
@@ -215,14 +264,24 @@ export async function signIn(deps: IdentityDeps, tenant: string, login: string, 
       ...(signal !== undefined && { signal }),
     });
     const fin = await finishFlow(flow, pw, start.data.credential_response, start.data.ksf_params);
-    const r = await deps.client.post(OPAQUE_LOGIN_FINISH_PATH, {
-      body: { login_txn: start.data.login_txn, credential_finalization: base64urlEncode(fin) },
-      decode: decodeLoginFinish,
-      ...(signal !== undefined && { signal }),
-    });
-    if (r.data.state === "mfa_required") throw new MfaRequired(r.data);
-    deps.session.signedIn(r.data);
-    return r.data;
+    const keys = deps.session.dpopKeys;
+    const finish = async (): Promise<AuthResult | MfaChallenge> => {
+      // Rev 8: a new key pair for the new session, created before login/finish and shared by all tabs; the
+      // proof on login/finish binds the session and its refresh family to it.
+      await keys?.rotate();
+      const r = await deps.client.post(OPAQUE_LOGIN_FINISH_PATH, {
+        body: { login_txn: start.data.login_txn, credential_finalization: base64urlEncode(fin) },
+        decode: decodeLoginFinish,
+        ...(keys !== undefined && { dpop: true }),
+        ...(signal !== undefined && { signal }),
+      });
+      if (r.data.state === "authenticated") deps.session.signedIn(r.data);
+      return r.data;
+    };
+    // Under the cross-tab lock, so no other tab refreshes or signs in between the key change and the new token.
+    const result = keys ? await deps.session.exclusive(finish) : await finish();
+    if (result.state === "mfa_required") throw new MfaRequired(result);
+    return result;
   } finally {
     flow?.abandon();
     pw.fill(0);
@@ -270,7 +329,52 @@ export async function signOut(authedClient: ApiClient, session: AuthSession, sig
   } catch (e) {
     if (!(e instanceof ApiError && e.problem.code === "unauthenticated")) throw e;
   }
-  session.signedOut();
+  // Also deletes the session's DPoP key (rev 8); the next sign-in creates a new one.
+  await session.signedOut();
+}
+
+/**
+ * Password step-up on the existing session (rev 7): `opaque/reauth/start {credential_request}` → Argon2id + KE3 →
+ * `opaque/reauth/finish {reauth_txn, credential_finalization}` → 204. Both calls carry the current access token
+ * (and a DPoP proof when bound) through `authedClient`. The server sets `last_strong_auth_at` on the current
+ * session; no session, token or DPoP key is created or changed here. A wrong password rejects with ApiError
+ * `unauthenticated`, as for sign-in.
+ */
+export async function reauthenticate(
+  deps: Pick<IdentityDeps, "engine">,
+  authedClient: ApiClient,
+  tenant: string,
+  login: string,
+  password: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!isCanonicalTenantId(tenant)) throw new IdentityInputError("tenant");
+  const normalized = await normalizeOrThrow(deps.engine, login);
+  const pw = passwordBytes(password);
+  let flow: OpaqueFlow | undefined;
+  try {
+    // The client identifier is `<tenant>/<normalized login>` of the signed-in user, as at sign-in.
+    flow = await startFlow(deps.engine, "login", pw, tenant, normalized);
+    const start = await authedClient.post(OPAQUE_REAUTH_START_PATH, {
+      body: { credential_request: base64urlEncode(flow.request) },
+      decode: decodeReauthStart,
+      ...(signal !== undefined && { signal }),
+    });
+    const fin = await finishFlow(flow, pw, start.data.credential_response, start.data.ksf_params);
+    await authedClient.post(OPAQUE_REAUTH_FINISH_PATH, {
+      body: { reauth_txn: start.data.reauth_txn, credential_finalization: base64urlEncode(fin) },
+      ...(signal !== undefined && { signal }),
+    });
+  } finally {
+    flow?.abandon();
+    pw.fill(0);
+  }
+}
+
+/** `GET /api/v2/me` (rev 7) for the account page. */
+export async function getMe(authedClient: ApiClient, signal?: AbortSignal): Promise<Me> {
+  const r = await authedClient.get(ME_PATH, { decode: decodeMe, ...(signal !== undefined && { signal }) });
+  return r.data;
 }
 
 async function normalizeOrThrow(engine: OpaqueEngine, login: string): Promise<string> {

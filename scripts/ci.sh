@@ -28,6 +28,9 @@ echo "== opaque-wasm pkg freshness"
 # The committed wasm-bindgen output must match the crate (M1 rev 5 §2.1). Needs wasm-bindgen-cli 0.2.130.
 if WB="${WASM_BINDGEN:-wasm-bindgen}"; [[ "$("$WB" --version 2>/dev/null)" == "wasm-bindgen 0.2.130" ]]; then
   scripts/build-opaque-wasm.sh --check
+elif [[ "${CS_REQUIRE_WASM_BINDGEN:-0}" == "1" ]]; then
+  echo "FAILED: wasm-bindgen 0.2.130 required (CS_REQUIRE_WASM_BINDGEN=1) but not installed" >&2
+  exit 1
 else
   echo "SKIPPED: wasm-bindgen 0.2.130 not installed (set WASM_BINDGEN); pkg/ freshness not verified"
 fi

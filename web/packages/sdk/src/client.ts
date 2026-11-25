@@ -10,6 +10,7 @@ import {
   synthesizeProblem,
   type Problem,
 } from "./problem";
+import { DPOP_HEADER, DPOP_NONCE_HEADER, dpopAccessToken, isUseDpopNonce, type DpopProver } from "./dpop";
 import { RetryPolicy, parseRetryAfter, systemClock, type Clock } from "./retry";
 
 export type HttpMethod = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -44,6 +45,11 @@ export interface ApiClientOptions {
   readonly auth?: AuthHook;
   readonly idempotencyKeyFactory?: () => string;
   readonly headers?: Readonly<Record<string, string>>;
+  /**
+   * DPoP prover (RFC 9449, M1 rev 8). When set, every attempt that carries an access token, and every request
+   * with `dpop: true`, gets a fresh proof (new `jti`; `ath` when the Authorization scheme is `DPoP`).
+   */
+  readonly dpop?: DpopProver;
 }
 
 export interface RequestOptions<T> {
@@ -63,6 +69,8 @@ export interface RequestOptions<T> {
   readonly retry?: RetryPolicy | false;
   /** Validates and converts the decoded success body. Throwing makes the call fail as `internal`. */
   readonly decode?: (body: unknown) => T;
+  /** Send a DPoP proof even without an access token (`login/finish`, `token/refresh`; M1 rev 8). */
+  readonly dpop?: boolean;
 }
 
 export interface ApiResponse<T> {
@@ -83,7 +91,7 @@ const TIMEOUT = Symbol("timeout");
 
 type AttemptResult<T> =
   | { kind: "ok"; response: ApiResponse<T> }
-  | { kind: "error"; error: ApiError };
+  | { kind: "error"; error: ApiError; nonceRetry?: boolean };
 
 export class ApiClient {
   private readonly baseUrl: string;
@@ -94,6 +102,9 @@ export class ApiClient {
   private readonly auth: AuthHook | undefined;
   private readonly newKey: () => string;
   private readonly headers: Readonly<Record<string, string>>;
+  private readonly dpop: DpopProver | undefined;
+  /** Last `DPoP-Nonce` the server sent (RFC 9449 §8). M1 servers never send one (rev 8). */
+  private dpopNonce: string | undefined;
 
   constructor(opts: ApiClientOptions) {
     let parsed: URL;
@@ -111,6 +122,7 @@ export class ApiClient {
     this.auth = opts.auth;
     this.newKey = opts.idempotencyKeyFactory ?? defaultIdempotencyKey;
     this.headers = opts.headers ?? {};
+    this.dpop = opts.dpop;
   }
 
   get<T = unknown>(path: string, opts?: RequestOptions<T>): Promise<ApiResponse<T>> {
@@ -145,6 +157,7 @@ export class ApiClient {
     const policy = opts.retry === false ? RetryPolicy.none() : (opts.retry ?? this.retryPolicy);
     const signal = opts.signal;
     let refreshed = false;
+    let nonceRetried = false;
     let attempt = 0;
 
     for (;;) {
@@ -153,6 +166,13 @@ export class ApiClient {
       const result = await this.attempt<T>(method, url, path, opts, key, attempt);
       if (result.kind === "ok") return result.response;
       const { problem } = result.error;
+
+      // RFC 9449 §8 (rev 8: defensive; M1 servers send no nonce): retry once with the new nonce.
+      if (result.nonceRetry === true && !nonceRetried && (!write || key !== undefined)) {
+        nonceRetried = true;
+        attempt--;
+        continue;
+      }
 
       // Step-up (M1 §2.3 [R2]): a refresh cannot satisfy it, so it is surfaced at once as StepUpRequired.
       if (result.error instanceof StepUpRequired) throw result.error;
@@ -201,6 +221,17 @@ export class ApiClient {
     if (key !== undefined) headers.set(IDEMPOTENCY_HEADER, key);
     const authorization = await this.auth?.authorization?.();
     if (authorization !== undefined) headers.set("Authorization", authorization);
+    const sentNonce = this.dpopNonce;
+    if (this.dpop && (authorization !== undefined || opts.dpop === true)) {
+      const accessToken = dpopAccessToken(authorization);
+      const proof = await this.dpop.proof({
+        htm: method,
+        url,
+        ...(accessToken !== undefined && { accessToken }),
+        ...(sentNonce !== undefined && { nonce: sentNonce }),
+      });
+      if (proof !== undefined) headers.set(DPOP_HEADER, proof);
+    }
     let body: string | undefined;
     if (opts.body !== undefined) {
       body = JSON.stringify(opts.body);
@@ -219,9 +250,10 @@ export class ApiClient {
       controller.abort(TIMEOUT);
     }, timeoutMs);
 
-    const synth = (problem: Problem, httpStatus?: number): AttemptResult<T> => ({
+    const synth = (problem: Problem, httpStatus?: number, nonceRetry = false): AttemptResult<T> => ({
       kind: "error",
       error: new ApiError(problem, { httpStatus, synthesized: true, attempts: attempt }),
+      nonceRetry,
     });
 
     try {
@@ -236,6 +268,9 @@ export class ApiClient {
       }
 
       const requestId = res.headers.get(REQUEST_ID_HEADER) ?? undefined;
+      const nonce = this.dpop ? res.headers.get(DPOP_NONCE_HEADER) : null;
+      if (nonce !== null) this.dpopNonce = nonce;
+      const nonceRetry = nonce !== null && nonce !== sentNonce && isUseDpopNonce(res.status, res.headers);
       let text: string;
       try {
         text = await res.text();
@@ -266,12 +301,12 @@ export class ApiClient {
               const error = isStepUpProblem(parsed.problem)
                 ? new StepUpRequired(parsed.problem, errOpts)
                 : new ApiError(parsed.problem, errOpts);
-              return { kind: "error", error };
+              return { kind: "error", error, nonceRetry };
             }
           }
         }
         const code = codeForNonProblemStatus(res.status);
-        return synth(synthesizeProblem(code, { requestId, instance: path, retryAfterMs }), res.status);
+        return synth(synthesizeProblem(code, { requestId, instance: path, retryAfterMs }), res.status, nonceRetry);
       }
 
       let decoded: unknown = undefined;

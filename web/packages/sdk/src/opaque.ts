@@ -70,13 +70,27 @@ function isU32(v: unknown): v is number {
   return typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= U32_MAX;
 }
 
-/** Validates `ksf_params` from the server. Throws TypeError (the API client maps that to `internal`). */
+/** Lower bounds (rev 7 §2.1), equal to the contract default. */
+export const KSF_MIN: Readonly<Pick<KsfParams, "m_kib" | "t" | "p">> = Object.freeze({ m_kib: 65536, t: 3, p: 1 });
+/** Upper bounds (rev 7 §2.1): a hostile or broken server cannot make the client exhaust memory or time. */
+export const KSF_MAX: Readonly<Pick<KsfParams, "m_kib" | "t" | "p">> = Object.freeze({ m_kib: 262144, t: 10, p: 4 });
+
+function inRange(v: number, k: "m_kib" | "t" | "p"): boolean {
+  return v >= KSF_MIN[k] && v <= KSF_MAX[k];
+}
+
+/**
+ * Validates `ksf_params` from the server, including the rev 7 bounds `65536 ≤ m_kib ≤ 262144`, `3 ≤ t ≤ 10`,
+ * `1 ≤ p ≤ 4`. Every response carrying `ksf_params` is decoded with this before Argon2id runs, so parameters
+ * outside the bounds never reach the KSF. Throws TypeError (the API client maps that to `internal`).
+ */
 export function decodeKsfParams(v: unknown): KsfParams {
   if (typeof v !== "object" || v === null || Array.isArray(v)) throw new TypeError("ksf_params must be an object");
   const r = v as Record<string, unknown>;
   if (r.algorithm !== "argon2id") throw new TypeError("unsupported ksf algorithm");
   const { m_kib, t, p } = r;
   if (!isU32(m_kib) || !isU32(t) || !isU32(p)) throw new TypeError("ksf_params values must be positive u32");
+  if (!inRange(m_kib, "m_kib") || !inRange(t, "t") || !inRange(p, "p")) throw new TypeError("ksf_params outside the contract bounds");
   return { algorithm: "argon2id", m_kib, t, p };
 }
 
