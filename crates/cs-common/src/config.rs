@@ -203,6 +203,54 @@ pub const POLICY_TABLE: &[PolicySpec] = &[
         unit: "seconds",
         source: "spec §5.5 / erratum C13 / M1 contract §2.3, §8: 5 min, 1–60 min",
     },
+    PolicySpec {
+        key: "recovery_waiting_period_secs",
+        default: 86_400,
+        min: 3_600,
+        max: 1_209_600,
+        unit: "seconds",
+        source: "spec §5.6 / erratum C13 / M1 contract §8: 24 h, 1 h–14 d",
+    },
+    PolicySpec {
+        key: "mfa_required",
+        default: 0,
+        min: 0,
+        max: 1,
+        unit: "flag",
+        source: "M1 contract rev 11 (provisional range, owner to record in C13); tenant-overridable",
+    },
+    PolicySpec {
+        key: "dpop_first_party_required",
+        default: 0,
+        min: 0,
+        max: 1,
+        unit: "flag",
+        source: "M1 contract rev 11 (`dpop_first_party` optional|required; provisional range, C13 pending)",
+    },
+    PolicySpec {
+        key: "rate_limit_source_per_min",
+        default: 30,
+        min: 5,
+        max: 1_000,
+        unit: "requests/60 s",
+        source: "M1 contract §5, rev 11 (provisional range, owner to record in C13)",
+    },
+    PolicySpec {
+        key: "rate_limit_account_per_min",
+        default: 10,
+        min: 3,
+        max: 100,
+        unit: "requests/60 s",
+        source: "M1 contract §5, rev 11 (provisional range, owner to record in C13)",
+    },
+    PolicySpec {
+        key: "rate_limit_tenant_per_min",
+        default: 600,
+        min: 60,
+        max: 100_000,
+        unit: "requests/60 s",
+        source: "M1 contract §5, rev 11 (provisional range, owner to record in C13)",
+    },
 ];
 
 /// Typed handle on a policy key.
@@ -222,6 +270,12 @@ pub enum PolicyKey {
     SessionIdleLifetimeSecs,
     SessionAbsoluteLifetimeSecs,
     StepUpWindowSecs,
+    RecoveryWaitingPeriodSecs,
+    MfaRequired,
+    DpopFirstPartyRequired,
+    RateLimitSourcePerMin,
+    RateLimitAccountPerMin,
+    RateLimitTenantPerMin,
 }
 
 impl PolicyKey {
@@ -241,6 +295,12 @@ impl PolicyKey {
             PolicyKey::SessionIdleLifetimeSecs => "session_idle_lifetime_secs",
             PolicyKey::SessionAbsoluteLifetimeSecs => "session_absolute_lifetime_secs",
             PolicyKey::StepUpWindowSecs => "step_up_window_secs",
+            PolicyKey::RecoveryWaitingPeriodSecs => "recovery_waiting_period_secs",
+            PolicyKey::MfaRequired => "mfa_required",
+            PolicyKey::DpopFirstPartyRequired => "dpop_first_party_required",
+            PolicyKey::RateLimitSourcePerMin => "rate_limit_source_per_min",
+            PolicyKey::RateLimitAccountPerMin => "rate_limit_account_per_min",
+            PolicyKey::RateLimitTenantPerMin => "rate_limit_tenant_per_min",
         }
     }
 }
@@ -393,6 +453,26 @@ pub struct ValkeyConfig {
     pub url: Secret<String>,
 }
 
+/// Cluster facts known from configuration until cluster membership arrives (M8).
+/// `node_count` (M1 contract §5, rev 11) divides the rate limits for the local-bucket fallback
+/// when Valkey is unavailable (limit/N per node); `check-config` rejects N < 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterConfig {
+    #[serde(default = "d_node_count")]
+    pub node_count: i64,
+}
+
+fn d_node_count() -> i64 {
+    1
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self { node_count: 1 }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
@@ -478,6 +558,8 @@ struct RawConfig {
     #[serde(default)]
     valkey: Option<ValkeyConfig>,
     #[serde(default)]
+    cluster: ClusterConfig,
+    #[serde(default)]
     telemetry: TelemetryConfig,
     #[serde(default)]
     policy: BTreeMap<String, toml::Value>,
@@ -494,6 +576,7 @@ pub struct Config {
     pub kms: Option<KmsConfig>,
     pub api: Option<ApiConfig>,
     pub valkey: Option<ValkeyConfig>,
+    pub cluster: ClusterConfig,
     pub telemetry: TelemetryConfig,
     pub policy: Policy,
     pub locked_policy: BTreeSet<&'static str>,
@@ -644,6 +727,10 @@ impl Config {
             }
         }
 
+        if raw.cluster.node_count < 1 {
+            errs.push("cluster.node_count: must be at least 1 (rate-limit fallback limit/N, M1 contract §5)".to_owned());
+        }
+
         if tracing_subscriber::EnvFilter::try_new(&raw.telemetry.log_level).is_err() {
             errs.push("telemetry.log_level: invalid filter directive".to_owned());
         }
@@ -670,6 +757,7 @@ impl Config {
                 kms: raw.kms,
                 api: raw.api,
                 valkey: raw.valkey,
+                cluster: raw.cluster,
                 telemetry: raw.telemetry,
                 policy,
                 locked_policy,
@@ -782,6 +870,13 @@ policy = ["idempotency_retention_hours"]
             ("session_idle_lifetime_secs", 3_600, 7_776_000),
             ("session_absolute_lifetime_secs", 86_400, 31_536_000),
             ("step_up_window_secs", 60, 3_600),
+            // rev 11
+            ("recovery_waiting_period_secs", 3_600, 1_209_600),
+            ("mfa_required", 0, 1),
+            ("dpop_first_party_required", 0, 1),
+            ("rate_limit_source_per_min", 5, 1_000),
+            ("rate_limit_account_per_min", 3, 100),
+            ("rate_limit_tenant_per_min", 60, 100_000),
         ] {
             let g = good();
             for ok in [lo, hi] {
@@ -809,10 +904,28 @@ policy = ["idempotency_retention_hours"]
         assert_eq!(d.get(PolicyKey::SetupLinkLifetimeSecs), 86_400);
         assert_eq!(d.get(PolicyKey::AccessTokenLifetimeSecs), 600);
         assert_eq!(d.get(PolicyKey::StepUpWindowSecs), 300);
+        assert_eq!(d.get(PolicyKey::RecoveryWaitingPeriodSecs), 86_400);
+        assert_eq!(d.get(PolicyKey::MfaRequired), 0);
+        assert_eq!(d.get(PolicyKey::DpopFirstPartyRequired), 0);
+        assert_eq!(d.get(PolicyKey::RateLimitSourcePerMin), 30);
+        assert_eq!(d.get(PolicyKey::RateLimitAccountPerMin), 10);
+        assert_eq!(d.get(PolicyKey::RateLimitTenantPerMin), 600);
     }
 
     /// `[valkey] url` (M1 contract §3 [R6]): optional, redis:// or rediss://, credentials
     /// allowed and never printed; anything else is refused by check-config.
+    #[test]
+    fn cluster_node_count() {
+        let g = good();
+        assert_eq!(Config::from_toml_str(&g).unwrap().cluster.node_count, 1);
+        let c = Config::from_toml_str(&format!("{g}\n[cluster]\nnode_count = 3\n")).unwrap();
+        assert_eq!(c.cluster.node_count, 3);
+        for bad in ["0", "-1"] {
+            let e = invalid(&format!("{g}\n[cluster]\nnode_count = {bad}\n"));
+            assert!(e.contains("cluster.node_count"), "{bad}: {e}");
+        }
+    }
+
     #[test]
     fn valkey_section() {
         let g = good();

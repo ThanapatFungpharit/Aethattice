@@ -303,6 +303,18 @@ async fn serve(path: &Path) -> Result<(), String> {
                     auth
                 }
             };
+            // Rate limits (M1 contract §5, rev 11): Valkey counters, local buckets at limit/N
+            // ([cluster] node_count) when Valkey is unavailable; never unlimited.
+            let limits = cs_identity::ratelimit::RateLimits::from_policy(
+                &cfg.policy,
+                cfg.cluster.node_count,
+            );
+            let limiter = cs_identity::ratelimit::RateLimiter::new(
+                limits,
+                cfg.valkey.as_ref().map(|v| v.url.expose_secret().as_str()),
+            )
+            .map_err(|e| format!("cs: invalid valkey.url: {e}"))?;
+            let auth = auth.with_rate_limiter(limiter);
             routes = routes.merge(cs_identity::http::routes(Arc::new(auth)));
         }
         _ => tracing::warn!(

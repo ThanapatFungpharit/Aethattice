@@ -23,6 +23,8 @@ use crate::dpop::{self, ReplayStore, VerifiedProof};
 use crate::jws::{AccessClaims, AccessTokens};
 use crate::keys::{OpaqueKeys, ServerKeyVersion};
 use crate::login::normalize_login;
+use crate::notify::Notifier;
+use crate::ratelimit::{RateLimiter, RateLimits};
 use crate::session::{self, NewTokens, PresentedProof, RefreshOutcome, SessionPolicy};
 use crate::token::{self, TokenHash};
 use cs_common::error::{Code, Error, ErrorCode, FieldError};
@@ -97,7 +99,7 @@ pub const STEP_UP_REQUIRED: &str = "step_up_required";
 /// Re-registration purposes (rev 9).
 pub const PURPOSES: &[&str] = &["password_change", "ksf_upgrade"];
 
-fn step_up_required() -> AuthError {
+pub(crate) fn step_up_required() -> AuthError {
     let detail = "Recent strong authentication is required.".to_owned();
     Error::new(ErrorCode::Unauthenticated)
         .with_detail(detail.clone())
@@ -137,17 +139,17 @@ fn rereg_parse(b: &[u8]) -> Option<(KsfParams, &'static str, i64)> {
 }
 
 /// Whether stored KSF parameters are below the current defaults (rev 9 `reregister`).
-fn ksf_below_default(k: &KsfParams) -> bool {
+pub(crate) fn ksf_below_default(k: &KsfParams) -> bool {
     let d = KsfParams::DEFAULT;
     k.m_kib < d.m_kib || k.t < d.t || k.p < d.p
 }
 
 #[derive(Serialize)]
-struct CredentialsChanged {
-    tenant_id: TenantId,
-    user_id: UserId,
-    method: &'static str,
-    reason: &'static str,
+pub(crate) struct CredentialsChanged {
+    pub(crate) tenant_id: TenantId,
+    pub(crate) user_id: UserId,
+    pub(crate) method: &'static str,
+    pub(crate) reason: &'static str,
 }
 
 #[derive(Serialize)]
@@ -157,7 +159,7 @@ struct UserUpdated {
     status: &'static str,
 }
 
-fn unauthenticated() -> AuthError {
+pub(crate) fn unauthenticated() -> AuthError {
     // One detail for wrong password, unknown account, disabled user and bad txn (§6).
     Error::new(ErrorCode::Unauthenticated)
         .with_detail("Authentication failed.")
@@ -176,7 +178,7 @@ fn grant_required() -> AuthError {
         .into()
 }
 
-fn invalid(pointer: &str, detail: &str) -> AuthError {
+pub(crate) fn invalid(pointer: &str, detail: &str) -> AuthError {
     Error::new(ErrorCode::InvalidRequest)
         .with_detail(detail.to_owned())
         .with_field_error(FieldError {
@@ -196,7 +198,7 @@ fn txn_ad(tenant: &TenantId, hash: &TokenHash, kind: &str) -> Vec<u8> {
 }
 
 /// Parse the canonical tenant UUID text (rev 5: never a name or slug).
-fn parse_tenant(s: &str) -> AuthResult<TenantId> {
+pub(crate) fn parse_tenant(s: &str) -> AuthResult<TenantId> {
     let bad = || {
         invalid(
             "/tenant",
@@ -254,11 +256,11 @@ pub fn source_of(addr: Option<std::net::IpAddr>) -> String {
     }
 }
 
-fn to_i32(v: u32) -> i32 {
+pub(crate) fn to_i32(v: u32) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
 }
 
-fn ksf_from_row(m: i32, t: i32, p: i32) -> KsfParams {
+pub(crate) fn ksf_from_row(m: i32, t: i32, p: i32) -> KsfParams {
     KsfParams {
         m_kib: u32::try_from(m).unwrap_or(0),
         t: u32::try_from(t).unwrap_or(0),
@@ -392,15 +394,60 @@ async fn take_txn(
     ))
 }
 
+/// `errors[].code` for a sign-in that needs a second factor (contract §6.1, rev 11).
+pub const MFA_REQUIRED: &str = "mfa_required";
+
+/// 401 with `errors[] = [{pointer: "", code: "mfa_required"}]` (rev 11: enrolment-only
+/// session outside its routes, or an `auth_txn` presented to the wrong endpoint).
+pub(crate) fn mfa_required_error() -> AuthError {
+    let detail = "A second factor is required.".to_owned();
+    Error::new(ErrorCode::Unauthenticated)
+        .with_detail(detail.clone())
+        .with_field_error(FieldError {
+            pointer: String::new(),
+            code: MFA_REQUIRED.to_owned(),
+            detail,
+        })
+        .into()
+}
+
+/// Routes an enrolment-only session may call (rev 11): `webauthn/register/*`,
+/// `me/recovery-codes` (POST, GET), `GET /me` and logout.
+pub fn enrolment_allowed(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("POST", "/api/v2/auth/webauthn/register/start")
+            | ("POST", "/api/v2/auth/webauthn/register/finish")
+            | ("POST" | "GET", "/api/v2/me/recovery-codes")
+            | ("GET", "/api/v2/me")
+            | ("POST", "/api/v2/auth/logout")
+    )
+}
+
+/// Refuse a sign-in without a DPoP proof when `dpop_first_party_required` = 1 (rev 11).
+pub(crate) fn dpop_proof_required() -> AuthError {
+    Error::new(ErrorCode::Unauthenticated)
+        .with_detail("A DPoP proof is required.")
+        .into()
+}
+
 /// The authentication service.
 pub struct AuthService {
-    pool: DomainPool,
+    pub(crate) pool: DomainPool,
     kms: Arc<dyn Kms>,
     keys: OnceCell<Arc<OpaqueKeys>>,
-    tokens: AccessTokens,
-    policy: SessionPolicy,
+    pub(crate) tokens: AccessTokens,
+    pub(crate) policy: SessionPolicy,
     last_sweep: AtomicI64,
-    replay: ReplayStore,
+    pub(crate) replay: ReplayStore,
+    /// WebAuthn relying party (rp id = deployment domain, origin `https://<domain>`).
+    pub(crate) webauthn: Option<Arc<webauthn_rs::Webauthn>>,
+    /// Rate limits of the authentication endpoints (contract §5).
+    pub(crate) limiter: Arc<RateLimiter>,
+    /// Out-of-band delivery of recovery links (contract §4).
+    pub(crate) notifier: Arc<dyn Notifier>,
+    /// Dummy Argon2id hash for unknown recovery-code IDs (same timing path, rev 11).
+    pub(crate) dummy_code_hash: OnceCell<String>,
 }
 
 impl std::fmt::Debug for AuthService {
@@ -414,7 +461,25 @@ impl std::fmt::Debug for AuthService {
 
 enum LoginOutcome {
     Ok(Box<NewTokens>, bool),
+    Mfa(Secret<String>, Vec<&'static str>),
     Failed,
+}
+
+/// Result of a password sign-in (contract §2.4, §2.3 rev 11).
+#[derive(Debug)]
+pub enum LoginResult {
+    Authenticated(Authenticated),
+    MfaRequired(crate::mfa::MfaChallenge),
+}
+
+impl LoginResult {
+    /// The session, or `None` for `mfa_required`.
+    pub fn authenticated(self) -> Option<Authenticated> {
+        match self {
+            LoginResult::Authenticated(a) => Some(a),
+            LoginResult::MfaRequired(_) => None,
+        }
+    }
 }
 
 impl AuthService {
@@ -434,7 +499,23 @@ impl AuthService {
             policy,
             last_sweep: AtomicI64::new(0),
             replay: ReplayStore::table_only(pool_for_replay),
+            webauthn: crate::webauthn::relying_party(deployment_domain),
+            limiter: Arc::new(RateLimiter::local_only(RateLimits::default())),
+            notifier: Arc::new(crate::notify::Discard),
+            dummy_code_hash: OnceCell::new(),
         }
+    }
+
+    /// Replace the rate limiter (`cs serve`: policy limits, `[cluster] node_count`, Valkey).
+    pub fn with_rate_limiter(mut self, limiter: RateLimiter) -> Self {
+        self.limiter = Arc::new(limiter);
+        self
+    }
+
+    /// Replace the recovery-link notifier (contract §4).
+    pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
+        self.notifier = notifier;
+        self
     }
 
     /// Use Valkey (`[valkey] url`) as the primary DPoP replay store `[R6]`; without it the
@@ -457,7 +538,7 @@ impl AuthService {
 
     /// Verify an optional DPoP proof on a request without an access token (login/finish,
     /// refresh): form, signature, claims, then the shared replay check.
-    async fn proof_without_token(
+    pub(crate) async fn proof_without_token(
         &self,
         tenant: TenantId,
         ctx: &RequestCtx<'_>,
@@ -480,6 +561,21 @@ impl AuthService {
     /// come as `Authorization: DPoP <token>` with a fresh proof of the bound key carrying
     /// `ath`; an unbound token comes as `Bearer`. Anything else is `unauthenticated`.
     pub async fn authorize(
+        &self,
+        authorization: Option<&str>,
+        ctx: &RequestCtx<'_>,
+    ) -> AuthResult<AccessClaims> {
+        let claims = self.authorize_token(authorization, ctx).await?;
+        // rev 11: an enrolment-only session may call only the enrolment routes.
+        if claims.scp.as_deref() == Some(session::SCOPE_MFA_ENROLMENT)
+            && !enrolment_allowed(ctx.method, ctx.path)
+        {
+            return Err(mfa_required_error());
+        }
+        Ok(claims)
+    }
+
+    async fn authorize_token(
         &self,
         authorization: Option<&str>,
         ctx: &RequestCtx<'_>,
@@ -572,7 +668,7 @@ impl AuthService {
 
     /// Start a sweep of expired txn rows, at most once per interval per node (lazy
     /// reclamation). It runs in the background, so a request never waits for it.
-    fn sweep(&self) {
+    pub(crate) fn sweep(&self) {
         let now = unix_now();
         let last = self.last_sweep.load(Ordering::Relaxed);
         if now - last < SWEEP_INTERVAL_SECS
@@ -588,7 +684,9 @@ impl AuthService {
             let deleted = sweep_expired_txns(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES).await;
             let jti =
                 crate::dpop::sweep_expired_jti(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES).await;
-            tracing::debug!(deleted, jti, "expiry sweep finished");
+            let ceremonies =
+                crate::ceremony::sweep_expired(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES).await;
+            tracing::debug!(deleted, jti, ceremonies, "expiry sweep finished");
         });
     }
 
@@ -602,8 +700,12 @@ impl AuthService {
         credential_request: &[u8],
         source: &str,
     ) -> AuthResult<LoginStart> {
+        let tenant_text = tenant;
         let tenant = parse_tenant(tenant)?;
         let login = normalize_login(login).map_err(|e| invalid("/login", &e.to_string()))?;
+        // Contract §5: per source, tenant and account, whether or not they exist.
+        self.limit("login", source, Some(tenant_text), Some(&login))
+            .await?;
         let request = CredentialRequest::<Suite>::deserialize(credential_request)
             .map_err(|_| invalid("/credential_request", "malformed credential_request"))?;
         let keys = self.keys().await?;
@@ -722,14 +824,19 @@ impl AuthService {
         login_txn: &str,
         credential_finalization: &[u8],
         source: &str,
+        user_agent: Option<&str>,
         ctx: &RequestCtx<'_>,
-    ) -> AuthResult<Authenticated> {
+    ) -> AuthResult<LoginResult> {
         let parsed = token::parse(login_txn).map_err(|_| unauthenticated())?;
         // rev 8: a valid proof binds the new session; an invalid one is refused.
         let jkt = self
             .proof_without_token(parsed.tenant_id, ctx)
             .await?
             .map(|p| p.jkt);
+        // rev 11: `dpop_first_party_required` = 1 refuses a sign-in without a proof.
+        if self.policy.dpop_required && jkt.is_none() {
+            return Err(dpop_proof_required());
+        }
         let fin = CredentialFinalization::<Suite>::deserialize(credential_finalization).map_err(
             |_| {
                 invalid(
@@ -742,10 +849,12 @@ impl AuthService {
         let (tenant, hash) = (parsed.tenant_id, parsed.hash);
         let policy = self.policy;
         let source = source.to_owned();
+        let ua = user_agent.map(str::to_owned);
         let out = self
             .pool
             .transaction(move |tx| {
-                let (keys, fin, source) = (keys.clone(), fin.clone(), source.clone());
+                let (keys, fin, source, ua) =
+                    (keys.clone(), fin.clone(), source.clone(), ua.clone());
                 Box::pin(async move {
                     let Some(t) = take_txn(tx, tenant, &hash, "login").await? else {
                         return Ok(LoginOutcome::Failed);
@@ -801,7 +910,43 @@ impl AuthService {
                     .await?;
                     let reregister = t.key_version != keys.current().version
                         || reg.is_none_or(|(m, t, p)| ksf_below_default(&ksf_from_row(m, t, p)));
-                    let nt = session::create_in_tx(tx, tenant, user, &["pwd"], policy, jkt).await?;
+                    // rev 11: MFA decision.
+                    let f =
+                        crate::mfa::factors_in_tx(tx, tenant, user, policy.mfa_required).await?;
+                    let scope = match f.decision() {
+                        crate::mfa::Decision::Session => None,
+                        crate::mfa::Decision::Enrol => Some(session::SCOPE_MFA_ENROLMENT),
+                        crate::mfa::Decision::Challenge(methods) => {
+                            let state = crate::mfa::mfa_state(reregister);
+                            let txn = crate::ceremony::insert_in_tx(
+                                tx,
+                                &keys,
+                                crate::ceremony::New {
+                                    tenant,
+                                    kind: crate::ceremony::Kind::Mfa,
+                                    source: &source,
+                                    user: Some(user),
+                                    session: None,
+                                    state: &state,
+                                },
+                            )
+                            .await?;
+                            return Ok(LoginOutcome::Mfa(txn, methods));
+                        }
+                    };
+                    let nt = session::create_session(
+                        tx,
+                        tenant,
+                        user,
+                        session::NewSession {
+                            amr: vec!["pwd"],
+                            jkt,
+                            scope,
+                            user_agent: ua,
+                        },
+                        policy,
+                    )
+                    .await?;
                     Ok(LoginOutcome::Ok(Box::new(nt), reregister))
                 })
             })
@@ -810,13 +955,19 @@ impl AuthService {
             LoginOutcome::Ok(nt, reregister) => {
                 let mut a = self.finish_tokens(*nt).await?;
                 a.reregister = reregister;
-                Ok(a)
+                Ok(LoginResult::Authenticated(a))
             }
-            LoginOutcome::Failed => Err(unauthenticated()),
+            LoginOutcome::Mfa(auth_txn, methods) => {
+                Ok(LoginResult::MfaRequired(crate::mfa::MfaChallenge {
+                    auth_txn,
+                    methods,
+                }))
+            }
+            LoginOutcome::Failed => Err(self.mfa_or(login_txn, unauthenticated()).await),
         }
     }
 
-    async fn finish_tokens(&self, nt: NewTokens) -> AuthResult<Authenticated> {
+    pub(crate) async fn finish_tokens(&self, nt: NewTokens) -> AuthResult<Authenticated> {
         let expires_in = nt.claims.exp - nt.claims.iat;
         let at = self.tokens.sign(nt.claims).await?;
         Ok(Authenticated {
@@ -841,6 +992,14 @@ impl AuthService {
     ) -> AuthResult<RegisterStart> {
         let g = token::parse(grant).map_err(|_| grant_required())?;
         let login = normalize_login(login).map_err(|e| invalid("/login", &e.to_string()))?;
+        // Contract §5: registration is rate limited per source, tenant and account.
+        self.limit(
+            "register",
+            source,
+            Some(&g.tenant_id.as_uuid().to_string()),
+            Some(&login),
+        )
+        .await?;
         let request = RegistrationRequest::<Suite>::deserialize(registration_request)
             .map_err(|_| invalid("/registration_request", "malformed registration_request"))?;
         let keys = self.keys().await?;
@@ -864,7 +1023,14 @@ impl AuthService {
                 })
             })
             .await?;
-        let (uid, user_login) = user.ok_or_else(grant_required)?;
+        // [R5]: a recovery grant re-registers an active user.
+        let (uid, user_login) = match user {
+            Some(u) => u,
+            None => match self.recovery_grant_user(tenant, ghash).await? {
+                Some(u) => u,
+                None => return Err(self.mfa_or(grant, grant_required()).await),
+            },
+        };
         if user_login != login {
             return Err(invalid(
                 "/login",
@@ -906,13 +1072,35 @@ impl AuthService {
     }
 
     /// `register/finish {registration_txn, registration_upload}` → 204, consuming the grant.
+    ///
+    /// - Setup link: stores the registration, marks the link used and activates the user.
+    /// - Recovery grant (`[R5]`): one identity transaction replaces the OPAQUE registration,
+    ///   revokes every session of the user (generation bump each) and every refresh family,
+    ///   invalidates the recovery code used (if any), marks the request `completed` (which uses
+    ///   the grant up) and writes `identity.credentials.changed`, `identity.session.revoked` per
+    ///   session and `identity.recovery.completed`. A used grant is `unauthenticated`; an
+    ///   expired one also moves the request to `expired`.
+    /// - `idempotency_key`: a retry with the same key and body replays the stored outcome
+    ///   (M0 idempotency records, scope = the registration txn).
     pub async fn register_finish(
         &self,
         registration_txn: &str,
         registration_upload: &[u8],
         source: &str,
+        idempotency_key: Option<&cs_common::idempotency::IdempotencyKey>,
     ) -> AuthResult<()> {
+        use cs_db::idempotency::{
+            Begin, IdempotencyRecords, IdempotencyScope, RequestBody, StoredResponse,
+            request_digest,
+        };
         let parsed = token::parse(registration_txn).map_err(|_| grant_required())?;
+        self.limit(
+            "register",
+            source,
+            Some(&parsed.tenant_id.as_uuid().to_string()),
+            None,
+        )
+        .await?;
         let upload = RegistrationUpload::<Suite>::deserialize(registration_upload)
             .map_err(|_| invalid("/registration_upload", "malformed registration_upload"))?;
         let file = ServerRegistration::<Suite>::finish(upload)
@@ -921,113 +1109,83 @@ impl AuthService {
         let keys = self.keys().await?;
         let (tenant, hash) = (parsed.tenant_id, parsed.hash);
         let source = source.to_owned();
-        self.pool
+        // Idempotency scope: the registration txn (a deterministic v7-shaped principal id
+        // derived from its hash, so a retry after the txn was consumed finds the record).
+        let idem = match idempotency_key {
+            Some(k) => {
+                let mut b = [0u8; 16];
+                b.copy_from_slice(&hash.as_bytes()[..16]);
+                let u = uuid::Builder::from_bytes(b)
+                    .with_variant(uuid::Variant::RFC4122)
+                    .with_version(uuid::Version::SortRand)
+                    .into_uuid();
+                let principal =
+                    cs_common::id::PrincipalId::from_uuid(u).map_err(Error::internal)?;
+                let body = serde_json::json!({
+                    "registration_txn": registration_txn,
+                    "registration_upload": hash_hex(registration_upload),
+                })
+                .to_string();
+                let digest = request_digest(
+                    "POST",
+                    "/api/v2/auth/opaque/register/finish",
+                    &std::collections::BTreeMap::new(),
+                    RequestBody::Json(body.as_bytes()),
+                )?;
+                Some((
+                    IdempotencyScope {
+                        tenant_id: tenant,
+                        principal_id: principal,
+                        key: k.clone(),
+                    },
+                    digest,
+                ))
+            }
+            None => None,
+        };
+        let retention = self.policy.idempotency_retention_hours;
+        let out = self
+            .pool
             .transaction(move |tx| {
-                let (keys, file, source) = (keys.clone(), file.clone(), source.clone());
+                let (keys, file, source, idem) =
+                    (keys.clone(), file.clone(), source.clone(), idem.clone());
                 Box::pin(async move {
-                    let fail = || DbError::app(grant_required());
-                    let t = take_txn(tx, tenant, &hash, "registration")
-                        .await?
-                        .ok_or_else(fail)?;
-                    if t.source != source {
-                        return Err(fail());
+                    if let Some((scope, digest)) = &idem
+                        && let Begin::Replay(r) =
+                            IdempotencyRecords::begin(tx, scope, digest, retention).await?
+                    {
+                        return Ok(if r.status == 204 {
+                            RegOutcome::Done
+                        } else {
+                            RegOutcome::Refused
+                        });
                     }
-                    let k = keys.get(t.key_version).ok_or_else(fail)?;
-                    let st = k
-                        .open(&t.sealed, &txn_ad(&tenant, &hash, "registration"))
-                        .ok_or_else(fail)?;
-                    let ksf = ksf_parse(&st).ok_or_else(fail)?;
-                    if !ksf.is_valid() {
-                        return Err(DbError::app(invalid(
-                            "/ksf_params",
-                            "KSF parameters outside the allowed bounds",
-                        )));
-                    }
-                    let (uid, grant) = (t.user.ok_or_else(fail)?, t.grant.ok_or_else(fail)?);
-                    // Consume the grant (CAS on state).
-                    let used = sqlx::query(
-                        "UPDATE setup_links SET state = 'used', used_at = now(), version = version + 1 \
-                         WHERE tenant_id = $1 AND token_hash = $2 AND user_id = $3 \
-                           AND state = 'active' AND expires_at > now()",
-                    )
-                    .bind(tenant.as_uuid())
-                    .bind(&grant)
-                    .bind(uid)
-                    .execute(tx.conn())
-                    .await?
-                    .rows_affected();
-                    if used != 1 {
-                        return Err(fail());
-                    }
-                    let activated = sqlx::query(
-                        "UPDATE users SET status = 'active', version = version + 1, updated_at = now() \
-                         WHERE tenant_id = $1 AND user_id = $2 AND status = 'invited'",
-                    )
-                    .bind(tenant.as_uuid())
-                    .bind(uid)
-                    .execute(tx.conn())
-                    .await?
-                    .rows_affected();
-                    if activated != 1 {
-                        return Err(fail());
-                    }
-                    sqlx::query(
-                        "INSERT INTO opaque_registrations (tenant_id, user_id, password_file, \
-                           ksf_m_kib, ksf_t, ksf_p, server_key_version, version) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, 1) \
-                         ON CONFLICT (tenant_id, user_id) DO UPDATE SET \
-                           password_file = EXCLUDED.password_file, ksf_m_kib = EXCLUDED.ksf_m_kib, \
-                           ksf_t = EXCLUDED.ksf_t, ksf_p = EXCLUDED.ksf_p, \
-                           server_key_version = EXCLUDED.server_key_version, \
-                           version = opaque_registrations.version + 1, updated_at = now()",
-                    )
-                    .bind(tenant.as_uuid())
-                    .bind(uid)
-                    .bind(&file)
-                    .bind(to_i32(ksf.m_kib))
-                    .bind(to_i32(ksf.t))
-                    .bind(to_i32(ksf.p))
-                    .bind(k.label())
-                    .execute(tx.conn())
-                    .await?;
-                    let user =
-                        UserId::from_uuid(uid).map_err(|e| DbError::Invalid(e.to_string()))?;
-                    Outbox::append(
-                        tx,
-                        NewEvent {
-                            tenant_id: Some(tenant),
-                            event_type: "identity.credentials.changed",
-                            event_version: 1,
-                            partition_key: uid,
-                            payload: &CredentialsChanged {
-                                tenant_id: tenant,
-                                user_id: user,
-                                method: "opaque",
-                                reason: "setup_link",
+                    let out =
+                        register_finish_in_tx(tx, &keys, tenant, &hash, &file, &source).await?;
+                    if let Some((scope, _)) = &idem {
+                        let status = if matches!(out, RegOutcome::Done) {
+                            204
+                        } else {
+                            401
+                        };
+                        IdempotencyRecords::complete(
+                            tx,
+                            scope,
+                            &StoredResponse {
+                                status,
+                                body: Vec::new(),
                             },
-                        },
-                    )
-                    .await?;
-                    Outbox::append(
-                        tx,
-                        NewEvent {
-                            tenant_id: Some(tenant),
-                            event_type: "identity.user.updated",
-                            event_version: 1,
-                            partition_key: uid,
-                            payload: &UserUpdated {
-                                tenant_id: tenant,
-                                user_id: user,
-                                status: "active",
-                            },
-                        },
-                    )
-                    .await?;
-                    Ok(())
+                        )
+                        .await?;
+                    }
+                    Ok(out)
                 })
             })
-            .await
-            .map_err(AuthError::from)
+            .await?;
+        match out {
+            RegOutcome::Done => Ok(()),
+            RegOutcome::Refused => Err(unauthenticated()),
+        }
     }
 
     /// `register/start {purpose, registration_request}` with the session's access token
@@ -1286,7 +1444,7 @@ impl AuthService {
                 tracing::warn!(tenant = %tenant.as_uuid(), "DPoP-bound refresh without a proof of its key: session revoked");
                 Err(unauthenticated())
             }
-            RefreshOutcome::Invalid => Err(unauthenticated()),
+            RefreshOutcome::Invalid => Err(self.mfa_or(refresh_token, unauthenticated()).await),
         }
     }
 
@@ -1308,7 +1466,7 @@ impl AuthService {
     }
 
     /// Tenant, user and session named by verified access-token claims.
-    fn subject(claims: &AccessClaims) -> AuthResult<(TenantId, UserId, SessionId)> {
+    pub(crate) fn subject(claims: &AccessClaims) -> AuthResult<(TenantId, UserId, SessionId)> {
         let uuid = |s: &str| Uuid::parse_str(s).map_err(|_| unauthenticated());
         Ok((
             TenantId::from_uuid(uuid(&claims.tid)?).map_err(|_| unauthenticated())?,
@@ -1630,4 +1788,237 @@ pub fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// Outcome of `register/finish`.
+#[derive(Debug, Clone, Copy)]
+enum RegOutcome {
+    Done,
+    /// A used or expired recovery grant (`unauthenticated`); the state change commits.
+    Refused,
+}
+
+/// BLAKE3 hex of a request part (idempotency digest input).
+fn hash_hex(b: &[u8]) -> String {
+    blake3::hash(b).to_hex().to_string()
+}
+
+#[derive(Serialize)]
+struct RecoveryCompleted {
+    tenant_id: TenantId,
+    user_id: UserId,
+    request_id: Uuid,
+    sessions_revoked: usize,
+}
+
+async fn upsert_registration(
+    tx: &mut DomainTx,
+    tenant: TenantId,
+    uid: Uuid,
+    file: &[u8],
+    ksf: &KsfParams,
+    key_label: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO opaque_registrations (tenant_id, user_id, password_file, \
+           ksf_m_kib, ksf_t, ksf_p, server_key_version, version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 1) \
+         ON CONFLICT (tenant_id, user_id) DO UPDATE SET \
+           password_file = EXCLUDED.password_file, ksf_m_kib = EXCLUDED.ksf_m_kib, \
+           ksf_t = EXCLUDED.ksf_t, ksf_p = EXCLUDED.ksf_p, \
+           server_key_version = EXCLUDED.server_key_version, \
+           version = opaque_registrations.version + 1, updated_at = now()",
+    )
+    .bind(tenant.as_uuid())
+    .bind(uid)
+    .bind(file)
+    .bind(to_i32(ksf.m_kib))
+    .bind(to_i32(ksf.t))
+    .bind(to_i32(ksf.p))
+    .bind(key_label)
+    .execute(tx.conn())
+    .await?;
+    Ok(())
+}
+
+/// The body of `register/finish` inside its transaction (see [`AuthService::register_finish`]).
+async fn register_finish_in_tx(
+    tx: &mut DomainTx,
+    keys: &OpaqueKeys,
+    tenant: TenantId,
+    hash: &TokenHash,
+    file: &[u8],
+    source: &str,
+) -> Result<RegOutcome, DbError> {
+    let fail = || DbError::app(grant_required());
+    let t = take_txn(tx, tenant, hash, "registration")
+        .await?
+        .ok_or_else(fail)?;
+    if t.source != source {
+        return Err(fail());
+    }
+    let k = keys.get(t.key_version).ok_or_else(fail)?;
+    let st = k
+        .open(&t.sealed, &txn_ad(&tenant, hash, "registration"))
+        .ok_or_else(fail)?;
+    let ksf = ksf_parse(&st).ok_or_else(fail)?;
+    if !ksf.is_valid() {
+        return Err(DbError::app(invalid(
+            "/ksf_params",
+            "KSF parameters outside the allowed bounds",
+        )));
+    }
+    let (uid, grant) = (t.user.ok_or_else(fail)?, t.grant.ok_or_else(fail)?);
+    let user = UserId::from_uuid(uid).map_err(|e| DbError::Invalid(e.to_string()))?;
+    // Setup link: consume it (CAS on state).
+    let used = sqlx::query(
+        "UPDATE setup_links SET state = 'used', used_at = now(), version = version + 1 \
+         WHERE tenant_id = $1 AND token_hash = $2 AND user_id = $3 \
+           AND state = 'active' AND expires_at > now()",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&grant)
+    .bind(uid)
+    .execute(tx.conn())
+    .await?
+    .rows_affected();
+    if used == 1 {
+        let activated = sqlx::query(
+            "UPDATE users SET status = 'active', version = version + 1, updated_at = now() \
+             WHERE tenant_id = $1 AND user_id = $2 AND status = 'invited'",
+        )
+        .bind(tenant.as_uuid())
+        .bind(uid)
+        .execute(tx.conn())
+        .await?
+        .rows_affected();
+        if activated != 1 {
+            return Err(fail());
+        }
+        upsert_registration(tx, tenant, uid, file, &ksf, &k.label()).await?;
+        Outbox::append(
+            tx,
+            NewEvent {
+                tenant_id: Some(tenant),
+                event_type: "identity.credentials.changed",
+                event_version: 1,
+                partition_key: uid,
+                payload: &CredentialsChanged {
+                    tenant_id: tenant,
+                    user_id: user,
+                    method: "opaque",
+                    reason: "setup_link",
+                },
+            },
+        )
+        .await?;
+        Outbox::append(
+            tx,
+            NewEvent {
+                tenant_id: Some(tenant),
+                event_type: "identity.user.updated",
+                event_version: 1,
+                partition_key: uid,
+                payload: &UserUpdated {
+                    tenant_id: tenant,
+                    user_id: user,
+                    status: "active",
+                },
+            },
+        )
+        .await?;
+        return Ok(RegOutcome::Done);
+    }
+    // [R5] recovery grant: lock the request.
+    let req: Option<(Uuid, String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT request_id, state, grant_expires_at > now(), code_id FROM recovery_requests \
+         WHERE tenant_id = $1 AND grant_hash = $2 AND user_id = $3 FOR UPDATE",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&grant)
+    .bind(uid)
+    .fetch_optional(tx.conn())
+    .await?;
+    let Some((rid, state, live, code_id)) = req else {
+        return Err(fail());
+    };
+    if state != "granted" {
+        return Ok(RegOutcome::Refused);
+    }
+    if !live {
+        sqlx::query(
+            "UPDATE recovery_requests SET state = 'expired', version = version + 1, \
+               updated_at = now() WHERE tenant_id = $1 AND request_id = $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind(rid)
+        .execute(tx.conn())
+        .await?;
+        return Ok(RegOutcome::Refused);
+    }
+    if !crate::webauthn::loginable_in_tx(tx, tenant, user).await? {
+        return Err(DbError::app(unauthenticated()));
+    }
+    // The recovery code used must still be unused (it may have been spent meanwhile).
+    if let Some(c) = &code_id
+        && !crate::recovery::use_code_in_tx(tx, tenant, user, c).await?
+    {
+        return Err(DbError::app(unauthenticated()));
+    }
+    sqlx::query(
+        "UPDATE recovery_requests SET state = 'completed', version = version + 1, \
+           updated_at = now() WHERE tenant_id = $1 AND request_id = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(rid)
+    .execute(tx.conn())
+    .await?;
+    upsert_registration(tx, tenant, uid, file, &ksf, &k.label()).await?;
+    // Every session and refresh family of the user: there is no state in which the new
+    // password exists and an old session is still valid.
+    let sessions: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT session_id FROM sessions WHERE tenant_id = $1 AND user_id = $2 AND state = 'active'",
+    )
+    .bind(tenant.as_uuid())
+    .bind(uid)
+    .fetch_all(tx.conn())
+    .await?;
+    let n = sessions.len();
+    for s in sessions {
+        let s = SessionId::from_uuid(s).map_err(|e| DbError::Invalid(e.to_string()))?;
+        session::revoke_session(tx, tenant, s, "recovery").await?;
+    }
+    Outbox::append(
+        tx,
+        NewEvent {
+            tenant_id: Some(tenant),
+            event_type: "identity.credentials.changed",
+            event_version: 1,
+            partition_key: uid,
+            payload: &CredentialsChanged {
+                tenant_id: tenant,
+                user_id: user,
+                method: "opaque",
+                reason: "recovery",
+            },
+        },
+    )
+    .await?;
+    Outbox::append(
+        tx,
+        NewEvent {
+            tenant_id: Some(tenant),
+            event_type: "identity.recovery.completed",
+            event_version: 1,
+            partition_key: uid,
+            payload: &RecoveryCompleted {
+                tenant_id: tenant,
+                user_id: user,
+                request_id: rid,
+                sessions_revoked: n,
+            },
+        },
+    )
+    .await?;
+    Ok(RegOutcome::Done)
 }

@@ -47,6 +47,9 @@ pub struct AccessClaims {
     pub jti: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cnf: Option<Confirmation>,
+    /// (rev 11) `"mfa_enrolment"` on an enrolment-only session; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scp: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

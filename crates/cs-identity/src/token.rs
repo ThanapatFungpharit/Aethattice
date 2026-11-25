@@ -40,6 +40,11 @@ impl TokenHash {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// A stored hash (e.g. sealed inside ceremony state).
+    pub fn from_bytes(b: [u8; 32]) -> Self {
+        Self(b)
+    }
 }
 
 impl fmt::Debug for TokenHash {

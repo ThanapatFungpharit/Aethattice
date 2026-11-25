@@ -28,13 +28,20 @@
 
 pub mod admin;
 pub mod auth;
+pub mod ceremony;
 pub mod dpop;
 pub mod http;
 pub mod jws;
 pub mod keys;
+pub mod me;
+pub mod mfa;
+pub mod notify;
+pub mod ratelimit;
+pub mod recovery;
 pub use cs_identity_wire::login;
 pub mod session;
 pub mod token;
+pub mod webauthn;
 
 use cs_db::migrate::{MigrationError, MigrationSet};
 
@@ -53,6 +60,10 @@ pub fn migrations() -> Result<MigrationSet, MigrationError> {
         (
             "0102_expiry_buckets.expand.sql",
             include_str!("../migrations/identity/0102_expiry_buckets.expand.sql"),
+        ),
+        (
+            "0103_mfa_recovery_webauthn.expand.sql",
+            include_str!("../migrations/identity/0103_mfa_recovery_webauthn.expand.sql"),
         ),
     ])
 }
