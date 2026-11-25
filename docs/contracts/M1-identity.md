@@ -202,6 +202,9 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
       - Its access token carries `scp: "mfa_enrolment"`.
       - It may call only `webauthn/register/*`, `me/recovery-codes`, `GET /me` and logout. Every other endpoint answers 401 with `mfa_required`.
       - Once a factor is enrolled, the user signs in again normally.
+  - **`reregister` with MFA:** for MFA users the flag is set on the §2.4 result of `webauthn/assert/finish` (MFA) and `mfa/recovery-code`, never on the `mfa_required` body.
+    - The client may keep the password only as bytes (`Uint8Array`), never as a string. It keeps them only while the MFA prompt is open, at most for the `auth_txn` lifetime.
+    - It runs `ksf_upgrade` immediately after MFA succeeds, then zeroes the bytes. It also zeroes them on cancel, failure or timeout.
   - **New policy keys** (ranges are provisional until the owner records them in erratum C13):
     - `mfa_required` 0 (0–1);
     - `dpop_first_party_required` 0 (0–1);
@@ -298,3 +301,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-26 rev 10 (TL, frontend proposal): recovery endpoints per method (code without a waiting period; email by link with a waiting period, plus a recovery code for MFA users; device approval; admin-assisted; cancel), and WebAuthn, passkey, session and recovery-code wire shapes.
 - 2026-11-26 rev 10 addendum: RFC 3339 timestamps in bodies; `me/recovery-requests` item shape; `status` body and response.
 - 2026-11-26 rev 11 (TL, backend proposals): recovery-code sets, user email, session and passkey columns, MFA definition and the enrolment-only session, `mfa_required` response and 5 min `auth_txn`, new policy keys (ranges pending owner approval, C13).
+- 2026-11-26 rev 11 addendum: `reregister` on MFA completion, and bounded client-side retention of the password bytes.
