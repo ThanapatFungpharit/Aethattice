@@ -35,14 +35,35 @@ async fn exists(admin: &str, name: &str) -> bool {
     n == 1
 }
 
+async fn objects(url: &str) -> i64 {
+    use sqlx::Connection;
+    let mut c = sqlx::PgConnection::connect(url).await.unwrap();
+    let n: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace) \
+         + (SELECT count(*) FROM pg_namespace WHERE nspname = 'qa_extra')",
+    )
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    let _ = c.close().await;
+    n
+}
+
+/// Pooled harness (no CREATE/DROP DATABASE per test): two live leases are distinct and
+/// isolated; both the explicit reset and the panic-path reset leave the database empty and
+/// connectable (a disabled database is re-enabled) without dropping it.
 #[tokio::test]
-async fn test_db_is_created_isolated_and_dropped() {
+async fn test_db_is_leased_isolated_and_reset() {
     let admin = require_db!();
     let a = TestDb::create(&admin, "harness").await;
     let b = TestDb::create(&admin, "harness").await;
-    assert_ne!(a.name, b.name, "database names must be unique per test");
-    a.exec("CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t VALUES (1)")
-        .await;
+    assert_ne!(a.name, b.name, "two live leases must be different databases");
+    assert!(a.name.starts_with(support::db::POOL_PREFIX));
+    a.exec(
+        "CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t VALUES (1); \
+         CREATE SCHEMA qa_extra; CREATE TABLE qa_extra.u (id int PRIMARY KEY)",
+    )
+    .await;
     assert_eq!(a.scalar_i64("SELECT count(*)::bigint FROM t").await, 1);
     assert_eq!(
         b.scalar_i64(
@@ -51,17 +72,26 @@ async fn test_db_is_created_isolated_and_dropped() {
         .await,
         0
     );
-    let (na, nb) = (a.name.clone(), b.name.clone());
-    a.drop_forced().await;
-    assert!(!exists(&admin, &na).await, "explicit drop left {na}");
-    // Implicit drop (the panic path) also cleans up.
-    if support::db::defer_drop() {
-        b.drop_forced().await;
-        assert!(!exists(&admin, &nb).await, "forced drop left {nb}");
-        return;
-    }
+    b.exec("CREATE TABLE w (id int PRIMARY KEY)").await;
+    b.make_unavailable().await;
+    let (na, nb, ua, ub) = (a.name.clone(), b.name.clone(), a.url.clone(), b.url.clone());
+    let leaked = support::db::LEAKED.load(std::sync::atomic::Ordering::SeqCst);
+    a.drop_now().await;
+    assert!(
+        exists(&admin, &na).await,
+        "pool database {na} must be reused, not dropped"
+    );
+    assert_eq!(objects(&ua).await, 0, "explicit reset left objects in {na}");
+    // Implicit reset (the panic path) also cleans up and re-enables connections.
+    assert!(b.is_leased());
     drop(b);
-    assert!(!exists(&admin, &nb).await, "Drop guard left {nb}");
+    assert!(exists(&admin, &nb).await);
+    assert_eq!(objects(&ub).await, 0, "Drop guard left objects in {nb}");
+    assert_eq!(
+        support::db::LEAKED.load(std::sync::atomic::Ordering::SeqCst),
+        leaked,
+        "QA HARNESS LEAK reported"
+    );
 }
 
 #[tokio::test]
