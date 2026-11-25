@@ -8,6 +8,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -1188,6 +1190,50 @@ async fn recovery_by_code_and_r5_completion() {
         1
     );
     e.t.cleanup().await;
+}
+
+/// Rev 13: the email recovery link goes through the SMTP relay. `recovery/start` answers 202
+/// without waiting for SMTP (the fake server greets only after 3 s), and the delivered link
+/// works with `recovery/status`.
+#[tokio::test]
+async fn recovery_email_through_smtp_relay_never_waits_for_smtp() {
+    let Some(mut e) = env().await else { return };
+    let t = alice(&e, "pw").await;
+    let ts = t.as_uuid().to_string();
+    exec(
+        e.pool(),
+        "UPDATE users SET email = 'alice@mail.test', email_verified_at = now()",
+    )
+    .await;
+    let smtp = common::fake_smtp::FakeSmtp::start(Duration::from_secs(3), 0).await;
+    let relay = cs_identity::notify::SmtpRelay::start(&smtp.config(), DOMAIN).unwrap();
+    let auth = Arc::new(
+        AuthService::new(e.pool().clone(), e.kms.clone(), DOMAIN, SessionPolicy::default())
+            .with_rate_limiter(RateLimiter::local_only(generous()))
+            .with_notifier(Arc::new(relay)),
+    );
+    e.app = app(auth);
+    let t0 = std::time::Instant::now();
+    let (s, _, a) = e
+        .post(
+            "/api/v2/auth/recovery/start",
+            json!({"tenant": ts, "login": LOGIN, "method": "email"}),
+        )
+        .await;
+    let elapsed = t0.elapsed();
+    assert_eq!((s, a), (StatusCode::ACCEPTED, json!({"state": "pending"})));
+    assert!(elapsed < Duration::from_secs(3), "start waited for SMTP: {elapsed:?}");
+    assert!(smtp.mails.lock().unwrap().is_empty());
+    let mails = smtp.wait_for(1, Duration::from_secs(20)).await;
+    assert_eq!(mails.len(), 1);
+    assert!(mails[0].contains("To: alice@mail.test"), "{}", mails[0]);
+    assert!(mails[0].contains(&format!("https://{DOMAIN}/#/recover/rt1.")));
+    let link = common::fake_smtp::link_token(&mails[0]).unwrap();
+    let (s, _, st) = e
+        .post("/api/v2/auth/recovery/status", json!({"token": link}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{st}");
+    assert_eq!(st["state"], "pending");
 }
 
 /// rev 10 email method (waiting period, identical 202, link only through the Notifier, MFA

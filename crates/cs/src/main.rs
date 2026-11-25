@@ -44,6 +44,10 @@ enum Cmd {
     Serve {
         #[arg(long)]
         config: PathBuf,
+        /// Development profile. Required by `[notifier] kind = "dev_log"`, which writes bearer
+        /// secrets to stderr ([R7]). Never use in production.
+        #[arg(long)]
+        dev: bool,
     },
     /// Apply database migrations for every configured domain.
     Migrate {
@@ -59,6 +63,9 @@ enum Cmd {
     CheckConfig {
         #[arg(long)]
         config: PathBuf,
+        /// Check for the `cs serve --dev` profile ([R7]).
+        #[arg(long)]
+        dev: bool,
     },
     /// Identity administration (M1: CLI only; no HTTP admin API until M2).
     Admin {
@@ -284,9 +291,18 @@ async fn shutdown_signal() {
     }
 }
 
-async fn serve(path: &Path) -> Result<(), String> {
+/// Profile-dependent checks shared by `serve` and `check-config` (M1 contract §4 rev 13, [R7]).
+fn check_profile(cfg: &Config, dev: bool) -> Result<(), String> {
+    cfg.check_profile(dev).map_err(|e| format!("cs: {e}"))?;
+    let domain = cfg.api.as_ref().map(|a| a.deployment_domain.as_str()).unwrap_or("");
+    cs_identity::notify::validate_config(cfg.notifier.as_ref(), domain, dev)
+        .map_err(|e| format!("cs: invalid [notifier]: {}", admin_error(&e)))
+}
+
+async fn serve(path: &Path, dev: bool) -> Result<(), String> {
     let cfg = load(path)?;
     check_roles(&cfg)?;
+    check_profile(&cfg, dev)?;
     let telemetry = cs_common::telemetry::init(&cfg.telemetry).map_err(|e| format!("cs: {e}"))?;
     let kms = open_kms(&cfg)?;
     let api = cfg
@@ -343,6 +359,22 @@ async fn serve(path: &Path) -> Result<(), String> {
             )
             .map_err(|e| format!("cs: invalid valkey.url: {e}"))?;
             let auth = auth.with_rate_limiter(limiter);
+            // Recovery-link delivery (M1 contract §4 rev 13): best effort, bounded queue.
+            if dev {
+                tracing::warn!("cs serve --dev: development profile, not for production");
+            }
+            if cfg.notifier.is_none() {
+                tracing::warn!(
+                    "[notifier] not configured: email recovery cannot deliver links (recovery/start still answers 202)"
+                );
+            }
+            let notifier = cs_identity::notify::from_config(
+                cfg.notifier.as_ref(),
+                &api.deployment_domain,
+                dev,
+            )
+            .map_err(|e| format!("cs: invalid [notifier]: {}", admin_error(&e)))?;
+            let auth = auth.with_notifier(notifier);
             routes = routes.merge(cs_identity::http::routes(Arc::new(auth)));
         }
         _ => tracing::warn!(
@@ -598,14 +630,16 @@ fn main() -> ExitCode {
         }
     };
     let res = match cli.cmd {
-        Cmd::Serve { config } => rt.block_on(serve(&config)),
+        Cmd::Serve { config, dev } => rt.block_on(serve(&config, dev)),
         Cmd::Migrate { config } => rt.block_on(migrate(&config)),
         Cmd::InitKms { config } => init_kms(&config),
         Cmd::Admin { config, action } => rt.block_on(admin(&config, action)),
-        Cmd::CheckConfig { config } => load(&config).map(|c| {
-            let roles: Vec<_> = c.roles.iter().map(|r| r.as_str()).collect();
-            println!("configuration valid (roles: {})", roles.join(", "));
-        }),
+        Cmd::CheckConfig { config, dev } => load(&config)
+            .and_then(|c| check_profile(&c, dev).map(|()| c))
+            .map(|c| {
+                let roles: Vec<_> = c.roles.iter().map(|r| r.as_str()).collect();
+                println!("configuration valid (roles: {})", roles.join(", "));
+            }),
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,

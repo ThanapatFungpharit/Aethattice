@@ -453,6 +453,111 @@ pub struct ValkeyConfig {
     pub url: Secret<String>,
 }
 
+/// Which recovery-link notifier `cs serve` uses (M1 contract §4, rev 13). There is no default:
+/// without a `[notifier]` section nothing is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifierKind {
+    /// Outbound SMTP relay (`[notifier.smtp]`).
+    Smtp,
+    /// `[R7]` Development sink that writes bearer secrets; needs `--dev`.
+    DevLog,
+}
+
+/// Transport security of the SMTP relay connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmtpTls {
+    /// Implicit TLS (SMTPS).
+    Tls,
+    /// Plaintext connect, then mandatory STARTTLS (no plaintext fallback).
+    Starttls,
+    /// Plaintext; only accepted for loopback hosts.
+    None,
+}
+
+/// `[notifier.smtp]` (M1 contract §4, rev 13).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    pub tls: SmtpTls,
+    #[serde(default)]
+    pub username: Option<Secret<String>>,
+    #[serde(default)]
+    pub password: Option<Secret<String>>,
+    /// Sender mailbox, e.g. `Cloud System <no-reply@example.com>`.
+    pub from: String,
+}
+
+/// `[notifier]` (M1 contract §4, rev 13).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifierConfig {
+    pub kind: NotifierKind,
+    #[serde(default)]
+    pub smtp: Option<SmtpConfig>,
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn validate_notifier(n: &NotifierConfig, has_api: bool, errs: &mut Vec<String>) {
+    match (n.kind, &n.smtp) {
+        (NotifierKind::Smtp, None) => {
+            errs.push("notifier.smtp: section required when notifier.kind = \"smtp\"".to_owned())
+        }
+        (NotifierKind::DevLog, Some(_)) => errs.push(
+            "notifier.smtp: not allowed when notifier.kind = \"dev_log\"".to_owned(),
+        ),
+        _ => {}
+    }
+    if !has_api {
+        errs.push(
+            "notifier: needs the [api] section (links use api.deployment_domain)".to_owned(),
+        );
+    }
+    let Some(s) = &n.smtp else { return };
+    let host_ok = !s.host.is_empty()
+        && s.host.len() <= 253
+        && s
+            .host
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b':' | b'[' | b']'));
+    if !host_ok {
+        errs.push("notifier.smtp.host: must be a host name or IP address".to_owned());
+    }
+    if s.port == 0 {
+        errs.push("notifier.smtp.port: must be 1..=65535".to_owned());
+    }
+    if s.tls == SmtpTls::None && !is_loopback_host(&s.host) {
+        errs.push(
+            "notifier.smtp.tls: \"none\" is only allowed for loopback hosts (recovery links are bearer secrets)"
+                .to_owned(),
+        );
+    }
+    match (&s.username, &s.password) {
+        (Some(u), Some(_)) if u.expose_secret().is_empty() => {
+            errs.push("notifier.smtp.username: must not be empty".to_owned())
+        }
+        (Some(_), None) | (None, Some(_)) => errs.push(
+            "notifier.smtp: username and password must be given together".to_owned(),
+        ),
+        _ => {}
+    }
+    let f = &s.from;
+    if f.is_empty() || f.len() > 320 || !f.contains('@') || f.chars().any(char::is_control) {
+        errs.push("notifier.smtp.from: must be a mailbox such as `Name <user@example.com>`".to_owned());
+    }
+}
+
 /// Cluster facts known from configuration until cluster membership arrives (M8).
 /// `node_count` (M1 contract §5, rev 11) divides the rate limits for the local-bucket fallback
 /// when Valkey is unavailable (limit/N per node); `check-config` rejects N < 1.
@@ -558,6 +663,8 @@ struct RawConfig {
     #[serde(default)]
     valkey: Option<ValkeyConfig>,
     #[serde(default)]
+    notifier: Option<NotifierConfig>,
+    #[serde(default)]
     cluster: ClusterConfig,
     #[serde(default)]
     telemetry: TelemetryConfig,
@@ -576,6 +683,8 @@ pub struct Config {
     pub kms: Option<KmsConfig>,
     pub api: Option<ApiConfig>,
     pub valkey: Option<ValkeyConfig>,
+    /// Recovery-link notifier; `None` means nothing is sent (M1 contract §4, rev 13).
+    pub notifier: Option<NotifierConfig>,
     pub cluster: ClusterConfig,
     pub telemetry: TelemetryConfig,
     pub policy: Policy,
@@ -727,6 +836,10 @@ impl Config {
             }
         }
 
+        if let Some(n) = &raw.notifier {
+            validate_notifier(n, raw.api.is_some(), &mut errs);
+        }
+
         if raw.cluster.node_count < 1 {
             errs.push("cluster.node_count: must be at least 1 (rate-limit fallback limit/N, M1 contract §5)".to_owned());
         }
@@ -757,12 +870,25 @@ impl Config {
                 kms: raw.kms,
                 api: raw.api,
                 valkey: raw.valkey,
+                notifier: raw.notifier,
                 cluster: raw.cluster,
                 telemetry: raw.telemetry,
                 policy,
                 locked_policy,
             }),
             _ => Err(ConfigError::Invalid(errs)),
+        }
+    }
+
+    /// Checks that depend on the run profile. `[R7]` the `dev_log` notifier writes bearer
+    /// secrets, so it is refused unless `cs serve` / `cs check-config` run with `--dev`.
+    pub fn check_profile(&self, dev: bool) -> Result<(), ConfigError> {
+        match &self.notifier {
+            Some(n) if n.kind == NotifierKind::DevLog && !dev => Err(ConfigError::Invalid(vec![
+                "notifier.kind: \"dev_log\" writes bearer secrets and is only allowed with --dev ([R7])"
+                    .to_owned(),
+            ])),
+            _ => Ok(()),
         }
     }
 
@@ -1013,5 +1139,47 @@ policy = ["idempotency_retention_hours"]
         );
         let e = invalid(&g);
         assert!(!e.contains("hunter2"), "{e}");
+    }
+
+    /// `[notifier]` (M1 contract §4, rev 13; [R7]).
+    #[test]
+    fn notifier_section() {
+        let g = good();
+        assert!(Config::from_toml_str(&g).unwrap().notifier.is_none());
+        let smtp = |extra: &str| {
+            format!(
+                "{g}\n[notifier]\nkind = \"smtp\"\n[notifier.smtp]\nhost = \"smtp.example.com\"\nport = 587\ntls = \"starttls\"\nfrom = \"Cloud System <no-reply@example.com>\"\n{extra}"
+            )
+        };
+        let c = Config::from_toml_str(&smtp(
+            "username = \"relay\"\npassword = \"pw-s3cr3t\"\n",
+        ))
+        .unwrap();
+        let s = c.notifier.as_ref().unwrap().smtp.as_ref().unwrap();
+        assert_eq!((s.port, s.tls), (587, SmtpTls::Starttls));
+        assert!(!format!("{c:?}").contains("pw-s3cr3t"));
+        assert!(c.check_profile(false).is_ok());
+        // both-or-neither credentials
+        assert!(invalid(&smtp("username = \"relay\"\n")).contains("together"));
+        assert!(invalid(&smtp("password = \"pw\"\n")).contains("together"));
+        // tls = none only for loopback hosts
+        let none = smtp("").replace("tls = \"starttls\"", "tls = \"none\"");
+        assert!(invalid(&none).contains("loopback"));
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let doc = none.replace("smtp.example.com", host);
+            assert!(Config::from_toml_str(&doc).is_ok(), "{host}");
+        }
+        assert!(invalid(&smtp("").replace("port = 587", "port = 0")).contains("port"));
+        assert!(invalid(&smtp("").replace("Cloud System <no-reply@example.com>", "nobody")).contains("from"));
+        assert!(invalid(&smtp("").replace("smtp.example.com", "bad host")).contains("host"));
+        assert!(invalid(&smtp("timeout = 1\n")).contains("unknown field"));
+        assert!(invalid(&format!("{g}\n[notifier]\nkind = \"smtp\"\n")).contains("notifier.smtp"));
+        assert!(invalid(&format!("{g}\n[notifier]\nkind = \"carrier_pigeon\"\n")).contains("unknown variant"));
+        // [R7] dev_log: accepted by the parser, refused by the profile check without --dev
+        let dev = Config::from_toml_str(&format!("{g}\n[notifier]\nkind = \"dev_log\"\n")).unwrap();
+        let e = dev.check_profile(false).unwrap_err().to_string();
+        assert!(e.contains("--dev"), "{e}");
+        assert!(dev.check_profile(true).is_ok());
+        assert!(invalid(&format!("{}\n[notifier]\nkind = \"dev_log\"\n[notifier.smtp]\nhost = \"h\"\nport = 25\ntls = \"tls\"\nfrom = \"a@b\"\n", g)).contains("not allowed"));
     }
 }
