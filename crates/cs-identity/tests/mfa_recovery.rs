@@ -6,6 +6,8 @@
 //! A software authenticator (P-256, `none` attestation) drives the WebAuthn ceremonies, so
 //! origin, rp id hash, user verification and the sign counter are under test control.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};

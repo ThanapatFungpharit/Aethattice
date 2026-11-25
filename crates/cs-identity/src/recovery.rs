@@ -505,7 +505,7 @@ impl AuthService {
             .await?;
         self.sweep();
         let account = self.account(tenant_id, &login).await?;
-        let ua = user_agent.map(|u| truncate_bytes(u, 256));
+        let ua = user_agent.map(|u| clip_bytes(u, 256));
         match method {
             "recovery_code" => {
                 let code = code.unwrap_or_default();
@@ -1095,8 +1095,8 @@ async fn grant_in_tx(
     }
 }
 
-/// Truncate to at most `max` bytes on a character boundary.
-pub(crate) fn truncate_bytes(s: &str, max: usize) -> String {
+/// Cut to at most `max` bytes on a character boundary.
+pub(crate) fn clip_bytes(s: &str, max: usize) -> String {
     let mut end = s.len().min(max);
     while !s.is_char_boundary(end) {
         end -= 1;
@@ -1132,9 +1132,9 @@ mod tests {
     }
 
     #[test]
-    fn truncation_respects_char_boundaries() {
-        assert_eq!(truncate_bytes("abc", 2), "ab");
-        assert_eq!(truncate_bytes("aé", 2), "a");
-        assert_eq!(truncate_bytes("ok", 256), "ok");
+    fn clipping_respects_char_boundaries() {
+        assert_eq!(clip_bytes("abc", 2), "ab");
+        assert_eq!(clip_bytes("aé", 2), "a");
+        assert_eq!(clip_bytes("ok", 256), "ok");
     }
 }
