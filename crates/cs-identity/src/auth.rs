@@ -47,6 +47,10 @@ pub const TXN_TTL_SECS: i64 = 60;
 pub const REGISTRATION_GRANT_REQUIRED: &str = "registration_grant_required";
 /// Interval between lazy sweeps of expired txn rows on one node.
 const SWEEP_INTERVAL_SECS: i64 = 60;
+/// Rows deleted per sweep transaction (App. E / §21.3: bounded, short transactions).
+pub const SWEEP_BATCH_ROWS: i64 = 500;
+/// Maximum sweep transactions per sweep run; the remainder waits for the next interval.
+pub const SWEEP_MAX_BATCHES: u32 = 20;
 
 /// Result of `login/start`.
 #[derive(Debug)]
@@ -382,8 +386,9 @@ impl AuthService {
             .cloned()
     }
 
-    /// Delete expired txn rows, at most once per interval per node (lazy reclamation).
-    async fn sweep(&self) {
+    /// Start a sweep of expired txn rows, at most once per interval per node (lazy
+    /// reclamation). It runs in the background, so a request never waits for it.
+    fn sweep(&self) {
         let now = unix_now();
         let last = self.last_sweep.load(Ordering::Relaxed);
         if now - last < SWEEP_INTERVAL_SECS
@@ -394,20 +399,11 @@ impl AuthService {
         {
             return;
         }
-        let r = self
-            .pool
-            .transaction(|tx| {
-                Box::pin(async move {
-                    sqlx::query("DELETE FROM auth_txns WHERE expires_at < now()")
-                        .execute(tx.conn())
-                        .await?;
-                    Ok(())
-                })
-            })
-            .await;
-        if let Err(e) = r {
-            tracing::warn!(error = %e, "auth txn sweep failed");
-        }
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let deleted = sweep_expired_txns(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES).await;
+            tracing::debug!(deleted, "auth txn sweep finished");
+        });
     }
 
     // ----- login -----
@@ -425,7 +421,7 @@ impl AuthService {
         let request = CredentialRequest::<Suite>::deserialize(credential_request)
             .map_err(|_| invalid("/credential_request", "malformed credential_request"))?;
         let keys = self.keys().await?;
-        self.sweep().await;
+        self.sweep();
 
         type Reg = (Uuid, String, Vec<u8>, i32, i32, i32, String);
         type DistRow = (i32, i32, i32, i64);
@@ -639,7 +635,7 @@ impl AuthService {
         let request = RegistrationRequest::<Suite>::deserialize(registration_request)
             .map_err(|_| invalid("/registration_request", "malformed registration_request"))?;
         let keys = self.keys().await?;
-        self.sweep().await;
+        self.sweep();
         let (tenant, ghash) = (g.tenant_id, g.hash);
         let user: Option<(Uuid, String)> = self
             .pool
@@ -1115,6 +1111,45 @@ pub struct Me {
 }
 
 /// Unix time in seconds.
+/// Delete expired `auth_txns` rows in bounded batches: at most `batch_rows` rows per
+/// transaction and at most `max_batches` transactions. Each batch is a short, single-domain
+/// transaction retried on 40001/40P01 like any other; a failed batch stops the run (the next
+/// interval resumes it), since expired rows are already unusable and only cost space.
+/// Returns the number of rows deleted.
+pub async fn sweep_expired_txns(pool: &DomainPool, batch_rows: i64, max_batches: u32) -> u64 {
+    let mut total = 0u64;
+    for _ in 0..max_batches {
+        let r = pool
+            .transaction(move |tx| {
+                Box::pin(async move {
+                    let n = sqlx::query(
+                        "DELETE FROM auth_txns WHERE (tenant_id, txn_hash) IN \
+                         (SELECT tenant_id, txn_hash FROM auth_txns WHERE expires_at < now() LIMIT $1)",
+                    )
+                    .bind(batch_rows)
+                    .execute(tx.conn())
+                    .await?
+                    .rows_affected();
+                    Ok(n)
+                })
+            })
+            .await;
+        match r {
+            Ok(n) => {
+                total += n;
+                if n < u64::try_from(batch_rows).unwrap_or(0) {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "auth txn sweep batch failed");
+                break;
+            }
+        }
+    }
+    total
+}
+
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

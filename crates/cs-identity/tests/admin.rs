@@ -131,7 +131,11 @@ async fn schema_follows_contract_and_appendix_e() {
     .await;
     for r in &pk_first {
         let (table, col): (String, String) = (r.get(0), r.get(1));
-        if table == "schema_migrations" || table == "finalized_releases" {
+        // opaque_server_keys is deployment-wide by design (M1 contract rev 6 §2.1).
+        if table == "schema_migrations"
+            || table == "finalized_releases"
+            || table == "opaque_server_keys"
+        {
             continue;
         }
         assert_eq!(col, "tenant_id", "{table}: first PK column");

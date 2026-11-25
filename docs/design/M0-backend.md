@@ -181,3 +181,31 @@ Design choices:
 - `serve`, `migrate`, `init-kms` and `check-config`, each taking `--config <path>`.
 - Only the `api` role is implemented. Any other role makes the binary refuse to start, with exit code 2 and an explicit message.
 - `serve` never migrates and requires an existing KMS root key (created by `init-kms`).
+
+## Decision record: cross-request batching of database requests (evaluated 2026-11-25, not adopted)
+
+The question was whether to add a hybrid batcher: a generic layer that queues database requests from many API requests and flushes them on a size limit or a time limit, whichever comes first.
+
+**Findings**
+- **No such batching exists, and none is needed.** Every API request runs as its own short transaction on one domain (`DomainPool::transaction`): BEGIN, a few statements, COMMIT, about 4–8 round trips. The statements share one pooled connection and use the prepared-statement cache. Within a transaction, YSQL already buffers writes and flushes them at statement boundaries and commit.
+- **Grouping requests from different callers into one transaction would break the contract:**
+  - Each request's effect, idempotency record and outbox event commit atomically on their own (contract §5 and §5.3). A shared transaction would couple failures: one request's constraint violation or 40001 would abort and retry everyone else's work, and turn their outcomes into `outcome_unknown`.
+  - Per-request idempotency, which returns the stored result of the original request, would need a shared record and then a split result.
+  - Outbox sequence ordering per (tenant, partition) is already serialized by the counter row lock. Batching would not remove that lock; it would only make it last longer.
+- **The workload doesn't justify it.**
+  - M1 traffic is human-rate and latency-sensitive (sign-in, refresh, admin), so a time-based trigger adds latency to every request when traffic is low.
+  - There is no measured round-trip bottleneck. The only DB-related slowness seen was catalog churn from tests creating databases (DDL), which batching would not fix.
+- **The spec asks for batching only in specific places,** and each is built in its own milestone with the spec's parameters, not as a generic layer:
+  - §17 storage group commit: records within up to 1 ms share one fdatasync (M3).
+  - §10 collaboration updates: batched per document, up to 50 ms (M6).
+  - Bounded batch authorization checks (M2).
+  - Background jobs process work in bounded batches: the saga reconciler already pages 100 sagas per pass.
+
+**Defect fixed alongside (cs-identity):** the expired-`auth_txns` sweep ran an unbounded `DELETE … WHERE expires_at < now()` across all tenants, inline in `login/start` and `register/start`. That broke App. E (no unbounded scans in request paths) and §21.3 (bounded work).
+- The sweep now runs in the background, rate-limited to once per 60 s per node, so requests never wait for it.
+- Each transaction deletes at most `SWEEP_BATCH_ROWS` (500) rows, and one run makes at most `SWEEP_MAX_BATCHES` (20) transactions. A run ends early on a short batch or the first failure, and the next interval resumes it.
+- Test: `auth::expired_txn_sweep_is_bounded_and_keeps_live_rows`.
+
+**Open follow-up (backend, next slice):** `auth_txns_expiry_idx` is a plain range index on `expires_at`. App. E requires range indexes to be prefixed by a hash-sharded column, because a monotonically growing key puts every insert on the same tablet. The fix is a hash-bucketed expiry index added by a new expand migration, with the sweep iterating the buckets.
+
+**Revisit batching when:** a measured profile shows round-trip-bound throughput on one domain at production load, and the operations involved are independent (no per-request atomicity or idempotency coupling). Candidates are background relays: outbox publishing in M4, and the DPoP `jti` fallback table if Valkey is unavailable.

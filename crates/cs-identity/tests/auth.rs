@@ -1084,3 +1084,53 @@ async fn reauth_steps_up_the_existing_session_and_me() {
     );
     e.cleanup().await;
 }
+
+/// Expired `auth_txns` are reclaimed in bounded batches (App. E, §21.3): at most
+/// `batch_rows` per transaction and `max_batches` transactions per run; live rows are kept.
+#[tokio::test]
+async fn expired_txn_sweep_is_bounded_and_keeps_live_rows() {
+    let Some(e) = env().await else { return };
+    exec(
+        e.pool(),
+        "INSERT INTO auth_txns (tenant_id, txn_hash, kind, login, source, key_version, sealed_state, expires_at) \
+         SELECT gen_random_uuid(), sha256(('expired-' || i)::bytea), 'login', 'u', 's', 1, '\\x01'::bytea, \
+         now() - interval '1 minute' FROM generate_series(1, 25) AS i",
+    )
+    .await;
+    exec(
+        e.pool(),
+        "INSERT INTO auth_txns (tenant_id, txn_hash, kind, login, source, key_version, sealed_state, expires_at) \
+         SELECT gen_random_uuid(), sha256(('live-' || i)::bytea), 'login', 'u', 's', 1, '\\x01'::bytea, \
+         now() + interval '1 minute' FROM generate_series(1, 3) AS i",
+    )
+    .await;
+    let pool = e.pool().clone();
+    let count = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            pool.transaction(move |tx| {
+                Box::pin(async move {
+                    Ok(sqlx::query_scalar::<_, i64>(sql)
+                        .fetch_one(tx.conn())
+                        .await?)
+                })
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let expired = "SELECT count(*) FROM auth_txns WHERE expires_at < now()";
+    let live = "SELECT count(*) FROM auth_txns WHERE expires_at >= now()";
+    let sweep = cs_identity::auth::sweep_expired_txns;
+
+    // The run cap holds: 2 batches of 10 delete 20 of the 25 expired rows.
+    assert_eq!(sweep(e.pool(), 10, 2).await, 20);
+    assert_eq!(count(expired).await, 5);
+    // The next run stops early on a short batch and never touches live rows.
+    assert_eq!(sweep(e.pool(), 10, 5).await, 5);
+    assert_eq!(count(expired).await, 0);
+    assert_eq!(count(live).await, 3);
+    // Nothing left: a run is a no-op.
+    assert_eq!(sweep(e.pool(), 10, 5).await, 0);
+    e.cleanup().await;
+}

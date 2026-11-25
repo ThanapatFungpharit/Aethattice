@@ -10,6 +10,15 @@ if [[ "${1:-}" == "--with-db" ]]; then
   # DB tests read CS_TEST_DATABASE_URL; with CS_REQUIRE_DB=1 a missing/unreachable DB is a failure, not a skip.
   CS_REQUIRE_DB=1 CS_TEST_DATABASE_URL="${CS_TEST_DATABASE_URL:-postgres://yugabyte@localhost:5433/yugabyte}" \
     cargo test --workspace -- --test-threads=4
+  # Test databases are created and dropped per test; on YugabyteDB that churn bloats the master's
+  # sys catalog and slows every heartbeat and DDL (dev-host finding, 2026-11-25). Compact it after
+  # the run. Best effort: skipped when the dev container is not running (e.g. GitHub Actions).
+  yb="${CS_DEV_YB_CONTAINER:-cs-dev-yugabyte-1}"
+  if docker inspect -f '{{.State.Running}}' "$yb" 2>/dev/null | grep -q true; then
+    echo "== db: compact YugabyteDB sys catalog ($yb)"
+    docker exec "$yb" bin/yb-admin --master_addresses "$(docker exec "$yb" hostname):7100" \
+      --timeout_ms 600000 compact_sys_catalog >/dev/null 2>&1 || echo "warning: sys catalog compaction failed (non-fatal)"
+  fi
 fi
 echo "== opaque-wasm pkg freshness"
 # The committed wasm-bindgen output must match the crate (M1 rev 5 §2.1). Needs wasm-bindgen-cli 0.2.130.
