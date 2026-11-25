@@ -19,12 +19,13 @@
 //!   Sessions are issued only by `login/finish`.
 
 use crate::admin::{AdminError as AuthError, AdminResult as AuthResult};
+use crate::dpop::{self, ReplayStore, VerifiedProof};
 use crate::jws::{AccessClaims, AccessTokens};
 use crate::keys::{OpaqueKeys, ServerKeyVersion};
 use crate::login::normalize_login;
-use crate::session::{self, NewTokens, RefreshOutcome, SessionPolicy};
+use crate::session::{self, NewTokens, PresentedProof, RefreshOutcome, SessionPolicy};
 use crate::token::{self, TokenHash};
-use cs_common::error::{Error, ErrorCode, FieldError};
+use cs_common::error::{Code, Error, ErrorCode, FieldError};
 use cs_common::id::{SessionId, TenantId, UserId};
 use cs_common::secret::Secret;
 use cs_db::outbox::{NewEvent, Outbox};
@@ -77,6 +78,68 @@ pub struct Authenticated {
     pub session_id: SessionId,
     pub refresh_token: Secret<String>,
     pub refresh_max_age: i64,
+    /// (rev 9) `login/finish` only: the registration uses KSF parameters below the current
+    /// defaults or an older server key version; the client re-registers (`ksf_upgrade`).
+    pub reregister: bool,
+}
+
+/// Request context for DPoP (contract rev 8): method, path and the `DPoP` header.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestCtx<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub dpop: Option<&'a str>,
+}
+
+/// `errors[].code` for an operation that needs recent strong authentication (§2.3 `[R2]`).
+pub const STEP_UP_REQUIRED: &str = "step_up_required";
+
+/// Re-registration purposes (rev 9).
+pub const PURPOSES: &[&str] = &["password_change", "ksf_upgrade"];
+
+fn step_up_required() -> AuthError {
+    let detail = "Recent strong authentication is required.".to_owned();
+    Error::new(ErrorCode::Unauthenticated)
+        .with_detail(detail.clone())
+        .with_field_error(FieldError {
+            pointer: String::new(),
+            code: STEP_UP_REQUIRED.to_owned(),
+            detail,
+        })
+        .into()
+}
+
+/// Binding of a re-registration txn to the session and its generation (stored in the txn's
+/// `grant_hash`, which a setup link can never match).
+fn reregistration_binding(session: SessionId, generation: i64) -> TokenHash {
+    TokenHash::of(&format!(
+        "cs-reregistration/v1:{}:{generation}",
+        session.as_uuid()
+    ))
+}
+
+/// Sealed state of a re-registration txn: KSF params ‖ purpose index ‖ generation.
+fn rereg_bytes(ksf: &KsfParams, purpose: u8, generation: i64) -> Vec<u8> {
+    let mut v = ksf_bytes(ksf);
+    v.push(purpose);
+    v.extend_from_slice(&generation.to_be_bytes());
+    v
+}
+
+fn rereg_parse(b: &[u8]) -> Option<(KsfParams, &'static str, i64)> {
+    if b.len() != 21 {
+        return None;
+    }
+    let ksf = ksf_parse(&b[..12])?;
+    let purpose = PURPOSES.get(usize::from(b[12]))?;
+    let generation = i64::from_be_bytes(b[13..21].try_into().ok()?);
+    Some((ksf, purpose, generation))
+}
+
+/// Whether stored KSF parameters are below the current defaults (rev 9 `reregister`).
+fn ksf_below_default(k: &KsfParams) -> bool {
+    let d = KsfParams::DEFAULT;
+    k.m_kib < d.m_kib || k.t < d.t || k.p < d.p
 }
 
 #[derive(Serialize)]
@@ -252,8 +315,8 @@ async fn insert_txn(pool: &DomainPool, t: TxnInsert<'_>) -> AuthResult<()> {
         Box::pin(async move {
             sqlx::query(
                 "INSERT INTO auth_txns (tenant_id, txn_hash, kind, login, source, user_id, \
-                   grant_hash, key_version, sealed_state, expires_at, session_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + make_interval(secs => $10::float8), $11)",
+                   grant_hash, key_version, sealed_state, expires_at, session_id, expiry_bucket) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + make_interval(secs => $10::float8), $11, $12)",
             )
             .bind(tenant.as_uuid())
             .bind(hash.as_bytes().as_slice())
@@ -266,6 +329,7 @@ async fn insert_txn(pool: &DomainPool, t: TxnInsert<'_>) -> AuthResult<()> {
             .bind(sealed)
             .bind(TXN_TTL_SECS as f64)
             .bind(session.map(SessionId::into_uuid))
+            .bind(expiry_bucket(hash.as_bytes()))
             .execute(tx.conn())
             .await?;
             Ok(())
@@ -336,6 +400,7 @@ pub struct AuthService {
     tokens: AccessTokens,
     policy: SessionPolicy,
     last_sweep: AtomicI64,
+    replay: ReplayStore,
 }
 
 impl std::fmt::Debug for AuthService {
@@ -348,7 +413,7 @@ impl std::fmt::Debug for AuthService {
 }
 
 enum LoginOutcome {
-    Ok(Box<NewTokens>),
+    Ok(Box<NewTokens>, bool),
     Failed,
 }
 
@@ -360,6 +425,7 @@ impl AuthService {
         deployment_domain: &str,
         policy: SessionPolicy,
     ) -> Self {
+        let pool_for_replay = pool.clone();
         Self {
             pool,
             tokens: AccessTokens::new(kms.clone(), deployment_domain),
@@ -367,6 +433,124 @@ impl AuthService {
             keys: OnceCell::new(),
             policy,
             last_sweep: AtomicI64::new(0),
+            replay: ReplayStore::table_only(pool_for_replay),
+        }
+    }
+
+    /// Use Valkey (`[valkey] url`) as the primary DPoP replay store `[R6]`; without it the
+    /// `dpop_jti` table is used alone.
+    pub fn with_valkey(mut self, url: &str) -> AuthResult<Self> {
+        self.replay = ReplayStore::new(self.pool.clone(), Some(url))?;
+        Ok(self)
+    }
+
+    /// Replace the replay store (tests: unreachable stores).
+    pub fn with_replay_store(mut self, replay: ReplayStore) -> Self {
+        self.replay = replay;
+        self
+    }
+
+    /// `https://<deployment domain>` + `path`: the expected DPoP `htu` (rev 8).
+    fn expected_htu(&self, path: &str) -> String {
+        format!("{}{path}", self.tokens.issuer())
+    }
+
+    /// Verify an optional DPoP proof on a request without an access token (login/finish,
+    /// refresh): form, signature, claims, then the shared replay check.
+    async fn proof_without_token(
+        &self,
+        tenant: TenantId,
+        ctx: &RequestCtx<'_>,
+    ) -> AuthResult<Option<VerifiedProof>> {
+        let Some(proof) = ctx.dpop else {
+            return Ok(None);
+        };
+        let v = dpop::verify_proof(
+            proof,
+            ctx.method,
+            &self.expected_htu(ctx.path),
+            None,
+            unix_now(),
+        )?;
+        self.replay.require_fresh(tenant, &v).await?;
+        Ok(Some(v))
+    }
+
+    /// Authenticate a request by its access token (contract rev 8): a `cnf`-bound token must
+    /// come as `Authorization: DPoP <token>` with a fresh proof of the bound key carrying
+    /// `ath`; an unbound token comes as `Bearer`. Anything else is `unauthenticated`.
+    pub async fn authorize(
+        &self,
+        authorization: Option<&str>,
+        ctx: &RequestCtx<'_>,
+    ) -> AuthResult<AccessClaims> {
+        let (scheme, token) = authorization
+            .and_then(|v| v.split_once(' '))
+            .map(|(s, t)| (s, t.trim()))
+            .ok_or_else(|| {
+                AuthError::from(
+                    Error::new(ErrorCode::Unauthenticated).with_detail("Access token required."),
+                )
+            })?;
+        let claims = self.tokens.verify(token, unix_now()).await?;
+        if scheme.eq_ignore_ascii_case("bearer") {
+            return if claims.cnf.is_some() {
+                Err(unauthenticated())
+            } else {
+                Ok(claims)
+            };
+        }
+        if !scheme.eq_ignore_ascii_case("dpop") {
+            return Err(unauthenticated());
+        }
+        let cnf = claims.cnf.as_ref().ok_or_else(unauthenticated)?;
+        let proof = ctx.dpop.ok_or_else(unauthenticated)?;
+        let v = dpop::verify_proof(
+            proof,
+            ctx.method,
+            &self.expected_htu(ctx.path),
+            Some(token),
+            unix_now(),
+        )?;
+        if v.jkt_b64() != cnf.jkt {
+            return Err(unauthenticated());
+        }
+        let (tenant, _, _) = Self::subject(&claims)?;
+        self.replay.require_fresh(tenant, &v).await?;
+        Ok(claims)
+    }
+
+    /// Step-up guard (contract §2.3 `[R2]`, spec §5.5): the session of `claims` must be
+    /// active at the token's generation and have `last_strong_auth_at` within the step-up
+    /// window (policy `step_up_window_secs`). Otherwise `unauthenticated`, with
+    /// `errors[] = [{pointer: "", code: "step_up_required"}]` when only the window failed.
+    pub async fn require_step_up(&self, claims: &AccessClaims) -> AuthResult<()> {
+        let (tenant, user, session) = Self::subject(claims)?;
+        let (sgen, window) = (claims.sgen, self.policy.step_up_secs);
+        let fresh: Option<bool> = self
+            .pool
+            .read_snapshot(move |tx| {
+                Box::pin(async move {
+                    Ok(sqlx::query_scalar(
+                        "SELECT COALESCE(last_strong_auth_at >= now() - make_interval(secs => $5::float8), false) \
+                         FROM sessions WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3 \
+                           AND state = 'active' AND generation = $4 \
+                           AND now() < idle_expires_at AND now() < absolute_expires_at",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(session.as_uuid())
+                    .bind(user.as_uuid())
+                    .bind(sgen)
+                    .bind(window as f64)
+                    .fetch_optional(tx.conn())
+                    .await?)
+                })
+            })
+            .await?;
+        match fresh {
+            Some(true) => Ok(()),
+            Some(false) => Err(step_up_required()),
+            None => Err(unauthenticated()),
         }
     }
 
@@ -402,7 +586,9 @@ impl AuthService {
         let pool = self.pool.clone();
         tokio::spawn(async move {
             let deleted = sweep_expired_txns(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES).await;
-            tracing::debug!(deleted, "auth txn sweep finished");
+            let jti =
+                crate::dpop::sweep_expired_jti(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES).await;
+            tracing::debug!(deleted, jti, "expiry sweep finished");
         });
     }
 
@@ -536,8 +722,14 @@ impl AuthService {
         login_txn: &str,
         credential_finalization: &[u8],
         source: &str,
+        ctx: &RequestCtx<'_>,
     ) -> AuthResult<Authenticated> {
         let parsed = token::parse(login_txn).map_err(|_| unauthenticated())?;
+        // rev 8: a valid proof binds the new session; an invalid one is refused.
+        let jkt = self
+            .proof_without_token(parsed.tenant_id, ctx)
+            .await?
+            .map(|p| p.jkt);
         let fin = CredentialFinalization::<Suite>::deserialize(credential_finalization).map_err(
             |_| {
                 invalid(
@@ -597,13 +789,29 @@ impl AuthService {
                     }
                     let user =
                         UserId::from_uuid(uid).map_err(|e| DbError::Invalid(e.to_string()))?;
-                    let nt = session::create_in_tx(tx, tenant, user, &["pwd"], policy).await?;
-                    Ok(LoginOutcome::Ok(Box::new(nt)))
+                    // rev 9: signal a transparent re-registration when the stored KSF
+                    // parameters or the server key version are not current.
+                    let reg: Option<(i32, i32, i32)> = sqlx::query_as(
+                        "SELECT ksf_m_kib, ksf_t, ksf_p FROM opaque_registrations \
+                         WHERE tenant_id = $1 AND user_id = $2",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(uid)
+                    .fetch_optional(tx.conn())
+                    .await?;
+                    let reregister = t.key_version != keys.current().version
+                        || reg.is_none_or(|(m, t, p)| ksf_below_default(&ksf_from_row(m, t, p)));
+                    let nt = session::create_in_tx(tx, tenant, user, &["pwd"], policy, jkt).await?;
+                    Ok(LoginOutcome::Ok(Box::new(nt), reregister))
                 })
             })
             .await?;
         match out {
-            LoginOutcome::Ok(nt) => self.finish_tokens(*nt).await,
+            LoginOutcome::Ok(nt, reregister) => {
+                let mut a = self.finish_tokens(*nt).await?;
+                a.reregister = reregister;
+                Ok(a)
+            }
             LoginOutcome::Failed => Err(unauthenticated()),
         }
     }
@@ -617,6 +825,7 @@ impl AuthService {
             session_id: nt.session_id,
             refresh_token: nt.refresh.token,
             refresh_max_age: nt.refresh_max_age,
+            reregister: false,
         })
     }
 
@@ -821,6 +1030,222 @@ impl AuthService {
             .map_err(AuthError::from)
     }
 
+    /// `register/start {purpose, registration_request}` with the session's access token
+    /// (contract rev 9): password change or transparent KSF / key-version upgrade. Needs the
+    /// step-up window; the txn is bound to the session's `sid`, user and generation.
+    pub async fn register_start_session(
+        &self,
+        claims: &AccessClaims,
+        purpose: &str,
+        registration_request: &[u8],
+        source: &str,
+    ) -> AuthResult<RegisterStart> {
+        let (tenant, user, session) = Self::subject(claims)?;
+        let purpose_idx = PURPOSES
+            .iter()
+            .position(|p| *p == purpose)
+            .and_then(|i| u8::try_from(i).ok())
+            .ok_or_else(|| invalid("/purpose", "purpose must be password_change or ksf_upgrade"))?;
+        let request = RegistrationRequest::<Suite>::deserialize(registration_request)
+            .map_err(|_| invalid("/registration_request", "malformed registration_request"))?;
+        self.require_step_up(claims).await?;
+        let keys = self.keys().await?;
+        self.sweep();
+        let sgen = claims.sgen;
+        let login: Option<String> = self
+            .pool
+            .read_snapshot(move |tx| {
+                Box::pin(async move {
+                    Ok(sqlx::query_scalar(
+                        "SELECT u.login FROM users u JOIN tenants t ON t.tenant_id = u.tenant_id \
+                         WHERE u.tenant_id = $1 AND u.user_id = $2 AND u.status = 'active' \
+                           AND t.state = 'active'",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(user.as_uuid())
+                    .fetch_optional(tx.conn())
+                    .await?)
+                })
+            })
+            .await?;
+        let login = login.ok_or_else(unauthenticated)?;
+        let k = keys.current();
+        let cred_id = client_identifier(&tenant.as_uuid().to_string(), &login);
+        let resp = ServerRegistration::<Suite>::start(&k.setup, request, cred_id.as_bytes())
+            .map_err(|_| invalid("/registration_request", "invalid registration_request"))?;
+        let ksf = KsfParams::DEFAULT;
+        let txn = token::generate(tenant).map_err(Error::internal)?;
+        let sealed = k.seal(
+            &rereg_bytes(&ksf, purpose_idx, sgen),
+            &txn_ad(&tenant, &txn.hash, "registration"),
+        )?;
+        insert_txn(
+            &self.pool,
+            TxnInsert {
+                tenant,
+                hash: txn.hash,
+                kind: "registration",
+                login: &login,
+                source,
+                user: Some(user),
+                session: Some(session),
+                grant: Some(reregistration_binding(session, sgen)),
+                key_version: k.version,
+                sealed,
+            },
+        )
+        .await?;
+        Ok(RegisterStart {
+            registration_txn: txn.token,
+            registration_response: resp.message.serialize().to_vec(),
+            ksf_params: ksf,
+        })
+    }
+
+    /// `register/finish {registration_txn, registration_upload}` with the session's access
+    /// token (contract rev 9) → 204. In one identity transaction: replaces the registration
+    /// with the current KSF parameters and key version, revokes **every other** session and
+    /// refresh family of the user (whatever the purpose), keeps the current session, and
+    /// emits `identity.credentials.changed` with reason = purpose.
+    pub async fn register_finish_session(
+        &self,
+        claims: &AccessClaims,
+        registration_txn: &str,
+        registration_upload: &[u8],
+        source: &str,
+    ) -> AuthResult<()> {
+        let (tenant, user, session) = Self::subject(claims)?;
+        let parsed = token::parse(registration_txn).map_err(|_| unauthenticated())?;
+        if parsed.tenant_id != tenant {
+            return Err(unauthenticated());
+        }
+        let upload = RegistrationUpload::<Suite>::deserialize(registration_upload)
+            .map_err(|_| invalid("/registration_upload", "malformed registration_upload"))?;
+        let file = ServerRegistration::<Suite>::finish(upload)
+            .serialize()
+            .to_vec();
+        let keys = self.keys().await?;
+        let hash = parsed.hash;
+        let (source, sgen, window) = (source.to_owned(), claims.sgen, self.policy.step_up_secs);
+        self.pool
+            .transaction(move |tx| {
+                let (keys, file, source) = (keys.clone(), file.clone(), source.clone());
+                Box::pin(async move {
+                    let fail = || DbError::app(unauthenticated());
+                    let t = take_txn(tx, tenant, &hash, "registration")
+                        .await?
+                        .ok_or_else(fail)?;
+                    let binding = reregistration_binding(session, sgen);
+                    if t.source != source
+                        || t.session != Some(session.into_uuid())
+                        || t.user != Some(user.into_uuid())
+                        || t.grant.as_deref() != Some(binding.as_bytes().as_slice())
+                    {
+                        return Err(fail());
+                    }
+                    let k = keys.get(t.key_version).ok_or_else(fail)?;
+                    let st = k
+                        .open(&t.sealed, &txn_ad(&tenant, &hash, "registration"))
+                        .ok_or_else(fail)?;
+                    let (ksf, purpose, txn_gen) = rereg_parse(&st).ok_or_else(fail)?;
+                    if txn_gen != sgen {
+                        return Err(fail());
+                    }
+                    if !ksf.is_valid() {
+                        return Err(DbError::app(invalid(
+                            "/ksf_params",
+                            "KSF parameters outside the allowed bounds",
+                        )));
+                    }
+                    // The session must still be active at this generation and within the
+                    // step-up window (checked again under lock).
+                    let fresh: Option<bool> = sqlx::query_scalar(
+                        "SELECT COALESCE(last_strong_auth_at >= now() - make_interval(secs => $5::float8), false) \
+                         FROM sessions WHERE tenant_id = $1 AND session_id = $2 AND user_id = $3 \
+                           AND state = 'active' AND generation = $4 \
+                           AND now() < idle_expires_at AND now() < absolute_expires_at FOR UPDATE",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(session.as_uuid())
+                    .bind(user.as_uuid())
+                    .bind(sgen)
+                    .bind(window as f64)
+                    .fetch_optional(tx.conn())
+                    .await?;
+                    match fresh {
+                        Some(true) => {}
+                        Some(false) => return Err(DbError::app(step_up_required())),
+                        None => return Err(fail()),
+                    }
+                    let active: Option<bool> = sqlx::query_scalar(
+                        "SELECT u.status = 'active' AND t.state = 'active' FROM users u \
+                         JOIN tenants t ON t.tenant_id = u.tenant_id \
+                         WHERE u.tenant_id = $1 AND u.user_id = $2 FOR SHARE OF u",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(user.as_uuid())
+                    .fetch_optional(tx.conn())
+                    .await?;
+                    if active != Some(true) {
+                        return Err(fail());
+                    }
+                    let n = sqlx::query(
+                        "UPDATE opaque_registrations SET password_file = $3, ksf_m_kib = $4, \
+                           ksf_t = $5, ksf_p = $6, server_key_version = $7, \
+                           version = version + 1, updated_at = now() \
+                         WHERE tenant_id = $1 AND user_id = $2",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(user.as_uuid())
+                    .bind(&file)
+                    .bind(to_i32(ksf.m_kib))
+                    .bind(to_i32(ksf.t))
+                    .bind(to_i32(ksf.p))
+                    .bind(k.label())
+                    .execute(tx.conn())
+                    .await?
+                    .rows_affected();
+                    if n != 1 {
+                        return Err(fail());
+                    }
+                    // rev 9: revoke every other session (and refresh family) of the user.
+                    let others: Vec<Uuid> = sqlx::query_scalar(
+                        "SELECT session_id FROM sessions WHERE tenant_id = $1 AND user_id = $2 \
+                           AND session_id <> $3 AND state = 'active'",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(user.as_uuid())
+                    .bind(session.as_uuid())
+                    .fetch_all(tx.conn())
+                    .await?;
+                    for o in others {
+                        let o = SessionId::from_uuid(o)
+                            .map_err(|e| DbError::Invalid(e.to_string()))?;
+                        session::revoke_session(tx, tenant, o, "credentials_changed").await?;
+                    }
+                    Outbox::append(
+                        tx,
+                        NewEvent {
+                            tenant_id: Some(tenant),
+                            event_type: "identity.credentials.changed",
+                            event_version: 1,
+                            partition_key: user.into_uuid(),
+                            payload: &CredentialsChanged {
+                                tenant_id: tenant,
+                                user_id: user,
+                                method: "opaque",
+                                reason: purpose,
+                            },
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(AuthError::from)
+    }
+
     // ----- tokens -----
 
     /// `POST /api/v2/auth/token/refresh` (contract §3 `[R1]`).
@@ -828,18 +1253,27 @@ impl AuthService {
         &self,
         refresh_token: &str,
         idempotency_key: &str,
+        ctx: &RequestCtx<'_>,
     ) -> AuthResult<Authenticated> {
         let parsed = token::parse(refresh_token).map_err(|_| unauthenticated())?;
         let (tenant, hash) = (parsed.tenant_id, parsed.hash);
         let key = idempotency_key.to_owned();
         let policy = self.policy;
+        // rev 8: the binding decision is made under the token's row lock; a replay store
+        // outage fails closed (503) before anything is touched.
+        let proof = match self.proof_without_token(tenant, ctx).await {
+            Ok(Some(p)) => PresentedProof::Valid(p.jkt),
+            Ok(None) => PresentedProof::None,
+            Err(e) if matches!(e.code(), Code::Core(ErrorCode::Unavailable)) => return Err(e),
+            Err(_) => PresentedProof::Invalid,
+        };
         let out = self
             .pool
             .transaction(move |tx| {
                 let key = key.clone();
-                Box::pin(
-                    async move { session::refresh_in_tx(tx, tenant, hash, &key, policy).await },
-                )
+                Box::pin(async move {
+                    session::refresh_in_tx(tx, tenant, hash, &key, policy, proof).await
+                })
             })
             .await?;
         match out {
@@ -848,17 +1282,12 @@ impl AuthService {
                 tracing::warn!(tenant = %tenant.as_uuid(), "refresh token reuse: session revoked");
                 Err(unauthenticated())
             }
+            RefreshOutcome::KeyMismatch => {
+                tracing::warn!(tenant = %tenant.as_uuid(), "DPoP-bound refresh without a proof of its key: session revoked");
+                Err(unauthenticated())
+            }
             RefreshOutcome::Invalid => Err(unauthenticated()),
         }
-    }
-
-    /// Verify a bearer access token (no DPoP proof: a `cnf`-bound token is refused).
-    pub async fn verify_bearer(&self, access_token: &str) -> AuthResult<AccessClaims> {
-        let c = self.tokens.verify(access_token, unix_now()).await?;
-        if c.cnf.is_some() {
-            return Err(unauthenticated());
-        }
-        Ok(c)
     }
 
     /// `POST /api/v2/auth/logout` (contract §3 `[R10]`): revoke the session named by `sid`
@@ -1110,27 +1539,72 @@ pub struct Me {
     pub sid: String,
 }
 
-/// Unix time in seconds.
+/// Number of `auth_txns.expiry_bucket` values (migration 0102).
+pub const EXPIRY_BUCKETS: i16 = 16;
+
+/// Expiry bucket of a txn: first byte of its (random) hash, mod [`EXPIRY_BUCKETS`].
+pub fn expiry_bucket(txn_hash: &[u8]) -> i16 {
+    txn_hash
+        .first()
+        .map_or(0, |b| i16::from(*b) % EXPIRY_BUCKETS)
+}
+
 /// Delete expired `auth_txns` rows in bounded batches: at most `batch_rows` rows per
 /// transaction and at most `max_batches` transactions. Each batch is a short, single-domain
 /// transaction retried on 40001/40P01 like any other; a failed batch stops the run (the next
 /// interval resumes it), since expired rows are already unusable and only cost space.
 /// Returns the number of rows deleted.
 pub async fn sweep_expired_txns(pool: &DomainPool, batch_rows: i64, max_batches: u32) -> u64 {
+    sweep_bucketed(
+        pool,
+        "auth_txns",
+        "tenant_id, txn_hash",
+        batch_rows,
+        max_batches,
+    )
+    .await
+}
+
+/// Bounded expiry sweep over a table with the hash-bucketed expiry index of migration 0102
+/// (App. E). Each batch walks the buckets one by one (`expiry_bucket = $b`, so every read is a
+/// point lookup on the hash column plus a range on `expires_at`, which the planner always
+/// serves from the bucketed index), then the NULL bucket written by N-1 nodes, all within one
+/// row budget of `batch_rows`. `table` and `key` are compile-time constants of this crate.
+pub(crate) async fn sweep_bucketed(
+    pool: &DomainPool,
+    table: &'static str,
+    key: &'static str,
+    batch_rows: i64,
+    max_batches: u32,
+) -> u64 {
     let mut total = 0u64;
     for _ in 0..max_batches {
         let r = pool
             .transaction(move |tx| {
                 Box::pin(async move {
-                    let n = sqlx::query(
-                        "DELETE FROM auth_txns WHERE (tenant_id, txn_hash) IN \
-                         (SELECT tenant_id, txn_hash FROM auth_txns WHERE expires_at < now() LIMIT $1)",
-                    )
-                    .bind(batch_rows)
-                    .execute(tx.conn())
-                    .await?
-                    .rows_affected();
-                    Ok(n)
+                    let mut left = batch_rows;
+                    let buckets = (0..EXPIRY_BUCKETS).map(Some).chain(std::iter::once(None));
+                    for b in buckets {
+                        if left <= 0 {
+                            break;
+                        }
+                        let cond = if b.is_some() {
+                            "expiry_bucket = $2"
+                        } else {
+                            "expiry_bucket IS NULL"
+                        };
+                        let q = format!(
+                            "DELETE FROM {table} WHERE ({key}) IN (SELECT {key} FROM {table} \
+                             WHERE {cond} AND expires_at < now() LIMIT $1)"
+                        );
+                        let mut q = sqlx::query(sqlx::AssertSqlSafe(q)).bind(left);
+                        if let Some(b) = b {
+                            q = q.bind(b);
+                        }
+                        let n = q.execute(tx.conn()).await?.rows_affected();
+                        left -= i64::try_from(n).unwrap_or(left);
+                    }
+                    Ok(u64::try_from(batch_rows - left).unwrap_or(0))
                 })
             })
             .await;
@@ -1142,7 +1616,7 @@ pub async fn sweep_expired_txns(pool: &DomainPool, batch_rows: i64, max_batches:
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "auth txn sweep batch failed");
+                tracing::warn!(error = %e, table, "expiry sweep batch failed");
                 break;
             }
         }
@@ -1150,6 +1624,7 @@ pub async fn sweep_expired_txns(pool: &DomainPool, batch_rows: i64, max_batches:
     total
 }
 
+/// Unix time in seconds.
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

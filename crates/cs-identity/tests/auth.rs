@@ -1,5 +1,6 @@
 //! OPAQUE registration/login, sessions, access tokens, refresh and logout (M1 contract rev 6
-//! §2.1, §2.4, §3) against a real identity domain, through the HTTP routes.
+//! §2.1, §2.4, §3), DPoP (rev 8), step-up and re-registration (rev 9) against a real identity
+//! domain, through the HTTP routes.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use axum::body::Body;
@@ -225,6 +226,17 @@ async fn login(
     login: &str,
     pw: &str,
 ) -> Result<(Value, String, String), (StatusCode, Value)> {
+    login_with(e, tenant, login, pw, None).await
+}
+
+/// Full login with an optional DPoP proof on login/finish.
+async fn login_with(
+    e: &Env,
+    tenant: TenantId,
+    login: &str,
+    pw: &str,
+    dpop: Option<&PKey>,
+) -> Result<(Value, String, String), (StatusCode, Value)> {
     let (s, v, st) = login_start(e, &tenant.as_uuid().to_string(), login, pw).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let cid = client_identifier(&tenant.as_uuid().to_string(), login);
@@ -248,10 +260,18 @@ async fn login(
         // length so the server path is still exercised.
         Err(_) => vec![0u8; 64],
     };
+    let path = "/api/v2/auth/opaque/login/finish";
+    let mut b = Request::post(path).header(header::CONTENT_TYPE, "application/json");
+    if let Some(k) = dpop {
+        b = b.header("DPoP", k.proof("POST", &htu(path), None));
+    }
     let (s, h, v) = e
-        .post(
-            "/api/v2/auth/opaque/login/finish",
-            json!({"login_txn": v["login_txn"], "credential_finalization": b64(&fin)}),
+        .call(
+            b.body(Body::from(
+                json!({"login_txn": v["login_txn"], "credential_finalization": b64(&fin)})
+                    .to_string(),
+            ))
+            .unwrap(),
         )
         .await;
     if s != StatusCode::OK {
@@ -853,12 +873,15 @@ async fn access_token_verification_rejects_tampering() {
     let bad = [
         // payload changed
         format!("{}.{}.{}", parts[0], enc(json!({"sub": "evil"})), parts[2]),
-        // signature changed
+        // signature changed (first character: its 6 bits are all significant; the last
+        // character of an unpadded 64-byte signature carries only 4, so changing it could
+        // decode to the same bytes)
         format!(
-            "{}.{}.{}A",
+            "{}.{}.{}{}",
             parts[0],
             parts[1],
-            &parts[2][..parts[2].len() - 1]
+            if parts[2].starts_with('A') { "B" } else { "A" },
+            &parts[2][1..]
         ),
         // alg none / HS256 / jwk header / unknown kid
         format!(
@@ -1097,6 +1120,13 @@ async fn expired_txn_sweep_is_bounded_and_keeps_live_rows() {
          now() - interval '1 minute' FROM generate_series(1, 25) AS i",
     )
     .await;
+    // 20 rows carry their bucket (current nodes); 5 have none (rows of an N-1 node).
+    exec(
+        e.pool(),
+        "UPDATE auth_txns SET expiry_bucket = get_byte(txn_hash, 0) % 16 \
+         WHERE txn_hash IN (SELECT sha256(('expired-' || i)::bytea) FROM generate_series(1, 20) AS i)",
+    )
+    .await;
     exec(
         e.pool(),
         "INSERT INTO auth_txns (tenant_id, txn_hash, kind, login, source, key_version, sealed_state, expires_at) \
@@ -1132,5 +1162,1086 @@ async fn expired_txn_sweep_is_bounded_and_keeps_live_rows() {
     assert_eq!(count(live).await, 3);
     // Nothing left: a run is a no-op.
     assert_eq!(sweep(e.pool(), 10, 5).await, 0);
+    // The bucketed read uses the hash-sharded expiry index (App. E). While the expand-phase
+    // range index `auth_txns_expiry_idx` still exists the planner may prefer it; the follow-up
+    // contract migration drops it, which is simulated here.
+    exec(e.pool(), "DROP INDEX auth_txns_expiry_idx").await;
+    let plan: Vec<String> = {
+        let pool = e.pool().clone();
+        pool.transaction(move |tx| {
+            Box::pin(async move {
+                Ok(sqlx::query_scalar::<_, String>(
+                    "EXPLAIN SELECT tenant_id, txn_hash FROM auth_txns \
+                     WHERE expiry_bucket = 3 AND expires_at < now() LIMIT 500",
+                )
+                .fetch_all(tx.conn())
+                .await?)
+            })
+        })
+        .await
+        .unwrap()
+    };
+    assert!(
+        plan.iter()
+            .any(|l| l.contains("auth_txns_expiry_bucket_idx")),
+        "{plan:?}"
+    );
+    assert_eq!(cs_identity::auth::expiry_bucket(&[0x1f, 0]), 15);
+    e.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// DPoP (M1 contract rev 8 §3, [R6], [R12])
+// ---------------------------------------------------------------------------------------------
+
+/// A client DPoP key.
+enum PKey {
+    Es(p256::ecdsa::SigningKey),
+    Ed(ed25519_dalek::SigningKey),
+}
+
+fn rand32() -> [u8; 32] {
+    use rand_core_06::RngCore as _;
+    let mut b = [0u8; 32];
+    rand_core_06::OsRng.fill_bytes(&mut b);
+    b
+}
+
+fn now() -> i64 {
+    cs_identity::auth::unix_now()
+}
+
+fn htu(path: &str) -> String {
+    format!("https://{DOMAIN}{path}")
+}
+
+impl PKey {
+    fn es256() -> Self {
+        loop {
+            if let Ok(k) = p256::ecdsa::SigningKey::from_slice(&rand32()) {
+                return PKey::Es(k);
+            }
+        }
+    }
+
+    fn ed25519() -> Self {
+        PKey::Ed(ed25519_dalek::SigningKey::from_bytes(&rand32()))
+    }
+
+    fn alg(&self) -> &'static str {
+        match self {
+            PKey::Es(_) => "ES256",
+            PKey::Ed(_) => "EdDSA",
+        }
+    }
+
+    fn jwk(&self) -> Value {
+        match self {
+            PKey::Es(k) => {
+                let p = k.verifying_key().to_encoded_point(false);
+                json!({"kty": "EC", "crv": "P-256",
+                       "x": b64(p.x().unwrap()), "y": b64(p.y().unwrap())})
+            }
+            PKey::Ed(k) => json!({"kty": "OKP", "crv": "Ed25519",
+                                  "x": b64(k.verifying_key().as_bytes())}),
+        }
+    }
+
+    /// RFC 7638 thumbprint, base64url.
+    fn jkt(&self) -> String {
+        use sha2::Digest as _;
+        let j = self.jwk();
+        let canon = match self {
+            PKey::Es(_) => format!(
+                r#"{{"crv":"P-256","kty":"EC","x":{},"y":{}}}"#,
+                j["x"], j["y"]
+            ),
+            PKey::Ed(_) => format!(r#"{{"crv":"Ed25519","kty":"OKP","x":{}}}"#, j["x"]),
+        };
+        b64(&sha2::Sha256::digest(canon.as_bytes()))
+    }
+
+    fn sign_raw(&self, header: &Value, claims: &Value) -> String {
+        let input = format!(
+            "{}.{}",
+            b64(header.to_string().as_bytes()),
+            b64(claims.to_string().as_bytes())
+        );
+        let sig = match self {
+            PKey::Es(k) => {
+                use p256::ecdsa::signature::Signer as _;
+                let s: p256::ecdsa::Signature = k.sign(input.as_bytes());
+                s.to_bytes().to_vec()
+            }
+            PKey::Ed(k) => {
+                use ed25519_dalek::Signer as _;
+                k.sign(input.as_bytes()).to_bytes().to_vec()
+            }
+        };
+        format!("{input}.{}", b64(&sig))
+    }
+
+    fn header(&self) -> Value {
+        json!({"typ": "dpop+jwt", "alg": self.alg(), "jwk": self.jwk()})
+    }
+
+    fn claims(&self, htm: &str, htu: &str, at: Option<&str>) -> Value {
+        let mut c = json!({"jti": b64(&rand32()), "htm": htm, "htu": htu, "iat": now()});
+        if let Some(at) = at {
+            c["ath"] = json!(cs_identity::dpop::ath(at));
+        }
+        c
+    }
+
+    fn proof(&self, htm: &str, htu: &str, at: Option<&str>) -> String {
+        self.sign_raw(&self.header(), &self.claims(htm, htu, at))
+    }
+}
+
+/// Call `path` with an access token (`scheme` Bearer or DPoP) and an optional proof.
+async fn with_at(
+    e: &Env,
+    method: &str,
+    path: &str,
+    scheme: &str,
+    at: &str,
+    proof: Option<String>,
+    body: Option<Value>,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("{scheme} {at}"));
+    if let Some(p) = proof {
+        b = b.header("DPoP", p);
+    }
+    let body = match body {
+        Some(v) => {
+            b = b.header(header::CONTENT_TYPE, "application/json");
+            Body::from(v.to_string())
+        }
+        None => Body::empty(),
+    };
+    e.call(b.body(body).unwrap()).await
+}
+
+async fn me_dpop(e: &Env, at: &str, proof: String) -> StatusCode {
+    with_at(e, "GET", "/api/v2/me", "DPoP", at, Some(proof), None)
+        .await
+        .0
+}
+
+fn claims_of(at: &str) -> Value {
+    let p = at.split('.').nth(1).unwrap();
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(p).unwrap()).unwrap()
+}
+
+async fn refresh_dpop(
+    e: &Env,
+    rt: &str,
+    proof: Option<String>,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut b = Request::post("/api/v2/auth/token/refresh")
+        .header(header::COOKIE, format!("__Secure-cs_rt={rt}"))
+        .header("Idempotency-Key", b64(&rand32()));
+    if let Some(p) = proof {
+        b = b.header("DPoP", p);
+    }
+    e.call(b.body(Body::empty()).unwrap()).await
+}
+
+/// Active user alice@acme.test with password `pw`.
+async fn alice(e: &Env, pw: &str) -> TenantId {
+    let t = e.admin.create_tenant("acme").await.unwrap().tenant_id;
+    let link = invited(e, t, "alice@acme.test").await;
+    assert_eq!(
+        register(e, t, &link, "alice@acme.test", pw).await,
+        StatusCode::NO_CONTENT
+    );
+    t
+}
+
+/// A valid proof binds the session, its access tokens and refresh family; bound tokens need
+/// `DPoP` + a fresh proof with matching htm, htu, iat, ath and key; every negative is 401.
+#[tokio::test]
+async fn dpop_bound_access_token_proof_checks() {
+    let Some(e) = env().await else { return };
+    let t = alice(&e, "pw").await;
+    let key = PKey::es256();
+    let (v, _, _) = login_with(&e, t, "alice@acme.test", "pw", Some(&key))
+        .await
+        .unwrap();
+    let at = v["access_token"].as_str().unwrap().to_owned();
+    assert_eq!(claims_of(&at)["cnf"]["jkt"], json!(key.jkt()));
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM sessions WHERE device_key_jkt IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM refresh_tokens WHERE key_jkt IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    let me = "/api/v2/me";
+    let good = || key.proof("GET", &htu(me), Some(&at));
+    // Valid; htu query and fragment are ignored.
+    assert_eq!(me_dpop(&e, &at, good()).await, StatusCode::OK);
+    let mut c = key.claims("GET", &format!("{}?x=1#f", htu(me)), Some(&at));
+    assert_eq!(
+        me_dpop(&e, &at, key.sign_raw(&key.header(), &c)).await,
+        StatusCode::OK
+    );
+    // Replay of the same proof (shared dpop_jti table here: Valkey not configured).
+    let p = good();
+    assert_eq!(me_dpop(&e, &at, p.clone()).await, StatusCode::OK);
+    assert_eq!(me_dpop(&e, &at, p).await, StatusCode::UNAUTHORIZED);
+    // Bearer with a cnf-bound token is refused, with or without a proof.
+    assert_eq!(
+        with_at(&e, "GET", me, "Bearer", &at, None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        with_at(&e, "GET", me, "Bearer", &at, Some(good()), None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    // DPoP scheme without a proof.
+    assert_eq!(
+        with_at(&e, "GET", me, "DPoP", &at, None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let bad: Vec<(&str, String)> = vec![
+        ("wrong htm", key.proof("POST", &htu(me), Some(&at))),
+        (
+            "wrong htu path",
+            key.proof("GET", &htu("/api/v2/other"), Some(&at)),
+        ),
+        (
+            "wrong htu origin",
+            key.proof("GET", &format!("https://evil.test{me}"), Some(&at)),
+        ),
+        ("wrong ath", key.proof("GET", &htu(me), Some("other-token"))),
+        ("missing ath", key.proof("GET", &htu(me), None)),
+        ("other key", PKey::es256().proof("GET", &htu(me), Some(&at))),
+        (
+            "other key (EdDSA)",
+            PKey::ed25519().proof("GET", &htu(me), Some(&at)),
+        ),
+        ("stale iat", {
+            c = key.claims("GET", &htu(me), Some(&at));
+            c["iat"] = json!(now() - 120);
+            key.sign_raw(&key.header(), &c)
+        }),
+        ("future iat", {
+            c = key.claims("GET", &htu(me), Some(&at));
+            c["iat"] = json!(now() + 120);
+            key.sign_raw(&key.header(), &c)
+        }),
+        ("typ jwt", {
+            let mut h = key.header();
+            h["typ"] = json!("jwt");
+            key.sign_raw(&h, &key.claims("GET", &htu(me), Some(&at)))
+        }),
+        ("alg RS256", {
+            let mut h = key.header();
+            h["alg"] = json!("RS256");
+            key.sign_raw(&h, &key.claims("GET", &htu(me), Some(&at)))
+        }),
+        ("alg none", {
+            let mut h = key.header();
+            h["alg"] = json!("none");
+            let p = key.sign_raw(&h, &key.claims("GET", &htu(me), Some(&at)));
+            format!("{}.", p.rsplit_once('.').unwrap().0)
+        }),
+        ("alg EdDSA with an EC key", {
+            let mut h = key.header();
+            h["alg"] = json!("EdDSA");
+            key.sign_raw(&h, &key.claims("GET", &htu(me), Some(&at)))
+        }),
+        ("private jwk member", {
+            let mut h = key.header();
+            h["jwk"]["d"] = json!(b64(&rand32()));
+            key.sign_raw(&h, &key.claims("GET", &htu(me), Some(&at)))
+        }),
+        ("bad signature", {
+            let p = good();
+            let (head, sig) = p.rsplit_once('.').unwrap();
+            let first = if sig.starts_with('A') { "B" } else { "A" };
+            format!("{head}.{first}{}", &sig[1..])
+        }),
+        ("garbage", "garbage".to_owned()),
+    ];
+    for (what, p) in bad {
+        assert_eq!(
+            me_dpop(&e, &at, p).await,
+            StatusCode::UNAUTHORIZED,
+            "{what}"
+        );
+    }
+    // Two DPoP headers are refused.
+    let r = e
+        .call(
+            Request::get(me)
+                .header(header::AUTHORIZATION, format!("DPoP {at}"))
+                .header("DPoP", good())
+                .header("DPoP", good())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::UNAUTHORIZED);
+    // No DPoP-Nonce in M1.
+    assert!(r.1.get("dpop-nonce").is_none());
+    // An unbound token is refused with the DPoP scheme and accepted as Bearer.
+    let (v2, _, _) = login(&e, t, "alice@acme.test", "pw").await.unwrap();
+    let at2 = v2["access_token"].as_str().unwrap();
+    assert!(claims_of(at2).get("cnf").is_none());
+    assert_eq!(
+        me_dpop(&e, at2, key.proof("GET", &htu(me), Some(at2))).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        with_at(&e, "GET", me, "Bearer", at2, None, None).await.0,
+        StatusCode::OK
+    );
+    // EdDSA proofs are accepted too.
+    let ed = PKey::ed25519();
+    let (v3, _, _) = login_with(&e, t, "alice@acme.test", "pw", Some(&ed))
+        .await
+        .unwrap();
+    let at3 = v3["access_token"].as_str().unwrap();
+    assert_eq!(claims_of(at3)["cnf"]["jkt"], json!(ed.jkt()));
+    assert_eq!(
+        me_dpop(&e, at3, ed.proof("GET", &htu(me), Some(at3))).await,
+        StatusCode::OK
+    );
+    // A broken proof at login/finish is refused (never silently unbound).
+    let mut h = key.header();
+    h["typ"] = json!("jwt");
+    let (s, v, st) = login_start(&e, &t.as_uuid().to_string(), "alice@acme.test", "pw").await;
+    assert_eq!(s, StatusCode::OK);
+    let cid = client_identifier(&t.as_uuid().to_string(), "alice@acme.test");
+    let k = ksf();
+    let resp = CredentialResponse::<Suite>::deserialize(&unb64(&v["credential_response"])).unwrap();
+    let fin = st
+        .finish(
+            &mut rand_core_06::OsRng,
+            b"pw",
+            resp,
+            ClientLoginFinishParameters::new(
+                Some(CONTEXT),
+                Identifiers {
+                    client: Some(cid.as_bytes()),
+                    server: None,
+                },
+                Some(&k),
+            ),
+        )
+        .unwrap();
+    let path = "/api/v2/auth/opaque/login/finish";
+    let (s, _, _) = e
+        .call(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    "DPoP",
+                    key.sign_raw(&h, &key.claims("POST", &htu(path), None)),
+                )
+                .body(Body::from(
+                    json!({"login_txn": v["login_txn"],
+                           "credential_finalization": b64(&fin.message.serialize())})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    e.cleanup().await;
+}
+
+/// A bound refresh family needs a proof of the same key; a missing proof or another key is
+/// treated like theft (session revoked, family revoked, identity.session.revoked). An unbound
+/// session stays unbound.
+#[tokio::test]
+async fn dpop_bound_refresh_requires_the_same_key() {
+    let Some(e) = env().await else { return };
+    let t = alice(&e, "pw").await;
+    let rpath = "/api/v2/auth/token/refresh";
+    let key = PKey::es256();
+    let (_, rt, _) = login_with(&e, t, "alice@acme.test", "pw", Some(&key))
+        .await
+        .unwrap();
+    // Same key: rotates, the new access token and refresh token stay bound.
+    let (s, h, v) = refresh_dpop(&e, &rt, Some(key.proof("POST", &htu(rpath), None))).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        claims_of(v["access_token"].as_str().unwrap())["cnf"]["jkt"],
+        json!(key.jkt())
+    );
+    let rt2 = rt_of(&h);
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM refresh_tokens WHERE key_jkt IS NULL"
+        )
+        .await,
+        0
+    );
+    // A proof from another key: refused and the session is revoked.
+    let (s, _, _) = refresh_dpop(
+        &e,
+        &rt2,
+        Some(PKey::es256().proof("POST", &htu(rpath), None)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM sessions WHERE state = 'revoked' AND generation = 2"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM refresh_tokens WHERE state <> 'revoked'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM outbox WHERE event_type = 'identity.session.revoked' \
+             AND position(convert_to('dpop_key_mismatch', 'UTF8') in payload) > 0"
+        )
+        .await,
+        1
+    );
+    // The right key can no longer refresh the revoked family.
+    let (s, _, _) = refresh_dpop(&e, &rt2, Some(key.proof("POST", &htu(rpath), None))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // A bound token without any proof: same treatment.
+    let (_, rt, _) = login_with(&e, t, "alice@acme.test", "pw", Some(&key))
+        .await
+        .unwrap();
+    let (s, _, _) = refresh_dpop(&e, &rt, None).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM sessions WHERE state = 'revoked'"
+        )
+        .await,
+        2
+    );
+    // A bound token with a broken proof (wrong htu) of its own key: same treatment.
+    let (_, rt, _) = login_with(&e, t, "alice@acme.test", "pw", Some(&key))
+        .await
+        .unwrap();
+    let (s, _, _) = refresh_dpop(&e, &rt, Some(key.proof("POST", &htu("/x"), None))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM sessions WHERE state = 'revoked'"
+        )
+        .await,
+        3
+    );
+
+    // Unbound session: a valid proof at refresh does not bind it; a broken proof is refused
+    // without revoking.
+    let (_, rt, _) = login(&e, t, "alice@acme.test", "pw").await.unwrap();
+    let (s, h, v) = refresh_dpop(&e, &rt, Some(key.proof("POST", &htu(rpath), None))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        claims_of(v["access_token"].as_str().unwrap())
+            .get("cnf")
+            .is_none()
+    );
+    let rt = rt_of(&h);
+    let (s, _, _) = refresh_dpop(&e, &rt, Some(key.proof("GET", &htu(rpath), None))).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM sessions WHERE state = 'active'"
+        )
+        .await,
+        1
+    );
+    let (s, _, _) = refresh_dpop(&e, &rt, None).await;
+    assert_eq!(s, StatusCode::OK);
+    e.cleanup().await;
+}
+
+fn valkey_url() -> Option<String> {
+    match std::env::var("CS_TEST_VALKEY_URL") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => {
+            assert!(
+                std::env::var("CS_REQUIRE_DB").as_deref() != Ok("1"),
+                "CS_REQUIRE_DB=1 but CS_TEST_VALKEY_URL is not set"
+            );
+            None
+        }
+    }
+}
+
+fn dead_pool() -> DomainPool {
+    let cfg = cs_common::config::DomainConfig {
+        url: cs_common::Secret::new("postgres://yugabyte@127.0.0.1:1/cs_identity".to_owned()),
+        pool: cs_common::config::PoolConfig {
+            acquire_timeout_ms: 300,
+            ..Default::default()
+        },
+    };
+    DomainPool::connect_lazy(
+        ID,
+        &cfg,
+        cs_db::RetryPolicy {
+            max_attempts: 2,
+            max_elapsed: Duration::from_millis(500),
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+        },
+    )
+    .unwrap()
+}
+
+/// `[R6]`: Valkey SET NX first; Valkey down → the shared dpop_jti table; both down → 503.
+#[tokio::test]
+async fn dpop_replay_store_valkey_table_fallback_and_fail_closed() {
+    use cs_identity::dpop::{ReplayBackend, ReplayStore, ReplayVerdict, verify_proof};
+    let Some(e) = env().await else { return };
+    let tenant = TenantId::generate().unwrap();
+    let key = PKey::es256();
+    let path = "/api/v2/me";
+    let proof = || {
+        verify_proof(
+            &key.proof("GET", &htu(path), None),
+            "GET",
+            &htu(path),
+            None,
+            now(),
+        )
+        .unwrap()
+    };
+
+    // Valkey up.
+    if let Some(url) = valkey_url() {
+        let store = ReplayStore::new(e.pool().clone(), Some(&url)).unwrap();
+        let p = proof();
+        assert_eq!(
+            store.check(tenant, &p).await.unwrap(),
+            (ReplayVerdict::Fresh, ReplayBackend::Valkey)
+        );
+        assert_eq!(
+            store.check(tenant, &p).await.unwrap(),
+            (ReplayVerdict::Replayed, ReplayBackend::Valkey)
+        );
+        // Shared across nodes: a second store (another node) sees the same entry.
+        let other = ReplayStore::new(e.pool().clone(), Some(&url)).unwrap();
+        assert_eq!(
+            other.check(tenant, &p).await.unwrap().0,
+            ReplayVerdict::Replayed
+        );
+        // Same jti under another tenant is a different entry.
+        let t2 = TenantId::generate().unwrap();
+        assert_eq!(other.check(t2, &p).await.unwrap().0, ReplayVerdict::Fresh);
+        // Through HTTP with Valkey configured: replayed proof refused.
+        let auth = Arc::new(
+            AuthService::new(
+                e.pool().clone(),
+                e.kms.clone(),
+                DOMAIN,
+                SessionPolicy::default(),
+            )
+            .with_valkey(&url)
+            .unwrap(),
+        );
+        let e2 = env_with(e, auth);
+        let t = alice(&e2, "pw").await;
+        let (v, _, _) = login_with(&e2, t, "alice@acme.test", "pw", Some(&key))
+            .await
+            .unwrap();
+        let at = v["access_token"].as_str().unwrap();
+        let pr = key.proof("GET", &htu(path), Some(at));
+        assert_eq!(me_dpop(&e2, at, pr.clone()).await, StatusCode::OK);
+        assert_eq!(me_dpop(&e2, at, pr).await, StatusCode::UNAUTHORIZED);
+        // Valkey answered: nothing went to the table.
+        assert_eq!(
+            scalar_i64(e2.pool(), "SELECT count(*) FROM dpop_jti").await,
+            0
+        );
+        e2.cleanup().await;
+        return dpop_fallback_part(tenant).await;
+    }
+    e.cleanup().await;
+    dpop_fallback_part(tenant).await;
+}
+
+/// Second half of the replay-store test (fresh database): table fallback and fail-closed.
+async fn dpop_fallback_part(tenant: TenantId) {
+    use cs_identity::dpop::{ReplayBackend, ReplayStore, ReplayVerdict, verify_proof};
+    let Some(e) = env().await else { return };
+    let key = PKey::es256();
+    let path = "/api/v2/me";
+    let proof = || {
+        verify_proof(
+            &key.proof("GET", &htu(path), None),
+            "GET",
+            &htu(path),
+            None,
+            now(),
+        )
+        .unwrap()
+    };
+    // Valkey down (nothing listens on port 1) → dpop_jti table.
+    let store = ReplayStore::new(e.pool().clone(), Some("redis://127.0.0.1:1")).unwrap();
+    let p = proof();
+    assert_eq!(
+        store.check(tenant, &p).await.unwrap(),
+        (ReplayVerdict::Fresh, ReplayBackend::Table)
+    );
+    assert_eq!(
+        store.check(tenant, &p).await.unwrap(),
+        (ReplayVerdict::Replayed, ReplayBackend::Table)
+    );
+    // Rows carry their expiry bucket and are purged by the bounded sweep once expired.
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM dpop_jti WHERE expiry_bucket IS NOT NULL \
+             AND expires_at > now() + interval '100 seconds'"
+        )
+        .await,
+        1
+    );
+    exec(
+        e.pool(),
+        "UPDATE dpop_jti SET expires_at = now() - interval '1 second'",
+    )
+    .await;
+    assert_eq!(
+        cs_identity::dpop::sweep_expired_jti(e.pool(), 500, 20).await,
+        1
+    );
+    // Valkey down and the table unreachable → 503 unavailable (fail closed).
+    let dead = ReplayStore::new(dead_pool(), Some("redis://127.0.0.1:1")).unwrap();
+    let err = dead.check(tenant, &proof()).await.unwrap_err();
+    assert_eq!(err.status(), 503);
+    // Through HTTP: a DPoP-bound request fails closed with 503.
+    let auth = Arc::new(
+        AuthService::new(
+            e.pool().clone(),
+            e.kms.clone(),
+            DOMAIN,
+            SessionPolicy::default(),
+        )
+        .with_replay_store(
+            ReplayStore::new(e.pool().clone(), Some("redis://127.0.0.1:1")).unwrap(),
+        ),
+    );
+    let e2 = env_with(e, auth);
+    let t = alice(&e2, "pw").await;
+    let (v, _, _) = login_with(&e2, t, "alice@acme.test", "pw", Some(&key))
+        .await
+        .unwrap();
+    let at = v["access_token"].as_str().unwrap().to_owned();
+    let pr = key.proof("GET", &htu(path), Some(&at));
+    assert_eq!(me_dpop(&e2, &at, pr.clone()).await, StatusCode::OK);
+    assert_eq!(me_dpop(&e2, &at, pr).await, StatusCode::UNAUTHORIZED);
+    let down = Arc::new(
+        AuthService::new(
+            e2.pool().clone(),
+            e2.kms.clone(),
+            DOMAIN,
+            SessionPolicy::default(),
+        )
+        .with_replay_store(ReplayStore::new(dead_pool(), Some("redis://127.0.0.1:1")).unwrap()),
+    );
+    let e3 = env_with(e2, down);
+    let (s, h, v) = with_at(
+        &e3,
+        "GET",
+        path,
+        "DPoP",
+        &at,
+        Some(key.proof("GET", &htu(path), Some(&at))),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(v["code"], json!("unavailable"));
+    assert!(h.get("dpop-nonce").is_none());
+    e3.cleanup().await;
+}
+
+/// The same database and KMS behind another AuthService (another node, or other settings).
+fn env_with(e: Env, auth: Arc<AuthService>) -> Env {
+    let state = ApiState::new(DOMAIN, vec![], Duration::from_secs(2));
+    let app = cs_api::with_middleware(
+        cs_api::public_routes().merge(cs_identity::http::routes(auth.clone())),
+        state,
+        1 << 20,
+    );
+    Env { auth, app, ..e }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Step-up (§2.3 [R2]) and re-registration by a step-up session (rev 9)
+// ---------------------------------------------------------------------------------------------
+
+/// Re-register through `register/{start,finish}` with the session's access token. Returns the
+/// (start, finish) statuses and the failing body.
+#[allow(clippy::too_many_arguments)]
+async fn reregister(
+    e: &Env,
+    tenant: TenantId,
+    at: &str,
+    key: Option<&PKey>,
+    purpose: &str,
+    pw: &str,
+    extra: Value,
+) -> (StatusCode, StatusCode, Value) {
+    let mut rng = rand_core_06::OsRng;
+    let c = ClientRegistration::<Suite>::start(&mut rng, pw.as_bytes()).unwrap();
+    let mut body = json!({"purpose": purpose, "registration_request": b64(&c.message.serialize())});
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    let (scheme, sp, fp) = match key {
+        Some(k) => (
+            "DPoP",
+            Some(k.proof("POST", &htu("/api/v2/auth/opaque/register/start"), Some(at))),
+            Some(k.proof(
+                "POST",
+                &htu("/api/v2/auth/opaque/register/finish"),
+                Some(at),
+            )),
+        ),
+        None => ("Bearer", None, None),
+    };
+    let (s, _, v) = with_at(
+        e,
+        "POST",
+        "/api/v2/auth/opaque/register/start",
+        scheme,
+        at,
+        sp,
+        Some(body),
+    )
+    .await;
+    if s != StatusCode::OK {
+        return (s, s, v);
+    }
+    let resp =
+        RegistrationResponse::<Suite>::deserialize(&unb64(&v["registration_response"])).unwrap();
+    let cid = client_identifier(&tenant.as_uuid().to_string(), "alice@acme.test");
+    let k = ksf();
+    let fin = c
+        .state
+        .finish(
+            &mut rng,
+            pw.as_bytes(),
+            resp,
+            ClientRegistrationFinishParameters::new(
+                Identifiers {
+                    client: Some(cid.as_bytes()),
+                    server: None,
+                },
+                Some(&k),
+            ),
+        )
+        .unwrap();
+    let (f, _, fv) = with_at(
+        e,
+        "POST",
+        "/api/v2/auth/opaque/register/finish",
+        scheme,
+        at,
+        fp,
+        Some(json!({"registration_txn": v["registration_txn"],
+                    "registration_upload": b64(&fin.message.serialize())})),
+    )
+    .await;
+    (s, f, fv)
+}
+
+/// Step-up guard: outside the window → 401 with errors[] step_up_required; a body `login`
+/// is refused; password change keeps the current session, revokes every other one, and the
+/// old password stops working.
+#[tokio::test]
+async fn step_up_password_change_revokes_other_sessions() {
+    let Some(e) = env().await else { return };
+    let t = alice(&e, "old-pw").await;
+    // Session A (DPoP-bound) and session B (unbound).
+    let key = PKey::es256();
+    let (a, rt_a, _) = login_with(&e, t, "alice@acme.test", "old-pw", Some(&key))
+        .await
+        .unwrap();
+    let at_a = a["access_token"].as_str().unwrap().to_owned();
+    let (b, rt_b, _) = login(&e, t, "alice@acme.test", "old-pw").await.unwrap();
+    let at_b = b["access_token"].as_str().unwrap().to_owned();
+    let sid_a = a["session_id"].as_str().unwrap().to_owned();
+    // A login inside the step-up window does not ask for re-registration.
+    assert!(a.get("reregister").is_none(), "{a}");
+
+    // Outside the window (policy default 5 min): step_up_required.
+    exec(
+        e.pool(),
+        "UPDATE sessions SET last_strong_auth_at = now() - interval '6 minutes'",
+    )
+    .await;
+    let (s, _, v) = reregister(&e, t, &at_b, None, "password_change", "new-pw", json!({})).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(v["errors"][0]["code"], json!("step_up_required"));
+    assert_eq!(v["errors"][0]["pointer"], json!(""));
+    // The reusable guard agrees.
+    let claims = e.auth.access_tokens().verify(&at_b, now()).await.unwrap();
+    let err = e.auth.require_step_up(&claims).await.unwrap_err();
+    assert_eq!(err.status(), 401);
+    assert_eq!(
+        err.detail(),
+        Some("Recent strong authentication is required.")
+    );
+    // A password reauth brings session B back into the window.
+    assert_eq!(
+        reauth_call(&e, &at_b, &t.as_uuid().to_string(), "old-pw").await,
+        StatusCode::NO_CONTENT
+    );
+    e.auth.require_step_up(&claims).await.unwrap();
+    exec(e.pool(), "UPDATE sessions SET last_strong_auth_at = now()").await;
+
+    // A body login, an unknown purpose, a grant with a purpose: refused.
+    let (s, _, v) = reregister(
+        &e,
+        t,
+        &at_a,
+        Some(&key),
+        "password_change",
+        "new-pw",
+        json!({"login": "alice@acme.test"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["errors"][0]["pointer"], json!("/login"));
+    let (s, _, _) = reregister(&e, t, &at_a, Some(&key), "other", "new-pw", json!({})).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // Without an access token.
+    let (s, _, _) = e
+        .post(
+            "/api/v2/auth/opaque/register/start",
+            json!({"purpose": "password_change", "registration_request": b64(&[0u8; 32])}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    // Password change from the DPoP-bound session A.
+    let (s, f, v) = reregister(
+        &e,
+        t,
+        &at_a,
+        Some(&key),
+        "password_change",
+        "new-pw",
+        json!({}),
+    )
+    .await;
+    assert_eq!((s, f), (StatusCode::OK, StatusCode::NO_CONTENT), "{v}");
+    // A is kept, B is revoked (generation bumped, family revoked, event).
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM sessions WHERE state = 'active'"
+        )
+        .await,
+        1
+    );
+    let active: String = {
+        let p = e.pool().clone();
+        p.read_snapshot(|tx| {
+            Box::pin(async move {
+                Ok(sqlx::query_scalar::<_, uuid::Uuid>(
+                    "SELECT session_id FROM sessions WHERE state = 'active'",
+                )
+                .fetch_one(tx.conn())
+                .await?
+                .to_string())
+            })
+        })
+        .await
+        .unwrap()
+    };
+    assert_eq!(active, sid_a);
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM outbox WHERE event_type = 'identity.session.revoked' \
+             AND position(convert_to('credentials_changed', 'UTF8') in payload) > 0"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM outbox WHERE event_type = 'identity.credentials.changed' \
+             AND position(convert_to('password_change', 'UTF8') in payload) > 0"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        with_at(&e, "GET", "/api/v2/me", "Bearer", &at_b, None, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        refresh_dpop(&e, &rt_b, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (s, _, _) = refresh_dpop(
+        &e,
+        &rt_a,
+        Some(key.proof("POST", &htu("/api/v2/auth/token/refresh"), None)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    // The old password fails, the new one works; the user stays active.
+    assert!(login(&e, t, "alice@acme.test", "old-pw").await.is_err());
+    login(&e, t, "alice@acme.test", "new-pw").await.unwrap();
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM users WHERE status = 'active'"
+        )
+        .await,
+        1
+    );
+    // A registration txn cannot be finished by another session (bound to sid and generation).
+    e.cleanup().await;
+}
+
+/// `reregister: true` after a login whose registration uses an older server key version;
+/// `ksf_upgrade` with the same password moves it to the current version and clears the flag.
+#[tokio::test]
+async fn reregister_signal_and_ksf_upgrade() {
+    let Some(e) = env().await else { return };
+    let t = alice(&e, "pw").await;
+    let (v, _, _) = login(&e, t, "alice@acme.test", "pw").await.unwrap();
+    assert!(v.get("reregister").is_none(), "{v}");
+    let (_, _, other) = login(&e, t, "alice@acme.test", "pw").await.unwrap();
+    let _ = other;
+    // Rotate the OPAQUE server keys; a node loading them now has version 2 as current.
+    OpaqueKeys::rotate(e.pool(), e.kms.as_ref()).await.unwrap();
+    let auth = Arc::new(AuthService::new(
+        e.pool().clone(),
+        e.kms.clone(),
+        DOMAIN,
+        SessionPolicy::default(),
+    ));
+    let e = env_with(e, auth);
+    let (v, _, _) = login(&e, t, "alice@acme.test", "pw").await.unwrap();
+    assert_eq!(v["reregister"], json!(true), "{v}");
+    let at = v["access_token"].as_str().unwrap();
+    let (s, f, b) = reregister(&e, t, at, None, "ksf_upgrade", "pw", json!({})).await;
+    assert_eq!((s, f), (StatusCode::OK, StatusCode::NO_CONTENT), "{b}");
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM opaque_registrations WHERE server_key_version LIKE '%2'"
+        )
+        .await,
+        1
+    );
+    // ksf_upgrade also revokes the other sessions (rev 9: purpose never weakens revocation).
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM sessions WHERE state = 'active'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar_i64(
+            e.pool(),
+            "SELECT count(*) FROM outbox WHERE event_type = 'identity.credentials.changed' \
+             AND position(convert_to('ksf_upgrade', 'UTF8') in payload) > 0"
+        )
+        .await,
+        1
+    );
+    let (v, _, _) = login(&e, t, "alice@acme.test", "pw").await.unwrap();
+    assert!(v.get("reregister").is_none(), "{v}");
+    // A re-registration txn is bound to its session: another session cannot finish it.
+    let (v2, _, _) = login(&e, t, "alice@acme.test", "pw").await.unwrap();
+    let at1 = v["access_token"].as_str().unwrap();
+    let at2 = v2["access_token"].as_str().unwrap();
+    let mut rng = rand_core_06::OsRng;
+    let c = ClientRegistration::<Suite>::start(&mut rng, b"pw").unwrap();
+    let (s, _, sv) = with_at(
+        &e,
+        "POST",
+        "/api/v2/auth/opaque/register/start",
+        "Bearer",
+        at1,
+        None,
+        Some(
+            json!({"purpose": "ksf_upgrade", "registration_request": b64(&c.message.serialize())}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let resp =
+        RegistrationResponse::<Suite>::deserialize(&unb64(&sv["registration_response"])).unwrap();
+    let cid = client_identifier(&t.as_uuid().to_string(), "alice@acme.test");
+    let k = ksf();
+    let fin = c
+        .state
+        .finish(
+            &mut rng,
+            b"pw",
+            resp,
+            ClientRegistrationFinishParameters::new(
+                Identifiers {
+                    client: Some(cid.as_bytes()),
+                    server: None,
+                },
+                Some(&k),
+            ),
+        )
+        .unwrap();
+    let body = json!({"registration_txn": sv["registration_txn"],
+                      "registration_upload": b64(&fin.message.serialize())});
+    let (s, _, _) = with_at(
+        &e,
+        "POST",
+        "/api/v2/auth/opaque/register/finish",
+        "Bearer",
+        at2,
+        None,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    // ... nor can the setup-link path (no Authorization header).
+    let (s, _, _) = e.post("/api/v2/auth/opaque/register/finish", body).await;
+    assert_ne!(s, StatusCode::NO_CONTENT);
     e.cleanup().await;
 }

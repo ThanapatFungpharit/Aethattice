@@ -8,7 +8,9 @@ echo "== rust: unit tests"; cargo test --workspace
 if [[ "${1:-}" == "--with-db" ]]; then
   echo "== rust: db integration tests (requires dev/docker-compose.yml up)"
   # DB tests read CS_TEST_DATABASE_URL; with CS_REQUIRE_DB=1 a missing/unreachable DB is a failure, not a skip.
+  # CS_TEST_VALKEY_URL: dev Valkey for the DPoP replay-store tests (M1 contract §3 [R6]).
   CS_REQUIRE_DB=1 CS_TEST_DATABASE_URL="${CS_TEST_DATABASE_URL:-postgres://yugabyte@localhost:5433/yugabyte}" \
+    CS_TEST_VALKEY_URL="${CS_TEST_VALKEY_URL:-redis://localhost:6379}" \
     cargo test --workspace -- --test-threads=4
   # Engineer tests lease reused pool databases (cs_db::testing, cs_test_pool_<domain>_<n>) instead
   # of CREATE/DROP DATABASE per test; the QA harness (cs-qa-tests) still creates and drops its own,

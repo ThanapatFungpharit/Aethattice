@@ -195,6 +195,14 @@ pub const POLICY_TABLE: &[PolicySpec] = &[
         unit: "seconds",
         source: "spec §5.5 / erratum C13 / M1 contract §8: 90 d, 1–365 d",
     },
+    PolicySpec {
+        key: "step_up_window_secs",
+        default: 300,
+        min: 60,
+        max: 3_600,
+        unit: "seconds",
+        source: "spec §5.5 / erratum C13 / M1 contract §2.3, §8: 5 min, 1–60 min",
+    },
 ];
 
 /// Typed handle on a policy key.
@@ -213,6 +221,7 @@ pub enum PolicyKey {
     AccessTokenLifetimeSecs,
     SessionIdleLifetimeSecs,
     SessionAbsoluteLifetimeSecs,
+    StepUpWindowSecs,
 }
 
 impl PolicyKey {
@@ -231,6 +240,7 @@ impl PolicyKey {
             PolicyKey::AccessTokenLifetimeSecs => "access_token_lifetime_secs",
             PolicyKey::SessionIdleLifetimeSecs => "session_idle_lifetime_secs",
             PolicyKey::SessionAbsoluteLifetimeSecs => "session_absolute_lifetime_secs",
+            PolicyKey::StepUpWindowSecs => "step_up_window_secs",
         }
     }
 }
@@ -374,6 +384,15 @@ pub struct KmsConfig {
     pub keystore_path: Option<PathBuf>,
 }
 
+/// Valkey connection (M1 contract §3 `[R6]`: shared DPoP replay store). Optional: when absent,
+/// replay checks use the identity `dpop_jti` table only.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValkeyConfig {
+    /// `redis://` or `rediss://` (TLS) URL; may carry credentials, so it is a secret.
+    pub url: Secret<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
@@ -457,6 +476,8 @@ struct RawConfig {
     #[serde(default)]
     api: Option<ApiConfig>,
     #[serde(default)]
+    valkey: Option<ValkeyConfig>,
+    #[serde(default)]
     telemetry: TelemetryConfig,
     #[serde(default)]
     policy: BTreeMap<String, toml::Value>,
@@ -472,6 +493,7 @@ pub struct Config {
     pub domains: BTreeMap<DomainId, DomainConfig>,
     pub kms: Option<KmsConfig>,
     pub api: Option<ApiConfig>,
+    pub valkey: Option<ValkeyConfig>,
     pub telemetry: TelemetryConfig,
     pub policy: Policy,
     pub locked_policy: BTreeSet<&'static str>,
@@ -612,6 +634,16 @@ impl Config {
             errs.push("kms.root_key_path: must not be empty".to_owned());
         }
 
+        if let Some(v) = &raw.valkey {
+            let u = v.url.expose_secret();
+            let rest = u
+                .strip_prefix("redis://")
+                .or_else(|| u.strip_prefix("rediss://"));
+            if rest.is_none_or(|r| r.is_empty() || r.starts_with('/')) {
+                errs.push("valkey.url: must be a redis:// or rediss:// URL with a host".to_owned());
+            }
+        }
+
         if tracing_subscriber::EnvFilter::try_new(&raw.telemetry.log_level).is_err() {
             errs.push("telemetry.log_level: invalid filter directive".to_owned());
         }
@@ -637,6 +669,7 @@ impl Config {
                 domains,
                 kms: raw.kms,
                 api: raw.api,
+                valkey: raw.valkey,
                 telemetry: raw.telemetry,
                 policy,
                 locked_policy,
@@ -748,6 +781,7 @@ policy = ["idempotency_retention_hours"]
             ("access_token_lifetime_secs", 60, 3_600),
             ("session_idle_lifetime_secs", 3_600, 7_776_000),
             ("session_absolute_lifetime_secs", 86_400, 31_536_000),
+            ("step_up_window_secs", 60, 3_600),
         ] {
             let g = good();
             for ok in [lo, hi] {
@@ -774,6 +808,31 @@ policy = ["idempotency_retention_hours"]
         assert_eq!(d.get(PolicyKey::GroupMaxClosure), 10_000);
         assert_eq!(d.get(PolicyKey::SetupLinkLifetimeSecs), 86_400);
         assert_eq!(d.get(PolicyKey::AccessTokenLifetimeSecs), 600);
+        assert_eq!(d.get(PolicyKey::StepUpWindowSecs), 300);
+    }
+
+    /// `[valkey] url` (M1 contract §3 [R6]): optional, redis:// or rediss://, credentials
+    /// allowed and never printed; anything else is refused by check-config.
+    #[test]
+    fn valkey_section() {
+        let g = good();
+        assert!(Config::from_toml_str(&g).unwrap().valkey.is_none());
+        for ok in [
+            "redis://localhost:6379",
+            "rediss://default:s3cr3t-pw@valkey.internal:6380/0",
+        ] {
+            let c = Config::from_toml_str(&format!("{g}\n[valkey]\nurl = \"{ok}\"\n")).unwrap();
+            assert_eq!(c.valkey.as_ref().unwrap().url.expose_secret(), ok);
+            assert!(!format!("{c:?}").contains("s3cr3t-pw"));
+        }
+        for bad in ["http://localhost:6379", "redis://", "localhost:6379", ""] {
+            let e = invalid(&format!("{g}\n[valkey]\nurl = \"{bad}\"\n"));
+            assert!(e.contains("valkey.url"), "{bad}: {e}");
+        }
+        assert!(
+            invalid(&format!("{g}\n[valkey]\nurl = \"redis://h\"\nx = 1\n"))
+                .contains("unknown field")
+        );
     }
 
     #[test]

@@ -285,13 +285,25 @@ async fn serve(path: &Path) -> Result<(), String> {
     let mut routes = cs_api::public_routes();
     match (identity_pool, kms) {
         (Some(pool), Some(kms)) => {
-            let auth = Arc::new(cs_identity::auth::AuthService::new(
+            let auth = cs_identity::auth::AuthService::new(
                 pool,
                 Arc::new(kms),
                 &api.deployment_domain,
                 cs_identity::session::SessionPolicy::from_policy(&cfg.policy),
-            ));
-            routes = routes.merge(cs_identity::http::routes(auth));
+            );
+            // DPoP replay store (M1 contract §3 [R6]): Valkey first, dpop_jti table fallback.
+            let auth = match &cfg.valkey {
+                Some(v) => auth
+                    .with_valkey(v.url.expose_secret())
+                    .map_err(|e| format!("cs: invalid valkey.url: {e}"))?,
+                None => {
+                    tracing::warn!(
+                        "[valkey] not configured: the DPoP replay check runs on the database (dpop_jti) only"
+                    );
+                    auth
+                }
+            };
+            routes = routes.merge(cs_identity::http::routes(Arc::new(auth)));
         }
         _ => tracing::warn!(
             "identity routes disabled: they need [domains.identity] and a [kms] section"
