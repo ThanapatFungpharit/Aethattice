@@ -101,12 +101,15 @@ async fn env() -> Option<Env> {
     let dir = tempfile::tempdir().unwrap();
     let kms: Arc<dyn Kms> =
         Arc::new(LocalSoftwareKms::init(&dir.path().join("root.key"), None).unwrap());
-    let auth = Arc::new(AuthService::new(
-        t.pool(&ID).clone(),
-        kms.clone(),
-        DOMAIN,
-        SessionPolicy::default(),
-    ));
+    let auth = Arc::new(
+        AuthService::new(
+            t.pool(&ID).clone(),
+            kms.clone(),
+            DOMAIN,
+            SessionPolicy::default(),
+        )
+        .with_rate_limiter(generous_limits()),
+    );
     let state = ApiState::new(DOMAIN, vec![], Duration::from_secs(2));
     let app = cs_api::with_middleware(
         cs_api::public_routes().merge(cs_identity::http::routes(auth.clone())),
@@ -121,6 +124,17 @@ async fn env() -> Option<Env> {
         auth,
         admin,
         app,
+    })
+}
+
+/// Rate limits at the top of their ranges: these tests run many sign-ins from one source
+/// (rate limiting itself is tested in tests/mfa_recovery.rs).
+fn generous_limits() -> cs_identity::ratelimit::RateLimiter {
+    cs_identity::ratelimit::RateLimiter::local_only(cs_identity::ratelimit::RateLimits {
+        source: 1000,
+        account: 100,
+        tenant: 100_000,
+        node_count: 1,
     })
 }
 
@@ -865,6 +879,7 @@ async fn access_token_verification_rejects_tampering() {
         exp: now + 600,
         jti: "j".into(),
         cnf: None,
+        scp: None,
     };
     let tok = tokens.sign(claims.clone()).await.unwrap();
     assert!(tokens.verify(&tok, now).await.is_ok());

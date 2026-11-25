@@ -23,18 +23,29 @@
 //!   re-registration by a step-up session (rev 9: password change, KSF / key-version upgrade,
 //!   `reregister` signal at login).
 //!
-//! Not yet: WebAuthn/MFA, recovery flows, rate limiting, `/me/sessions`, native
-//! (device-bound) refresh.
+//! - Slice 4 (rev 10/11): [`webauthn`] passkeys (webauthn-rs), [`mfa`] (second factor and
+//!   the enrolment-only session), [`ceremony`] state, [`recovery`] (codes, request flows,
+//!   [R5] completion in [`auth`]), [`ratelimit`] (Valkey, limit/N fallback), [`me`]
+//!   (`/me/sessions`), [`notify`] (Notifier trait; SMTP relay not yet).
+//!
+//! Not yet: SMTP relay notifier, native (device-bound) refresh.
 
 pub mod admin;
 pub mod auth;
+pub mod ceremony;
 pub mod dpop;
 pub mod http;
 pub mod jws;
 pub mod keys;
+pub mod me;
+pub mod mfa;
+pub mod notify;
+pub mod ratelimit;
+pub mod recovery;
 pub use cs_identity_wire::login;
 pub mod session;
 pub mod token;
+pub mod webauthn;
 
 use cs_db::migrate::{MigrationError, MigrationSet};
 
@@ -53,6 +64,10 @@ pub fn migrations() -> Result<MigrationSet, MigrationError> {
         (
             "0102_expiry_buckets.expand.sql",
             include_str!("../migrations/identity/0102_expiry_buckets.expand.sql"),
+        ),
+        (
+            "0103_mfa_recovery_webauthn.expand.sql",
+            include_str!("../migrations/identity/0103_mfa_recovery_webauthn.expand.sql"),
         ),
     ])
 }

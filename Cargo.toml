@@ -65,6 +65,10 @@ unicode-normalization = "0.1.26"
 # DPoP (M1 contract rev 8 §3): ES256 proofs (P-256 ECDSA, RustCrypto).
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
 # Valkey client for the shared DPoP replay store ([R6]); TLS via rustls, ConnectionManager.
+# WebAuthn (M1 contract §2.2, rev 10): kanidm webauthn-rs. State serialization lets ceremony
+# state live server-side in auth_txns (AEAD-sealed); conditional-ui enables discoverable login.
+webauthn-rs = { version = "=0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+url = "2.5.4"
 redis = { version = "1.8.3", default-features = false, features = ["tokio-rustls-comp", "connection-manager"] }
 
 [workspace.lints.rust]

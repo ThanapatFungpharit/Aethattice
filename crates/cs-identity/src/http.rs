@@ -17,12 +17,16 @@
 //! OPAQUE messages are base64url without padding (rev 5). Token responses carry
 //! `Cache-Control: no-store`. Nothing here logs a token, txn id, grant or OPAQUE message.
 
-use crate::auth::{AuthService, Authenticated, RequestCtx, source_of};
+use crate::auth::{AuthService, Authenticated, LoginResult, RequestCtx, source_of};
 use crate::jws::AccessClaims;
+use crate::me::Revoked;
+use crate::recovery::{RecoveryStart, StatusBy};
+use crate::webauthn::AssertOutcome;
+use axum::extract::Path;
 use axum::extract::{ConnectInfo, Extension, FromRequestParts, OriginalUri};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -51,6 +55,42 @@ pub fn routes(auth: Arc<AuthService>) -> axum::Router<ApiState> {
         .route("/api/v2/auth/opaque/reauth/start", post(reauth_start))
         .route("/api/v2/auth/opaque/reauth/finish", post(reauth_finish))
         .route("/api/v2/me", get(me))
+        // rev 10/11: WebAuthn, MFA, sessions, passkeys, recovery.
+        .route(
+            "/api/v2/auth/webauthn/register/start",
+            post(wa_register_start),
+        )
+        .route(
+            "/api/v2/auth/webauthn/register/finish",
+            post(wa_register_finish),
+        )
+        .route("/api/v2/auth/webauthn/login/start", post(wa_login_start))
+        .route("/api/v2/auth/webauthn/login/finish", post(wa_login_finish))
+        .route("/api/v2/auth/webauthn/assert/start", post(wa_assert_start))
+        .route(
+            "/api/v2/auth/webauthn/assert/finish",
+            post(wa_assert_finish),
+        )
+        .route("/api/v2/auth/mfa/recovery-code", post(mfa_recovery_code))
+        .route("/api/v2/auth/recovery/start", post(recovery_start))
+        .route("/api/v2/auth/recovery/status", post(recovery_status))
+        .route("/api/v2/me/sessions", get(me_sessions))
+        .route("/api/v2/me/sessions/{sid}", delete(me_session_delete))
+        .route("/api/v2/me/passkeys", get(me_passkeys))
+        .route("/api/v2/me/passkeys/{id}", delete(me_passkey_delete))
+        .route(
+            "/api/v2/me/recovery-codes",
+            get(me_recovery_codes).post(me_recovery_codes_new),
+        )
+        .route("/api/v2/me/recovery-requests", get(me_recovery_requests))
+        .route(
+            "/api/v2/me/recovery-requests/{id}",
+            delete(me_recovery_request_cancel),
+        )
+        .route(
+            "/api/v2/me/recovery-requests/{id}/approve",
+            post(me_recovery_request_approve),
+        )
         .layer(Extension(auth))
 }
 
@@ -229,8 +269,37 @@ async fn login_finish(
 ) -> Result<Response, ApiError> {
     let fin = b64("credential_finalization", &req.credential_finalization)?;
     let c = ctx(&method, &uri, &headers)?;
-    let a = auth.login_finish(&req.login_txn, &fin, &source, &c).await?;
-    authenticated(a)
+    let ua = user_agent(&headers);
+    match auth
+        .login_finish(&req.login_txn, &fin, &source, ua.as_deref(), &c)
+        .await?
+    {
+        LoginResult::Authenticated(a) => authenticated(a),
+        LoginResult::MfaRequired(m) => Ok(no_store(
+            Json(MfaRequiredResp {
+                state: "mfa_required",
+                auth_txn: m.auth_txn.expose_secret().clone(),
+                methods: m.methods,
+            })
+            .into_response(),
+        )),
+    }
+}
+
+/// `200 {state: "mfa_required", auth_txn, methods}` (rev 11).
+#[derive(Debug, Serialize)]
+struct MfaRequiredResp {
+    state: &'static str,
+    auth_txn: String,
+    methods: Vec<&'static str>,
+}
+
+/// The request's `User-Agent`, if it is valid text.
+fn user_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
 }
 
 /// Either `{grant, login, registration_request}` (setup link) or, with the session's access
@@ -323,6 +392,7 @@ struct RegisterFinishReq {
 async fn register_finish(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
+    IdempotencyKeyHeader(key): IdempotencyKeyHeader,
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
@@ -334,7 +404,7 @@ async fn register_finish(
         auth.register_finish_session(&claims, &req.registration_txn, &up, &source)
             .await?;
     } else {
-        auth.register_finish(&req.registration_txn, &up, &source)
+        auth.register_finish(&req.registration_txn, &up, &source, key.as_ref())
             .await?;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -484,4 +554,473 @@ async fn me(
     let claims = claims_of(&auth, &method, &uri, &headers).await?;
     let m = auth.me(&claims).await?;
     Ok(no_store(Json(m).into_response()))
+}
+
+// ----- rev 10/11: WebAuthn, MFA, sessions, passkeys, recovery -----
+
+/// Optional access token: claims when an `Authorization` header is present.
+async fn optional_claims(
+    auth: &AuthService,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+) -> Result<Option<AccessClaims>, ApiError> {
+    if headers.contains_key(header::AUTHORIZATION) {
+        Ok(Some(claims_of(auth, method, uri, headers).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RegistrationStartResp {
+    registration_txn: String,
+    public_key: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Empty {}
+
+async fn wa_register_start(
+    Extension(auth): Extension<Arc<AuthService>>,
+    Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    JsonBody(_): JsonBody<Empty>,
+) -> Result<Response, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    let s = auth.webauthn_register_start(&claims, &source).await?;
+    Ok(no_store(
+        Json(RegistrationStartResp {
+            registration_txn: s.txn.expose_secret().clone(),
+            public_key: s.public_key,
+        })
+        .into_response(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaRegisterFinishReq {
+    registration_txn: String,
+    credential: serde_json::Value,
+    /// Missing, empty or > 100 characters (trimmed): `invalid_request` at `/label`, and the
+    /// registration txn is not consumed.
+    #[serde(default)]
+    label: Option<String>,
+}
+
+async fn wa_register_finish(
+    Extension(auth): Extension<Arc<AuthService>>,
+    Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    JsonBody(req): JsonBody<WaRegisterFinishReq>,
+) -> Result<Response, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    let p = auth
+        .webauthn_register_finish(
+            &claims,
+            &req.registration_txn,
+            &req.credential,
+            req.label.as_deref().unwrap_or_default(),
+            &source,
+        )
+        .await?;
+    Ok(no_store(Json(p).into_response()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaLoginStartReq {
+    tenant: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WaLoginStartResp {
+    login_txn: String,
+    public_key: serde_json::Value,
+}
+
+async fn wa_login_start(
+    Extension(auth): Extension<Arc<AuthService>>,
+    Source(source): Source,
+    JsonBody(req): JsonBody<WaLoginStartReq>,
+) -> Result<Response, ApiError> {
+    let s = auth.webauthn_login_start(&req.tenant, &source).await?;
+    Ok(no_store(
+        Json(WaLoginStartResp {
+            login_txn: s.txn.expose_secret().clone(),
+            public_key: s.public_key,
+        })
+        .into_response(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaLoginFinishReq {
+    login_txn: String,
+    credential: serde_json::Value,
+}
+
+async fn wa_login_finish(
+    Extension(auth): Extension<Arc<AuthService>>,
+    Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    JsonBody(req): JsonBody<WaLoginFinishReq>,
+) -> Result<Response, ApiError> {
+    let c = ctx(&method, &uri, &headers)?;
+    let ua = user_agent(&headers);
+    let a = auth
+        .webauthn_login_finish(&req.login_txn, &req.credential, &source, ua.as_deref(), &c)
+        .await?;
+    authenticated(a)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaAssertStartReq {
+    #[serde(default)]
+    auth_txn: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WaAssertStartResp {
+    assert_txn: String,
+    public_key: serde_json::Value,
+}
+
+async fn wa_assert_start(
+    Extension(auth): Extension<Arc<AuthService>>,
+    Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    JsonBody(req): JsonBody<WaAssertStartReq>,
+) -> Result<Response, ApiError> {
+    let claims = optional_claims(&auth, &method, &uri, &headers).await?;
+    let s = auth
+        .webauthn_assert_start(req.auth_txn.as_deref(), claims.as_ref(), &source)
+        .await?;
+    Ok(no_store(
+        Json(WaAssertStartResp {
+            assert_txn: s.txn.expose_secret().clone(),
+            public_key: s.public_key,
+        })
+        .into_response(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaAssertFinishReq {
+    assert_txn: String,
+    credential: serde_json::Value,
+}
+
+async fn wa_assert_finish(
+    Extension(auth): Extension<Arc<AuthService>>,
+    Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    JsonBody(req): JsonBody<WaAssertFinishReq>,
+) -> Result<Response, ApiError> {
+    let claims = optional_claims(&auth, &method, &uri, &headers).await?;
+    let c = ctx(&method, &uri, &headers)?;
+    let ua = user_agent(&headers);
+    match auth
+        .webauthn_assert_finish(
+            &req.assert_txn,
+            &req.credential,
+            claims.as_ref(),
+            &source,
+            ua.as_deref(),
+            &c,
+        )
+        .await?
+    {
+        AssertOutcome::Authenticated(a) => authenticated(a),
+        AssertOutcome::SteppedUp => Ok(no_store(StatusCode::NO_CONTENT.into_response())),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MfaRecoveryCodeReq {
+    auth_txn: String,
+    code: String,
+}
+
+async fn mfa_recovery_code(
+    Extension(auth): Extension<Arc<AuthService>>,
+    Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    JsonBody(req): JsonBody<MfaRecoveryCodeReq>,
+) -> Result<Response, ApiError> {
+    let c = ctx(&method, &uri, &headers)?;
+    let ua = user_agent(&headers);
+    let a = auth
+        .mfa_recovery_code(&req.auth_txn, &req.code, &source, ua.as_deref(), &c)
+        .await?;
+    authenticated(a)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryStartReq {
+    tenant: String,
+    login: String,
+    method: String,
+    #[serde(default)]
+    code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecoveryResp {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_txn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_expires_in: Option<i64>,
+}
+
+async fn recovery_start(
+    Extension(auth): Extension<Arc<AuthService>>,
+    Source(source): Source,
+    headers: HeaderMap,
+    JsonBody(req): JsonBody<RecoveryStartReq>,
+) -> Result<Response, ApiError> {
+    let ua = user_agent(&headers);
+    let r = auth
+        .recovery_start(
+            &req.tenant,
+            &req.login,
+            &req.method,
+            req.code.as_deref(),
+            &source,
+            ua.as_deref(),
+        )
+        .await?;
+    let (status, body) = match r {
+        RecoveryStart::Granted {
+            grant,
+            grant_expires_in,
+        } => (
+            StatusCode::OK,
+            RecoveryResp {
+                state: "granted",
+                recovery_txn: None,
+                available_at: None,
+                grant: Some(grant.expose_secret().clone()),
+                grant_expires_in: Some(grant_expires_in),
+            },
+        ),
+        RecoveryStart::Pending { recovery_txn } => (
+            StatusCode::ACCEPTED,
+            RecoveryResp {
+                state: "pending",
+                recovery_txn: recovery_txn.map(|t| t.expose_secret().clone()),
+                available_at: None,
+                grant: None,
+                grant_expires_in: None,
+            },
+        ),
+    };
+    Ok(no_store((status, Json(body)).into_response()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryStatusReq {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    recovery_txn: Option<String>,
+}
+
+async fn recovery_status(
+    Extension(auth): Extension<Arc<AuthService>>,
+    Source(source): Source,
+    JsonBody(req): JsonBody<RecoveryStatusReq>,
+) -> Result<Response, ApiError> {
+    let by = match (&req.token, &req.recovery_txn, &req.code) {
+        (Some(t), None, c) => StatusBy::Link {
+            token: t,
+            code: c.as_deref(),
+        },
+        (None, Some(t), None) => StatusBy::Txn(t),
+        (None, Some(_), Some(_)) => {
+            return Err(field_invalid(
+                "/code",
+                "code is only sent with an email link token",
+            ));
+        }
+        _ => {
+            return Err(field_invalid(
+                "/token",
+                "exactly one of token and recovery_txn is required",
+            ));
+        }
+    };
+    let s = auth.recovery_status(by, &source).await?;
+    Ok(no_store(
+        Json(RecoveryResp {
+            state: s.state,
+            recovery_txn: None,
+            available_at: s.available_at,
+            grant: s.grant.map(|g| g.expose_secret().clone()),
+            grant_expires_in: s.grant_expires_in,
+        })
+        .into_response(),
+    ))
+}
+
+#[derive(Debug, Serialize)]
+struct Items<T> {
+    items: Vec<T>,
+}
+
+async fn me_sessions(
+    Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    let items = auth.sessions(&claims).await?;
+    Ok(no_store(Json(Items { items }).into_response()))
+}
+
+async fn me_session_delete(
+    Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(sid): Path<String>,
+) -> Result<Response, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    let mut r = StatusCode::NO_CONTENT.into_response();
+    if auth.session_revoke(&claims, &sid).await? == Revoked::Current {
+        r.headers_mut().insert(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&clear_refresh_cookie()).map_err(Error::internal)?,
+        );
+    }
+    Ok(no_store(r))
+}
+
+async fn me_passkeys(
+    Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    let items = auth.passkeys(&claims).await?;
+    Ok(no_store(Json(Items { items }).into_response()))
+}
+
+async fn me_passkey_delete(
+    Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    auth.passkey_delete(&claims, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize)]
+struct Remaining {
+    remaining: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct Codes {
+    codes: Vec<String>,
+}
+
+async fn me_recovery_codes(
+    Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    let remaining = auth.recovery_codes_remaining(&claims).await?;
+    Ok(no_store(Json(Remaining { remaining }).into_response()))
+}
+
+async fn me_recovery_codes_new(
+    Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    let codes = auth.recovery_codes_generate(&claims).await?;
+    Ok(no_store(
+        Json(Codes {
+            codes: codes.iter().map(|c| c.expose_secret().clone()).collect(),
+        })
+        .into_response(),
+    ))
+}
+
+async fn me_recovery_requests(
+    Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    let items = auth.recovery_requests(&claims).await?;
+    Ok(no_store(Json(Items { items }).into_response()))
+}
+
+fn request_id(id: &str) -> Result<uuid::Uuid, ApiError> {
+    uuid::Uuid::parse_str(id).map_err(|_| {
+        ApiError::new(Error::new(ErrorCode::NotFound).with_detail("No such recovery request."))
+    })
+}
+
+async fn me_recovery_request_cancel(
+    Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    auth.recovery_cancel(&claims, request_id(&id)?).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn me_recovery_request_approve(
+    Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
+    auth.recovery_approve(&claims, request_id(&id)?).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

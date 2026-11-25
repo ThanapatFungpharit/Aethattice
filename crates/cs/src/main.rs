@@ -88,6 +88,22 @@ enum AdminCmd {
         #[arg(long)]
         user: UserId,
     },
+    /// Administrator-assisted account recovery (M1 contract §4, rev 10).
+    #[command(subcommand)]
+    Recovery(RecoveryCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum RecoveryCmd {
+    /// Create an email-method recovery request under the waiting period. Prints the recovery
+    /// link token once (only its SHA-256 is stored); hand it to the user over a verified
+    /// channel. Recovery restores sign-in only, never vault keys.
+    Start {
+        #[arg(long)]
+        tenant: TenantId,
+        #[arg(long)]
+        user: UserId,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -113,6 +129,18 @@ enum MemberKindArg {
 
 #[derive(Subcommand, Debug)]
 enum UserCmd {
+    /// Set the user's email address (rev 11); `--verified` marks it verified, which the email
+    /// recovery method requires.
+    SetEmail {
+        #[arg(long)]
+        tenant: TenantId,
+        #[arg(long)]
+        user: UserId,
+        #[arg(long)]
+        email: String,
+        #[arg(long)]
+        verified: bool,
+    },
     /// Create an invited user.
     Create {
         #[arg(long)]
@@ -303,6 +331,18 @@ async fn serve(path: &Path) -> Result<(), String> {
                     auth
                 }
             };
+            // Rate limits (M1 contract §5, rev 11): Valkey counters, local buckets at limit/N
+            // ([cluster] node_count) when Valkey is unavailable; never unlimited.
+            let limits = cs_identity::ratelimit::RateLimits::from_policy(
+                &cfg.policy,
+                cfg.cluster.node_count,
+            );
+            let limiter = cs_identity::ratelimit::RateLimiter::new(
+                limits,
+                cfg.valkey.as_ref().map(|v| v.url.expose_secret().as_str()),
+            )
+            .map_err(|e| format!("cs: invalid valkey.url: {e}"))?;
+            let auth = auth.with_rate_limiter(limiter);
             routes = routes.merge(cs_identity::http::routes(Arc::new(auth)));
         }
         _ => tracing::warn!(
@@ -437,6 +477,21 @@ async fn admin_run(
         AdminCmd::Tenant(TenantCmd::Create { name }) => {
             let t = a.create_tenant(&name).await.map_err(err)?;
             println!("tenant_id={}", t.tenant_id);
+        }
+        AdminCmd::User(UserCmd::SetEmail {
+            tenant,
+            user,
+            email,
+            verified,
+        }) => {
+            a.set_email(tenant, user, &email, verified)
+                .await
+                .map_err(err)?;
+            println!("user_id={user} email_verified={verified}");
+        }
+        AdminCmd::Recovery(RecoveryCmd::Start { tenant, user }) => {
+            let link = a.start_recovery(tenant, user).await.map_err(err)?;
+            println!("recovery_link_token={}", link.expose_secret());
         }
         AdminCmd::User(UserCmd::Create {
             tenant,

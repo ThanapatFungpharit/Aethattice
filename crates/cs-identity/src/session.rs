@@ -37,6 +37,15 @@ pub struct SessionPolicy {
     pub absolute_secs: i64,
     /// Step-up window (contract §2.3, erratum C13: 5 min, 1–60 min).
     pub step_up_secs: i64,
+    /// (rev 11) Deployment default of `mfa_required`; a tenant may override it in
+    /// `tenants.policy`.
+    pub mfa_required: bool,
+    /// (rev 11) `dpop_first_party_required`: sign-in and refresh need a DPoP proof.
+    pub dpop_required: bool,
+    /// Recovery waiting period (erratum C13: 24 h, 1 h–14 d).
+    pub recovery_wait_secs: i64,
+    /// Idempotency record retention (M0 policy), for idempotent recovery completion.
+    pub idempotency_retention_hours: i64,
 }
 
 impl SessionPolicy {
@@ -46,6 +55,10 @@ impl SessionPolicy {
             idle_secs: p.get(PolicyKey::SessionIdleLifetimeSecs),
             absolute_secs: p.get(PolicyKey::SessionAbsoluteLifetimeSecs),
             step_up_secs: p.get(PolicyKey::StepUpWindowSecs),
+            mfa_required: p.get(PolicyKey::MfaRequired) == 1,
+            dpop_required: p.get(PolicyKey::DpopFirstPartyRequired) == 1,
+            recovery_wait_secs: p.get(PolicyKey::RecoveryWaitingPeriodSecs),
+            idempotency_retention_hours: p.get(PolicyKey::IdempotencyRetentionHours),
         }
     }
 }
@@ -114,6 +127,7 @@ fn claims(
     now: i64,
     policy: SessionPolicy,
     jkt: Option<&[u8]>,
+    scope: Option<String>,
 ) -> Result<AccessClaims, DbError> {
     Ok(AccessClaims {
         iss: String::new(),
@@ -130,6 +144,7 @@ fn claims(
         cnf: jkt.map(|j| crate::jws::Confirmation {
             jkt: URL_SAFE_NO_PAD.encode(j),
         }),
+        scp: scope,
     })
 }
 
@@ -163,19 +178,59 @@ pub async fn create_in_tx(
     tx: &mut DomainTx,
     tenant: TenantId,
     user: UserId,
-    amr: &[&str],
+    amr: &[&'static str],
     policy: SessionPolicy,
     jkt: Option<[u8; 32]>,
 ) -> Result<NewTokens, DbError> {
-    let jkt = jkt.as_ref().map(<[u8; 32]>::as_slice);
+    let opts = NewSession {
+        amr: amr.to_vec(),
+        jkt,
+        ..NewSession::default()
+    };
+    create_session(tx, tenant, user, opts, policy).await
+}
+
+/// Scope of an enrolment-only session (rev 11).
+pub const SCOPE_MFA_ENROLMENT: &str = "mfa_enrolment";
+
+/// How a new session was authenticated (contract §2.3, §2.4; rev 10/11).
+#[derive(Debug, Clone, Default)]
+pub struct NewSession {
+    /// Methods used, RFC 8176 values (`pwd`, `hwk`, `mfa`, ...).
+    pub amr: Vec<&'static str>,
+    /// rev 8: the DPoP key thumbprint when the sign-in carried a valid proof.
+    pub jkt: Option<[u8; 32]>,
+    /// rev 11: `Some("mfa_enrolment")` for an enrolment-only session.
+    pub scope: Option<&'static str>,
+    /// rev 11: `User-Agent` of the sign-in request (truncated to 200 characters here).
+    pub user_agent: Option<String>,
+}
+
+/// The first `max` characters of `s`.
+pub fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Create a session described by `opts` (see [`create_in_tx`]). Every sign-in method counts
+/// as strong authentication for step-up (`last_strong_auth_at = now()`).
+pub async fn create_session(
+    tx: &mut DomainTx,
+    tenant: TenantId,
+    user: UserId,
+    opts: NewSession,
+    policy: SessionPolicy,
+) -> Result<NewTokens, DbError> {
+    let jkt = opts.jkt.as_ref().map(<[u8; 32]>::as_slice);
     let session = SessionId::generate()?;
-    let amr: Vec<String> = amr.iter().map(|s| (*s).to_owned()).collect();
+    let amr: Vec<String> = opts.amr.iter().map(|s| (*s).to_owned()).collect();
+    let ua = opts.user_agent.as_deref().map(|u| truncate_chars(u, 200));
     let (now, max_age): (i64, i64) = sqlx::query_as(
         "INSERT INTO sessions (tenant_id, session_id, user_id, state, amr, auth_time, \
            last_strong_auth_at, idle_expires_at, absolute_expires_at, generation, version, \
-           device_key_jkt) \
+           device_key_jkt, last_seen_at, user_agent, scope) \
          VALUES ($1, $2, $3, 'active', $4, now(), now(), \
-           now() + make_interval(secs => $5::float8), now() + make_interval(secs => $6::float8), 1, 1, $7) \
+           now() + make_interval(secs => $5::float8), now() + make_interval(secs => $6::float8), 1, 1, $7, \
+           now(), $8, $9) \
          RETURNING extract(epoch FROM now())::bigint, \
            extract(epoch FROM (absolute_expires_at - now()))::bigint",
     )
@@ -186,12 +241,15 @@ pub async fn create_in_tx(
     .bind(policy.idle_secs.min(policy.absolute_secs) as f64)
     .bind(policy.absolute_secs as f64)
     .bind(jkt)
+    .bind(ua)
+    .bind(opts.scope)
     .fetch_one(tx.conn())
     .await?;
     let refresh = insert_refresh(tx, tenant, session, 1, jkt).await?;
+    let scope = opts.scope.map(str::to_owned);
     Ok(NewTokens {
         session_id: session,
-        claims: claims(tenant, user, session, 1, amr, now, now, policy, jkt)?,
+        claims: claims(tenant, user, session, 1, amr, now, now, policy, jkt, scope)?,
         refresh,
         refresh_max_age: max_age,
     })
@@ -205,7 +263,17 @@ type TokenRow = (
     bool,
     Option<Vec<u8>>,
 );
-type SessionRow = (String, Uuid, i64, Vec<String>, i64, bool, i64, i64);
+type SessionRow = (
+    String,
+    Uuid,
+    i64,
+    Vec<String>,
+    i64,
+    bool,
+    i64,
+    i64,
+    Option<String>,
+);
 
 /// Present a refresh token (`[R1]`). `key` is the request's `Idempotency-Key`; `proof` the
 /// DPoP proof that came with it (rev 8: a bound family needs a proof of its key).
@@ -236,14 +304,14 @@ pub async fn refresh_in_tx(
         "SELECT state, user_id, generation, amr, extract(epoch FROM auth_time)::bigint, \
            (now() < idle_expires_at AND now() < absolute_expires_at), \
            extract(epoch FROM now())::bigint, \
-           extract(epoch FROM (absolute_expires_at - now()))::bigint \
+           extract(epoch FROM (absolute_expires_at - now()))::bigint, scope \
          FROM sessions WHERE tenant_id = $1 AND session_id = $2 FOR UPDATE",
     )
     .bind(tenant.as_uuid())
     .bind(sid)
     .fetch_one(tx.conn())
     .await?;
-    let (s_state, uid, generation, amr, auth_time, live, now, max_age) = s;
+    let (s_state, uid, generation, amr, auth_time, live, now, max_age, scope) = s;
     let user = UserId::from_uuid(uid).map_err(|e| DbError::Invalid(e.to_string()))?;
     if s_state != "active" || state == "revoked" {
         return Ok(RefreshOutcome::Invalid);
@@ -271,6 +339,8 @@ pub async fn refresh_in_tx(
             return Ok(RefreshOutcome::KeyMismatch);
         }
         (None, PresentedProof::Invalid) => return Ok(RefreshOutcome::Invalid),
+        // rev 11: `dpop_first_party_required` = 1 refuses an unbound refresh family.
+        (None, _) if policy.dpop_required => return Ok(RefreshOutcome::Invalid),
         (None, _) => {}
     }
 
@@ -331,7 +401,7 @@ pub async fn refresh_in_tx(
     }
     sqlx::query(
         "UPDATE sessions SET idle_expires_at = LEAST(now() + make_interval(secs => $3::float8), \
-           absolute_expires_at), updated_at = now() \
+           absolute_expires_at), last_seen_at = now(), updated_at = now() \
          WHERE tenant_id = $1 AND session_id = $2",
     )
     .bind(tenant.as_uuid())
@@ -351,6 +421,7 @@ pub async fn refresh_in_tx(
             now,
             policy,
             key_jkt.as_deref(),
+            scope,
         )?,
         refresh: next,
         refresh_max_age: max_age,
