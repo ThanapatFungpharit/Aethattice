@@ -134,6 +134,10 @@ describe("routes", () => {
     expect(routeFromHash("#/register")).toBe("register");
     expect(routeFromHash(`#/register/${GRANT}`)).toBe("register");
     expect(routeFromHash("#/account")).toBe("account");
+    expect(routeFromHash("#/security")).toBe("security");
+    expect(routeFromHash("#/recover")).toBe("recover");
+    expect(routeFromHash("#/recover/rt1.x.y")).toBe("recover");
+    expect(routeFromHash("#/enrol")).toBe("enrol");
   });
 });
 
@@ -184,10 +188,11 @@ describe("sign-in page", () => {
     expect(s.paths.filter((p) => p.startsWith("/api"))).toEqual([]);
   });
 
-  it("explains that a second factor is needed when login/finish answers mfa_required", async () => {
+  it("shows the second-factor step when login/finish answers mfa_required (no passkey API: explains, offers cancel)", async () => {
     const s = setup(noCrossTabLock, { "/api/v2/auth/opaque/login/finish": () => json({ state: "mfa_required", auth_txn: "a", methods: ["webauthn"] }) });
     const { page } = await signInWith(s, { tenant: TENANT, login: "alice", password: "right" });
-    expect(q(page, ".failure").textContent).toContain("second factor");
+    expect(q(page, "h1").textContent).toBe("Confirm with a second factor");
+    expect(page.shadowRoot?.textContent).toContain("can be used in this browser");
     expect(s.session.state.authenticated).toBe(false);
   });
 });

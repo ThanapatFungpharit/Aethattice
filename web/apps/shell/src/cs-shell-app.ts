@@ -2,22 +2,27 @@
 // region and main region. M0 renders service readiness from GET /readyz through the error model.
 import "@cs/components";
 import { LocaleController } from "@cs/components";
-import { isStepUpRequired, t, type ApiClient, type IdentityDeps } from "@cs/sdk";
+import { MFA_ENROLMENT_SCOPE, isStepUpRequired, t, type ApiClient, type CredentialsLike, type IdentityDeps, type ReregisterOutcome } from "@cs/sdk";
 import { LitElement, css, html, nothing, type TemplateResult } from "lit";
 import "./auth-pages";
 import type { SignedInUser } from "./auth-pages";
 import "./dev-errors";
+import "./security-pages";
 import { checkReadiness, type Readiness } from "./readiness";
 
-type Route = "home" | "dev-errors" | "sign-in" | "register" | "account";
+type Route = "home" | "dev-errors" | "sign-in" | "register" | "account" | "security" | "recover" | "enrol";
 
 const REGISTER_PREFIX = "#/register/";
+const RECOVER_PREFIX = "#/recover/";
 
 export function routeFromHash(hash: string): Route {
   if (hash === "#/dev/errors") return "dev-errors";
   if (hash === "#/sign-in") return "sign-in";
   if (hash === "#/register" || hash.startsWith(REGISTER_PREFIX)) return "register";
   if (hash === "#/account") return "account";
+  if (hash === "#/security") return "security";
+  if (hash === "#/recover" || hash.startsWith(RECOVER_PREFIX)) return "recover";
+  if (hash === "#/enrol") return "enrol";
   return "home";
 }
 
@@ -33,6 +38,9 @@ export class CsShellApp extends LitElement {
     user: { state: true },
     stepUpOpen: { state: true },
     setupToken: { state: true },
+    recoveryToken: { state: true },
+    credentials: { attribute: false },
+    notice: { state: true },
   };
 
   static override styles = css`
@@ -158,6 +166,12 @@ export class CsShellApp extends LitElement {
   declare user: SignedInUser | undefined;
   declare stepUpOpen: boolean;
   declare setupToken: string;
+  /** Token of an emailed recovery link (rev 10), taken from `#/recover/<token>` and removed from the address bar. */
+  declare recoveryToken: string;
+  /** `navigator.credentials` when WebAuthn is available; passkey options are hidden without it. */
+  declare credentials: CredentialsLike | undefined;
+  /** Non-blocking notice in the notifications region (e.g. a failed transparent re-registration, rev 9). */
+  declare notice: string | undefined;
 
   private abort: AbortController | undefined;
   private unsubscribeSession: (() => void) | undefined;
@@ -178,6 +192,9 @@ export class CsShellApp extends LitElement {
     this.user = undefined;
     this.stepUpOpen = false;
     this.setupToken = "";
+    this.recoveryToken = "";
+    this.credentials = undefined;
+    this.notice = undefined;
     new LocaleController(this);
   }
 
@@ -190,7 +207,7 @@ export class CsShellApp extends LitElement {
       // Rev 8: a session that ended (revoked, reuse, refresh refused) goes back to sign-in.
       if (!s.authenticated && this.user !== undefined) {
         this.user = undefined;
-        if (this.route === "account") this.navigate("#/sign-in");
+        if (this.route === "account" || this.route === "security" || this.route === "enrol") this.navigate("#/sign-in");
       }
       this.requestUpdate();
     });
@@ -237,6 +254,11 @@ export class CsShellApp extends LitElement {
       this.setupToken = decodeURIComponent(hash.slice(REGISTER_PREFIX.length));
       history.replaceState(null, "", "#/register");
     }
+    if (hash.startsWith(RECOVER_PREFIX)) {
+      // The recovery link is a bearer secret as well.
+      this.recoveryToken = decodeURIComponent(hash.slice(RECOVER_PREFIX.length));
+      history.replaceState(null, "", "#/recover");
+    }
   }
 
   private navigate(hash: string): void {
@@ -247,8 +269,28 @@ export class CsShellApp extends LitElement {
   private onSignedIn(e: CustomEvent<SignedInUser>): void {
     this.user = e.detail;
     this.setupToken = "";
-    this.navigate("#/account");
+    this.recoveryToken = "";
+    // Rev 11: an enrolment-only session (scope read for routing only, never trusted) goes to forced enrolment.
+    this.navigate(this.identity?.session.scope === MFA_ENROLMENT_SCOPE ? "#/enrol" : "#/account");
   }
+
+  /**
+   * Identity deps for the sign-in flows: the authenticated client for the rev 9 transparent re-registration, and a
+   * listener that shows a non-blocking notice when it fails (it is retried at the next sign-in).
+   */
+  get signInDeps(): IdentityDeps | undefined {
+    const id = this.identity;
+    if (!id) return undefined;
+    return {
+      ...id,
+      ...(this.authedClient !== undefined && { authedClient: this.authedClient }),
+      onReregister: (o: ReregisterOutcome) => {
+        this.notice = o.ok ? undefined : t("auth.reregister_failed");
+      },
+    };
+  }
+
+  private readonly stepUpRunner = <T,>(op: () => Promise<T>): Promise<T> => this.runWithStepUp(op);
 
   private onSignedOut(): void {
     this.user = undefined;
@@ -286,7 +328,8 @@ export class CsShellApp extends LitElement {
             </li>
             ${this.identity
               ? this.signedIn
-                ? html`<li><a href="#/account">${t("auth.account_link")}</a></li>`
+                ? html`<li><a href="#/account">${t("auth.account_link")}</a></li>
+                    <li><a href="#/security">${t("security.link")}</a></li>`
                 : html`<li><a href="#/sign-in">${t("auth.signin_link")}</a></li>`
               : nothing}
             ${this.showDevLink ? html`<li><a href="#/dev/errors">${t("shell.dev_link")}</a></li>` : nothing}
@@ -296,7 +339,14 @@ export class CsShellApp extends LitElement {
       ${this.renderTabNotice()}
       <section class="notifications" aria-labelledby="notifications-heading">
         <h2 id="notifications-heading">${t("shell.notifications")}</h2>
-        <div role="log" aria-live="polite">${t("shell.notifications_empty")}</div>
+        <div role="log" aria-live="polite">
+          ${this.notice
+            ? html`<p class="notice">${this.notice}</p>
+                <cs-button variant="ghost" class="dismiss-notice" @click=${() => {
+                  this.notice = undefined;
+                }}>${t("shell.dismiss")}</cs-button>`
+            : t("shell.notifications_empty")}
+        </div>
       </section>
       <main id="main" tabindex="-1">${this.renderRoute()}</main>
       <cs-dialog heading=${t("shell.launcher_heading")} ?open=${this.launcherOpen} @cs-close=${this.onLauncherClose}>
@@ -308,6 +358,7 @@ export class CsShellApp extends LitElement {
             .user=${this.user}
             .identity=${this.identity}
             .authedClient=${this.authedClient}
+            .credentials=${this.credentials}
             @cs-step-up-done=${() => {
               this.settleStepUp(true);
             }}
@@ -339,7 +390,23 @@ export class CsShellApp extends LitElement {
       case "dev-errors":
         return html`<cs-dev-errors></cs-dev-errors>`;
       case "sign-in":
-        if (id) return html`<cs-sign-in-page .identity=${id} @cs-signed-in=${this.onSignedIn}></cs-sign-in-page>`;
+        if (id) return this.renderSignIn();
+        break;
+      case "recover":
+        if (id)
+          return html`<cs-recovery-page .identity=${this.signInDeps} .token=${this.recoveryToken} @cs-signed-in=${this.onSignedIn}></cs-recovery-page>`;
+        break;
+      case "security":
+        if (id && this.signedIn)
+          return html`<cs-security-page .user=${this.user} .identity=${id} .authedClient=${this.authedClient} .credentials=${this.credentials}
+            .runWithStepUp=${this.stepUpRunner} @cs-signed-out=${this.onSignedOut}></cs-security-page>`;
+        if (id) return this.renderSignIn();
+        break;
+      case "enrol":
+        if (id && this.signedIn)
+          return html`<cs-enrolment-page .session=${id.session} .authedClient=${this.authedClient} .credentials=${this.credentials}
+            .runWithStepUp=${this.stepUpRunner} @cs-signed-out=${this.onSignedOut}></cs-enrolment-page>`;
+        if (id) return this.renderSignIn();
         break;
       case "register":
         if (id)
@@ -349,12 +416,16 @@ export class CsShellApp extends LitElement {
         if (id && this.signedIn)
           return html`<cs-account-page .user=${this.user} .session=${id.session} .authedClient=${this.authedClient}
             @cs-signed-out=${this.onSignedOut}></cs-account-page>`;
-        if (id) return html`<cs-sign-in-page .identity=${id} @cs-signed-in=${this.onSignedIn}></cs-sign-in-page>`;
+        if (id) return this.renderSignIn();
         break;
       case "home":
         break;
     }
     return this.renderHome();
+  }
+
+  private renderSignIn(): TemplateResult {
+    return html`<cs-sign-in-page .identity=${this.signInDeps} .credentials=${this.credentials} @cs-signed-in=${this.onSignedIn}></cs-sign-in-page>`;
   }
 
   private renderHome(): TemplateResult {
