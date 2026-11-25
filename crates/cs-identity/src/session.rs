@@ -17,6 +17,8 @@
 
 use crate::jws::AccessClaims;
 use crate::token::{self, IssuedToken, TokenHash};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use cs_common::config::{Policy, PolicyKey};
 use cs_common::id::{SessionId, TenantId, UserId};
 use cs_db::outbox::{NewEvent, Outbox};
@@ -33,6 +35,8 @@ pub struct SessionPolicy {
     pub access_ttl_secs: i64,
     pub idle_secs: i64,
     pub absolute_secs: i64,
+    /// Step-up window (contract §2.3, erratum C13: 5 min, 1–60 min).
+    pub step_up_secs: i64,
 }
 
 impl SessionPolicy {
@@ -41,6 +45,7 @@ impl SessionPolicy {
             access_ttl_secs: p.get(PolicyKey::AccessTokenLifetimeSecs),
             idle_secs: p.get(PolicyKey::SessionIdleLifetimeSecs),
             absolute_secs: p.get(PolicyKey::SessionAbsoluteLifetimeSecs),
+            step_up_secs: p.get(PolicyKey::StepUpWindowSecs),
         }
     }
 }
@@ -70,6 +75,19 @@ pub enum RefreshOutcome {
     Reuse,
     /// Unknown, revoked or expired token, or an inactive session.
     Invalid,
+    /// A DPoP-bound refresh token presented without a valid proof of its key (rev 8): treated
+    /// like theft; the session has been revoked.
+    KeyMismatch,
+}
+
+/// The DPoP proof that came with a refresh request (already checked for form, signature,
+/// claims and replay; see [`crate::dpop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentedProof {
+    None,
+    Valid([u8; 32]),
+    /// A proof was sent but failed verification or was replayed.
+    Invalid,
 }
 
 #[derive(Serialize)]
@@ -95,6 +113,7 @@ fn claims(
     auth_time: i64,
     now: i64,
     policy: SessionPolicy,
+    jkt: Option<&[u8]>,
 ) -> Result<AccessClaims, DbError> {
     Ok(AccessClaims {
         iss: String::new(),
@@ -108,7 +127,9 @@ fn claims(
         iat: now,
         exp: now + policy.access_ttl_secs,
         jti: jti()?,
-        cnf: None,
+        cnf: jkt.map(|j| crate::jws::Confirmation {
+            jkt: URL_SAFE_NO_PAD.encode(j),
+        }),
     })
 }
 
@@ -117,16 +138,18 @@ async fn insert_refresh(
     tenant: TenantId,
     session: SessionId,
     family_generation: i64,
+    jkt: Option<&[u8]>,
 ) -> Result<IssuedToken, DbError> {
     let t = token::generate(tenant)?;
     sqlx::query(
-        "INSERT INTO refresh_tokens (tenant_id, token_hash, session_id, family_generation, state) \
-         VALUES ($1, $2, $3, $4, 'active')",
+        "INSERT INTO refresh_tokens (tenant_id, token_hash, session_id, family_generation, state, key_jkt) \
+         VALUES ($1, $2, $3, $4, 'active', $5)",
     )
     .bind(tenant.as_uuid())
     .bind(t.hash.as_bytes().as_slice())
     .bind(session.as_uuid())
     .bind(family_generation)
+    .bind(jkt)
     .execute(tx.conn())
     .await?;
     Ok(t)
@@ -134,20 +157,25 @@ async fn insert_refresh(
 
 /// Create a session for an authenticated user, with its first refresh token. `amr` lists the
 /// methods used; a password login counts as strong authentication for step-up (§2.3).
+/// `jkt` (rev 8): the DPoP key thumbprint when `login/finish` carried a valid proof; the
+/// session, its access tokens (`cnf.jkt`) and its whole refresh family are bound to it.
 pub async fn create_in_tx(
     tx: &mut DomainTx,
     tenant: TenantId,
     user: UserId,
     amr: &[&str],
     policy: SessionPolicy,
+    jkt: Option<[u8; 32]>,
 ) -> Result<NewTokens, DbError> {
+    let jkt = jkt.as_ref().map(<[u8; 32]>::as_slice);
     let session = SessionId::generate()?;
     let amr: Vec<String> = amr.iter().map(|s| (*s).to_owned()).collect();
     let (now, max_age): (i64, i64) = sqlx::query_as(
         "INSERT INTO sessions (tenant_id, session_id, user_id, state, amr, auth_time, \
-           last_strong_auth_at, idle_expires_at, absolute_expires_at, generation, version) \
+           last_strong_auth_at, idle_expires_at, absolute_expires_at, generation, version, \
+           device_key_jkt) \
          VALUES ($1, $2, $3, 'active', $4, now(), now(), \
-           now() + make_interval(secs => $5::float8), now() + make_interval(secs => $6::float8), 1, 1) \
+           now() + make_interval(secs => $5::float8), now() + make_interval(secs => $6::float8), 1, 1, $7) \
          RETURNING extract(epoch FROM now())::bigint, \
            extract(epoch FROM (absolute_expires_at - now()))::bigint",
     )
@@ -157,31 +185,42 @@ pub async fn create_in_tx(
     .bind(&amr)
     .bind(policy.idle_secs.min(policy.absolute_secs) as f64)
     .bind(policy.absolute_secs as f64)
+    .bind(jkt)
     .fetch_one(tx.conn())
     .await?;
-    let refresh = insert_refresh(tx, tenant, session, 1).await?;
+    let refresh = insert_refresh(tx, tenant, session, 1, jkt).await?;
     Ok(NewTokens {
         session_id: session,
-        claims: claims(tenant, user, session, 1, amr, now, now, policy)?,
+        claims: claims(tenant, user, session, 1, amr, now, now, policy, jkt)?,
         refresh,
         refresh_max_age: max_age,
     })
 }
 
-type TokenRow = (String, Uuid, Option<Vec<u8>>, Option<String>, bool);
+type TokenRow = (
+    String,
+    Uuid,
+    Option<Vec<u8>>,
+    Option<String>,
+    bool,
+    Option<Vec<u8>>,
+);
 type SessionRow = (String, Uuid, i64, Vec<String>, i64, bool, i64, i64);
 
-/// Present a refresh token (`[R1]`). `key` is the request's `Idempotency-Key`.
+/// Present a refresh token (`[R1]`). `key` is the request's `Idempotency-Key`; `proof` the
+/// DPoP proof that came with it (rev 8: a bound family needs a proof of its key).
 pub async fn refresh_in_tx(
     tx: &mut DomainTx,
     tenant: TenantId,
     hash: TokenHash,
     key: &str,
     policy: SessionPolicy,
+    proof: PresentedProof,
 ) -> Result<RefreshOutcome, DbError> {
     let row: Option<TokenRow> = sqlx::query_as(
         "SELECT state, session_id, successor_hash, rotation_idempotency_key, \
-           (rotated_at IS NOT NULL AND now() - rotated_at <= make_interval(secs => $3::float8)) \
+           (rotated_at IS NOT NULL AND now() - rotated_at <= make_interval(secs => $3::float8)), \
+           key_jkt \
          FROM refresh_tokens WHERE tenant_id = $1 AND token_hash = $2 FOR UPDATE",
     )
     .bind(tenant.as_uuid())
@@ -189,7 +228,7 @@ pub async fn refresh_in_tx(
     .bind(LOST_RESPONSE_WINDOW_SECS as f64)
     .fetch_optional(tx.conn())
     .await?;
-    let Some((state, sid, successor, rot_key, in_window)) = row else {
+    let Some((state, sid, successor, rot_key, in_window, key_jkt)) = row else {
         return Ok(RefreshOutcome::Invalid);
     };
     let session = SessionId::from_uuid(sid).map_err(|e| DbError::Invalid(e.to_string()))?;
@@ -220,6 +259,19 @@ pub async fn refresh_in_tx(
         .await?;
         revoke_family(tx, tenant, sid).await?;
         return Ok(RefreshOutcome::Invalid);
+    }
+
+    // DPoP binding (rev 8): a bound token without a proof of the same key is treated like
+    // theft (session revoked, as for reuse). An unbound session stays unbound; a broken proof
+    // on it is refused without revocation.
+    match (&key_jkt, proof) {
+        (Some(k), PresentedProof::Valid(j)) if k.as_slice() == j.as_slice() => {}
+        (Some(_), _) => {
+            revoke_session(tx, tenant, session, "dpop_key_mismatch").await?;
+            return Ok(RefreshOutcome::KeyMismatch);
+        }
+        (None, PresentedProof::Invalid) => return Ok(RefreshOutcome::Invalid),
+        (None, _) => {}
     }
 
     let lost_response = state == "rotated"
@@ -254,7 +306,7 @@ pub async fn refresh_in_tx(
         .execute(tx.conn())
         .await?;
     }
-    let next = insert_refresh(tx, tenant, session, generation).await?;
+    let next = insert_refresh(tx, tenant, session, generation, key_jkt.as_deref()).await?;
     if lost_response {
         sqlx::query(
             "UPDATE refresh_tokens SET successor_hash = $3 WHERE tenant_id = $1 AND token_hash = $2",
@@ -290,7 +342,15 @@ pub async fn refresh_in_tx(
     Ok(RefreshOutcome::Issued(Box::new(NewTokens {
         session_id: session,
         claims: claims(
-            tenant, user, session, generation, amr, auth_time, now, policy,
+            tenant,
+            user,
+            session,
+            generation,
+            amr,
+            auth_time,
+            now,
+            policy,
+            key_jkt.as_deref(),
         )?,
         refresh: next,
         refresh_max_age: max_age,

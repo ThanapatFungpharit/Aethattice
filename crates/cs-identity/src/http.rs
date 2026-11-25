@@ -1,7 +1,8 @@
 //! HTTP routes of the identity domain (contract §2.1, §2.4, §3).
 //!
 //! - `POST /api/v2/auth/opaque/login/start`, `…/login/finish`
-//! - `POST /api/v2/auth/opaque/register/start`, `…/register/finish` (204)
+//! - `POST /api/v2/auth/opaque/register/start`, `…/register/finish` (204): with a setup-link
+//!   `grant`, or (rev 9) with the session's access token and `purpose` (step-up required)
 //! - `POST /api/v2/auth/token/refresh` (cookie `__Secure-cs_rt`, `Idempotency-Key` required)
 //! - `POST /api/v2/auth/logout` (bearer access token; clears the cookie)
 //! - `GET /api/v2/auth/jwks`
@@ -9,12 +10,17 @@
 //!   token; password step-up on the existing session)
 //! - (rev 7) `GET /api/v2/me` (bearer access token)
 //!
+//! DPoP (rev 8): `login/finish` and `token/refresh` take an optional `DPoP` proof; requests with
+//! an access token use `Authorization: DPoP <token>` plus a proof when the token is `cnf`-bound,
+//! `Bearer` otherwise ([`AuthService::authorize`]).
+//!
 //! OPAQUE messages are base64url without padding (rev 5). Token responses carry
 //! `Cache-Control: no-store`. Nothing here logs a token, txn id, grant or OPAQUE message.
 
-use crate::auth::{AuthService, Authenticated, source_of};
-use axum::extract::{ConnectInfo, Extension, FromRequestParts};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header, request::Parts};
+use crate::auth::{AuthService, Authenticated, RequestCtx, source_of};
+use crate::jws::AccessClaims;
+use axum::extract::{ConnectInfo, Extension, FromRequestParts, OriginalUri};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -144,6 +150,40 @@ struct AuthResult {
     access_token: String,
     expires_in: i64,
     session_id: String,
+    /// rev 9: present (and `true`) only when the client should re-register (`ksf_upgrade`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    reregister: bool,
+}
+
+fn unauthenticated(detail: &str) -> ApiError {
+    ApiError::new(Error::new(ErrorCode::Unauthenticated).with_detail(detail.to_owned()))
+}
+
+/// The single `DPoP` header, if any (two headers are refused, RFC 9449 §4.3).
+fn dpop_header(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
+    let mut it = headers.get_all("dpop").iter();
+    let first = it.next();
+    if it.next().is_some() {
+        return Err(unauthenticated("Invalid DPoP proof."));
+    }
+    first
+        .map(|v| {
+            v.to_str()
+                .map_err(|_| unauthenticated("Invalid DPoP proof."))
+        })
+        .transpose()
+}
+
+fn ctx<'a>(
+    method: &'a Method,
+    uri: &'a axum::http::Uri,
+    headers: &'a HeaderMap,
+) -> Result<RequestCtx<'a>, ApiError> {
+    Ok(RequestCtx {
+        method: method.as_str(),
+        path: uri.path(),
+        dpop: dpop_header(headers)?,
+    })
 }
 
 /// `Set-Cookie` for a refresh token (contract §2.4).
@@ -169,6 +209,7 @@ fn authenticated(a: Authenticated) -> Result<Response, ApiError> {
         access_token: a.access_token.expose_secret().clone(),
         expires_in: a.expires_in,
         session_id: a.session_id.as_uuid().to_string(),
+        reregister: a.reregister,
     })
     .into_response();
     r.headers_mut().insert(
@@ -181,19 +222,41 @@ fn authenticated(a: Authenticated) -> Result<Response, ApiError> {
 async fn login_finish(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     JsonBody(req): JsonBody<LoginFinishReq>,
 ) -> Result<Response, ApiError> {
     let fin = b64("credential_finalization", &req.credential_finalization)?;
-    let a = auth.login_finish(&req.login_txn, &fin, &source).await?;
+    let c = ctx(&method, &uri, &headers)?;
+    let a = auth.login_finish(&req.login_txn, &fin, &source, &c).await?;
     authenticated(a)
 }
 
+/// Either `{grant, login, registration_request}` (setup link) or, with the session's access
+/// token, `{purpose, registration_request}` (rev 9; a `login` is refused).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegisterStartReq {
-    grant: String,
-    login: String,
+    #[serde(default)]
+    grant: Option<String>,
+    #[serde(default)]
+    login: Option<String>,
+    #[serde(default)]
+    purpose: Option<String>,
     registration_request: String,
+}
+
+fn field_invalid(pointer: &str, detail: &str) -> ApiError {
+    ApiError::new(
+        Error::new(ErrorCode::InvalidRequest)
+            .with_detail(detail.to_owned())
+            .with_field_error(cs_common::error::FieldError {
+                pointer: pointer.to_owned(),
+                code: ErrorCode::InvalidRequest.as_str().to_owned(),
+                detail: detail.to_owned(),
+            }),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -206,12 +269,38 @@ struct RegisterStartResp {
 async fn register_start(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     JsonBody(req): JsonBody<RegisterStartReq>,
 ) -> Result<Response, ApiError> {
     let rr = b64("registration_request", &req.registration_request)?;
-    let r = auth
-        .register_start(&req.grant, &req.login, &rr, &source)
-        .await?;
+    let r = match (req.purpose, req.grant, req.login) {
+        (Some(purpose), None, None) => {
+            let claims = claims_of(&auth, &method, &uri, &headers).await?;
+            auth.register_start_session(&claims, &purpose, &rr, &source)
+                .await?
+        }
+        (Some(_), _, Some(_)) => {
+            return Err(field_invalid(
+                "/login",
+                "login is taken from the session; it must not be sent with purpose",
+            ));
+        }
+        (Some(_), Some(_), None) => {
+            return Err(field_invalid(
+                "/grant",
+                "grant and purpose are mutually exclusive",
+            ));
+        }
+        (None, Some(grant), Some(login)) => {
+            auth.register_start(&grant, &login, &rr, &source).await?
+        }
+        (None, None, _) => {
+            return Err(field_invalid("/grant", "grant or purpose is required"));
+        }
+        (None, Some(_), None) => return Err(field_invalid("/login", "login is required")),
+    };
     Ok(no_store(
         Json(RegisterStartResp {
             registration_txn: r.registration_txn.expose_secret().clone(),
@@ -229,14 +318,25 @@ struct RegisterFinishReq {
     registration_upload: String,
 }
 
+/// With an `Authorization` header the txn must be a session re-registration (rev 9);
+/// without one, a setup-link registration.
 async fn register_finish(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
     JsonBody(req): JsonBody<RegisterFinishReq>,
 ) -> Result<StatusCode, ApiError> {
     let up = b64("registration_upload", &req.registration_upload)?;
-    auth.register_finish(&req.registration_txn, &up, &source)
-        .await?;
+    if headers.contains_key(header::AUTHORIZATION) {
+        let claims = claims_of(&auth, &method, &uri, &headers).await?;
+        auth.register_finish_session(&claims, &req.registration_txn, &up, &source)
+            .await?;
+    } else {
+        auth.register_finish(&req.registration_txn, &up, &source)
+            .await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -262,6 +362,8 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 async fn refresh(
     Extension(auth): Extension<Arc<AuthService>>,
     IdempotencyKeyHeader(key): IdempotencyKeyHeader,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let key = key.ok_or_else(|| {
@@ -273,24 +375,18 @@ async fn refresh(
     let token = cookie_value(&headers, REFRESH_COOKIE).ok_or_else(|| {
         ApiError::new(Error::new(ErrorCode::Unauthenticated).with_detail("Authentication failed."))
     })?;
-    let a = auth.refresh(&token, key.as_str()).await?;
+    let c = ctx(&method, &uri, &headers)?;
+    let a = auth.refresh(&token, key.as_str(), &c).await?;
     authenticated(a)
-}
-
-fn bearer(headers: &HeaderMap) -> Option<&str> {
-    let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let (scheme, tok) = v.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then_some(tok.trim())
 }
 
 async fn logout(
     Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let tok = bearer(&headers).ok_or_else(|| {
-        ApiError::new(Error::new(ErrorCode::Unauthenticated).with_detail("Access token required."))
-    })?;
-    let claims = auth.verify_bearer(tok).await?;
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
     auth.logout(&claims).await?;
     let mut r = StatusCode::NO_CONTENT.into_response();
     r.headers_mut().insert(
@@ -305,14 +401,22 @@ async fn jwks(Extension(auth): Extension<Arc<AuthService>>) -> Result<Response, 
     Ok(Json(doc).into_response())
 }
 
+/// Claims of the request's access token (`DPoP` or `Bearer`, rev 8).
 async fn claims_of(
     auth: &AuthService,
+    method: &Method,
+    uri: &axum::http::Uri,
     headers: &HeaderMap,
-) -> Result<crate::jws::AccessClaims, ApiError> {
-    let tok = bearer(headers).ok_or_else(|| {
-        ApiError::new(Error::new(ErrorCode::Unauthenticated).with_detail("Access token required."))
-    })?;
-    Ok(auth.verify_bearer(tok).await?)
+) -> Result<AccessClaims, ApiError> {
+    let authorization = match headers.get(header::AUTHORIZATION) {
+        Some(v) => Some(
+            v.to_str()
+                .map_err(|_| unauthenticated("Access token required."))?,
+        ),
+        None => None,
+    };
+    let c = ctx(method, uri, headers)?;
+    Ok(auth.authorize(authorization, &c).await?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -331,10 +435,12 @@ struct ReauthStartResp {
 async fn reauth_start(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     JsonBody(req): JsonBody<ReauthStartReq>,
 ) -> Result<Response, ApiError> {
-    let claims = claims_of(&auth, &headers).await?;
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
     let cr = b64("credential_request", &req.credential_request)?;
     let r = auth.reauth_start(&claims, &cr, &source).await?;
     Ok(no_store(
@@ -357,10 +463,12 @@ struct ReauthFinishReq {
 async fn reauth_finish(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     JsonBody(req): JsonBody<ReauthFinishReq>,
 ) -> Result<StatusCode, ApiError> {
-    let claims = claims_of(&auth, &headers).await?;
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
     let fin = b64("credential_finalization", &req.credential_finalization)?;
     auth.reauth_finish(&claims, &req.reauth_txn, &fin, &source)
         .await?;
@@ -369,9 +477,11 @@ async fn reauth_finish(
 
 async fn me(
     Extension(auth): Extension<Arc<AuthService>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let claims = claims_of(&auth, &headers).await?;
+    let claims = claims_of(&auth, &method, &uri, &headers).await?;
     let m = auth.me(&claims).await?;
     Ok(no_store(Json(m).into_response()))
 }
