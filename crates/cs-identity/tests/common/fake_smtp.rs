@@ -51,7 +51,7 @@ impl FakeSmtp {
                                 data.push_str(&l);
                                 data.push('\n');
                             }
-                            m.lock().unwrap().push(data);
+                            m.lock().unwrap().push(decode_qp(&data));
                             b"250 queued\r\n"
                         } else if cmd.starts_with("QUIT") {
                             let _ = w.write_all(b"221 bye\r\n").await;
@@ -105,4 +105,28 @@ pub fn link_token(mail: &str) -> Option<String> {
             .take_while(|c| !c.is_whitespace())
             .collect(),
     )
+}
+
+/// Undo quoted-printable (RFC 2045 §6.7) when the message declares it: soft line breaks and
+/// `=XX` escapes. Other messages are returned unchanged.
+fn decode_qp(data: &str) -> String {
+    if !data.contains("Content-Transfer-Encoding: quoted-printable") {
+        return data.to_owned();
+    }
+    let joined = data.replace("=\n", "");
+    let b = joined.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'=' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&joined[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

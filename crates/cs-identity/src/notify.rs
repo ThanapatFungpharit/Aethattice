@@ -363,6 +363,7 @@ async fn deliver(shared: &Shared, job: Job) -> u32 {
             .to(to.clone())
             .subject(SUBJECT)
             .header(ContentType::TEXT_PLAIN)
+            // lettre picks the transfer encoding (quoted-printable for the long link line).
             .body(body.clone());
         let msg = match msg {
             Ok(m) => m,
@@ -671,7 +672,9 @@ mod tests {
             .with_max_level(tracing::Level::TRACE)
             .json()
             .finish();
-        let _g = tracing::subscriber::set_default(sub);
+        // Global (the only global subscriber of this test binary): a thread-local default races
+        // with concurrent tests over the callsite interest cache.
+        tracing::subscriber::set_global_default(sub).unwrap();
         deliver(&shared(Fake::new(u32::MAX, false)), job()).await;
         deliver(&shared(Fake::new(u32::MAX, true)), job()).await;
         deliver(&shared(Fake::new(1, false)), job()).await;
