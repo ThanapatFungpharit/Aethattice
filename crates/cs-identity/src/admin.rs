@@ -583,6 +583,7 @@ pub struct IdentityAdmin {
     pool: DomainPool,
     limits: GroupLimits,
     setup_link_lifetime_secs: i64,
+    recovery_wait_secs: i64,
 }
 
 impl IdentityAdmin {
@@ -611,6 +612,7 @@ impl IdentityAdmin {
             pool,
             limits: GroupLimits::from_policy(policy),
             setup_link_lifetime_secs: policy.get(PolicyKey::SetupLinkLifetimeSecs),
+            recovery_wait_secs: policy.get(PolicyKey::RecoveryWaitingPeriodSecs),
         }
     }
 
@@ -1129,6 +1131,87 @@ impl IdentityAdmin {
             .await?;
         Ok(r)
     }
+
+    /// `cs admin recovery start` (contract §4, rev 10): an administrator-assisted recovery is an
+    /// email-method request under the same waiting period (policy
+    /// `recovery_waiting_period_secs`). Returns the `rt1` link token, shown once; only its
+    /// SHA-256 is stored. Outbox `identity.recovery.requested` (method `admin`).
+    pub async fn start_recovery(&self, tenant: TenantId, user: UserId) -> AdminResult<Secret<String>> {
+        crate::recovery::create_email_request(
+            &self.pool,
+            tenant,
+            user,
+            self.recovery_wait_secs,
+            None,
+            "admin",
+        )
+        .await
+    }
+
+    /// `cs admin user set-email` (rev 11): set the user's email address; `verified` marks it
+    /// verified now (the email recovery method uses verified addresses only). Outbox
+    /// `identity.user.updated`.
+    pub async fn set_email(
+        &self,
+        tenant: TenantId,
+        user: UserId,
+        email: &str,
+        verified: bool,
+    ) -> AdminResult<()> {
+        let email = email.trim().to_owned();
+        if email.len() < 3 || email.len() > 254 || !email.contains('@') {
+            return Err(Error::new(ErrorCode::InvalidRequest)
+                .with_detail("email must be an address of 3-254 bytes")
+                .into());
+        }
+        self.pool
+            .transaction(move |tx| {
+                let email = email.clone();
+                Box::pin(async move {
+                    require_active_tenant(tx, tenant).await?;
+                    let status: Option<String> = sqlx::query_scalar(
+                        "UPDATE users SET email = $3, \
+                           email_verified_at = CASE WHEN $4 THEN now() END, \
+                           version = version + 1, updated_at = now() \
+                         WHERE tenant_id = $1 AND user_id = $2 RETURNING status",
+                    )
+                    .bind(tenant.as_uuid())
+                    .bind(user.as_uuid())
+                    .bind(&email)
+                    .bind(verified)
+                    .fetch_optional(tx.conn())
+                    .await?;
+                    let status = status.ok_or_else(|| app(ErrorCode::NotFound, "user not found"))?;
+                    Outbox::append(
+                        tx,
+                        NewEvent {
+                            tenant_id: Some(tenant),
+                            event_type: "identity.user.updated",
+                            event_version: 1,
+                            partition_key: user.into_uuid(),
+                            payload: &EmailUpdated {
+                                tenant_id: tenant,
+                                user_id: user,
+                                status,
+                                email_verified: verified,
+                            },
+                        },
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct EmailUpdated {
+    tenant_id: TenantId,
+    user_id: UserId,
+    status: String,
+    email_verified: bool,
 }
 
 /// Bump membership_version by compare-and-set and write the membership event.

@@ -631,7 +631,7 @@ impl AuthService {
     }
 
     /// Create an email-method request with the waiting period and return its link token
-    /// (`recovery/start` method `email`, and `cs admin recovery start`).
+    /// (`recovery/start` method `email`).
     pub async fn create_email_request(
         &self,
         tenant: TenantId,
@@ -639,43 +639,15 @@ impl AuthService {
         requester_user_agent: Option<String>,
         actor: &'static str,
     ) -> AuthResult<Secret<String>> {
-        let link = token::generate(tenant).map_err(Error::internal)?;
-        let (lhash, request_id, wait) = (
-            link.hash,
-            cs_common::id::new_random128().map_err(Error::internal)?,
+        create_email_request(
+            &self.pool,
+            tenant,
+            user,
             self.policy.recovery_wait_secs,
-        );
-        self.pool
-            .transaction(move |tx| {
-                let ua = requester_user_agent.clone();
-                Box::pin(async move {
-                    sqlx::query(
-                        "INSERT INTO recovery_requests (tenant_id, request_id, user_id, method, \
-                           state, not_before, link_hash, requester_user_agent, version) \
-                         VALUES ($1, $2, $3, 'email', 'pending', \
-                           now() + make_interval(secs => $4::float8), $5, $6, 1)",
-                    )
-                    .bind(tenant.as_uuid())
-                    .bind(request_id)
-                    .bind(user.as_uuid())
-                    .bind(wait as f64)
-                    .bind(lhash.as_bytes().as_slice())
-                    .bind(ua)
-                    .execute(tx.conn())
-                    .await?;
-                    recovery_event(
-                        tx,
-                        tenant,
-                        user,
-                        request_id,
-                        "identity.recovery.requested",
-                        if actor == "admin" { "admin" } else { "email" },
-                    )
-                    .await
-                })
-            })
-            .await?;
-        Ok(link.token)
+            requester_user_agent,
+            actor,
+        )
+        .await
     }
 
     /// `POST /api/v2/auth/recovery/status` (rev 10 addendum).
@@ -969,6 +941,75 @@ impl AuthService {
             .await?;
         Ok(())
     }
+}
+
+/// Create an email-method recovery request (`not_before = now + wait_secs`) for an active
+/// user and return its link token; `actor` is `email` (self-service) or `admin`
+/// (`cs admin recovery start`, rev 10). Outbox `identity.recovery.requested`.
+pub async fn create_email_request(
+    pool: &cs_db::DomainPool,
+    tenant: TenantId,
+    user: UserId,
+    wait_secs: i64,
+    requester_user_agent: Option<String>,
+    actor: &'static str,
+) -> AuthResult<Secret<String>> {
+    let link = token::generate(tenant).map_err(Error::internal)?;
+    let lhash = link.hash;
+    let request_id = cs_common::id::new_random128().map_err(Error::internal)?;
+    let ok = pool
+        .transaction(move |tx| {
+            let ua = requester_user_agent.clone();
+            Box::pin(async move {
+                let active: Option<bool> = sqlx::query_scalar(
+                    "SELECT u.status = 'active' AND t.state = 'active' FROM users u \
+                     JOIN tenants t ON t.tenant_id = u.tenant_id \
+                     WHERE u.tenant_id = $1 AND u.user_id = $2 FOR SHARE OF u",
+                )
+                .bind(tenant.as_uuid())
+                .bind(user.as_uuid())
+                .fetch_optional(tx.conn())
+                .await?;
+                if active != Some(true) {
+                    return Ok(false);
+                }
+                sqlx::query(
+                    "INSERT INTO recovery_requests (tenant_id, request_id, user_id, method, \
+                       state, not_before, link_hash, requester_user_agent, version) \
+                     VALUES ($1, $2, $3, 'email', 'pending', \
+                       now() + make_interval(secs => $4::float8), $5, $6, 1)",
+                )
+                .bind(tenant.as_uuid())
+                .bind(request_id)
+                .bind(user.as_uuid())
+                .bind(wait_secs as f64)
+                .bind(lhash.as_bytes().as_slice())
+                .bind(ua)
+                .execute(tx.conn())
+                .await?;
+                recovery_event(
+                    tx,
+                    tenant,
+                    user,
+                    request_id,
+                    "identity.recovery.requested",
+                    if actor == "admin" { "admin" } else { "email" },
+                )
+                .await?;
+                Ok(true)
+            })
+        })
+        .await?;
+    if !ok {
+        return Err(not_found_user());
+    }
+    Ok(link.token)
+}
+
+fn not_found_user() -> crate::admin::AdminError {
+    Error::new(ErrorCode::NotFound)
+        .with_detail("No such active user.")
+        .into()
 }
 
 /// `pending → granted` (or a new grant hash for a granted request, keeping its expiry), under
