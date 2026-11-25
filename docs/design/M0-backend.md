@@ -138,13 +138,30 @@ Design choices:
 
 ### Test harness (`testing` feature)
 
-- Every database the harness creates is registered before it is created. `cleanup()` drops each one with:
-  - no statement timeout, because a DROP on YugabyteDB can take minutes;
-  - up to 8 attempts, each followed by a check against `pg_database`.
-- If a database cannot be dropped, cleanup panics and names the database.
-- Test pools use a 1 s idle timeout and are closed before the drop.
-- If a `TestDomains` is dropped without `cleanup()`, the databases are still dropped and then the test fails.
-- The harness drops only databases with its own `cs_test_` prefix that it created itself.
+(Revised 2026-11-25, m1/backend-3: database pool instead of CREATE/DROP DATABASE per test, which
+degraded the dev YugabyteDB through sys-catalog bloat.)
+
+- Each domain has a bounded pool of databases `cs_test_pool_<domain>_<n>` (`CS_TEST_POOL_SIZE`,
+  default 8), created once on first use and never dropped.
+- A test leases one database per domain with a session-level advisory lock
+  (`pg_try_advisory_lock(class, blake3(name))`) held on a dedicated admin connection, so leases are
+  exclusive across processes and worktrees and die with the connection if the process crashes.
+  Domains are leased in sorted order (no lease cycles); a test waits for a free database
+  (`CS_TEST_POOL_WAIT_SECS`, default 900 s) and then fails.
+- `cleanup()` closes the pools, terminates leftover sessions, drops every user schema
+  (`DROP SCHEMA … CASCADE`, re-creating `public`) and verifies the database is empty
+  (relations, types and functions in `public`, no other user schema); up to 8 attempts, then it
+  panics naming the database. Only then is the lease released.
+- A database found non-empty at lease time (its holder crashed) is reset first, with a warning.
+- If a `TestDomains` is dropped without `cleanup()`, the databases are still reset (from a
+  separate runtime, before the leases are released) and then the test fails.
+- CREATE DATABASE retries with backoff: a failed CREATE can leave a DocDB keyspace that
+  YugabyteDB removes asynchronously ("Keyspace … already exists" while `pg_database` does not list
+  it).
+- `CS_TEST_POOL_LOG=<file>` appends one line per `create` / `lease` / `reset` (churn measurement).
+- The harness only touches databases with its `cs_test_pool_` prefix.
+- The QA harness (`crates/cs-qa-tests/tests/support/db.rs`) is separate and still creates and
+  drops a database per test.
 
 ## cs-ops
 
