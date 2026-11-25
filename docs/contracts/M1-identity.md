@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 13)
+# M1 Contracts: Identity (FROZEN rev 14)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -136,6 +136,12 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
       - One key pair per session, created before `login/finish` and stored as a non-extractable CryptoKey in IndexedDB, shared by all tabs.
       - It is deleted on sign-out, and on any `unauthenticated` response that ends the session, such as revocation or reuse.
       - The next sign-in generates a new key.
+  - (rev 14, supersedes the Valkey part of [R6]) **The DPoP replay record is authoritative only in the identity-domain table `dpop_jti`.**
+    - Every DPoP-checked request inserts `((tenant_id, jkt), jti)` with `INSERT … ON CONFLICT DO NOTHING` in one short identity transaction. A conflict means replay.
+    - Valkey is no longer on the replay path. The QA gate (F-1) showed why: recording the `jti` in Valkey *or* the table lets a node partitioned from Valkey accept a proof that another node recorded only in Valkey, or the reverse.
+    - Losing Valkey therefore never affects replay safety (§18.5). If the identity domain is unavailable, DPoP-bound requests fail closed with `unavailable` (503).
+    - The extra single-row write per DPoP request is a measured-cost item for M8. Correctness comes before performance (§1.2).
+    - Valkey stays in use for rate limiting (§5).
   - `[R6]` The replay check is shared across nodes. It uses Valkey (`SET NX` with TTL 120 s). If Valkey is unavailable it falls back to the identity-domain `dpop_jti` table, never to a per-node cache. Losing Valkey costs latency only (§18.5). If both are unavailable, DPoP-bound requests fail closed with `unavailable` (503, retryable).
 - **Refresh:** `POST /api/v2/auth/token/refresh` rotates the token on every use.
   - Format `[R8]`: `rt1.<tenant_id base64url>.<256-bit random base64url>`. The server stores SHA-256 of the whole string. The tenant segment only selects the partition for the lookup `(tenant_id, token_hash)`; it is not trusted, because a changed tenant segment changes the hash and finds nothing. The same format is used for setup links and recovery grants.
@@ -212,6 +218,9 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
     - `rate_limit_account_per_min` 10 (3–100);
     - `rate_limit_tenant_per_min` 600 (60–100000), all over fixed 60 s windows.
     The rate-limit fallback is local buckets at limit/N per §5, using `[cluster] node_count` (≥ 1, checked by `check-config`).
+- (rev 14) **Every authenticated route checks the session, not only the JWT.**
+  - One shared extractor verifies the access token, then that its session is `active` at the token's `sgen`, then scope (`scp`) and DPoP binding.
+  - A revoked or rotated-generation session gets `unauthenticated` on every route, `/me/*` included, even while the token has not expired. This is QA gate finding F-3.
 - (rev 13) **Recovery email delivery in M1 is best effort and not durable.**
   - The `rt1` link is a bearer secret, so it never goes into the outbox or any other durable queue.
   - After the request commits, the handler hands the link to a **bounded in-memory queue** on that node and returns `202` immediately. Response timing therefore never depends on SMTP.
@@ -322,3 +331,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-26 rev 11 addendum: `reregister` on MFA completion, and bounded client-side retention of the password bytes.
 - 2026-11-26 rev 12 (TL): implementation notes from backend slice 4 (`auth_ceremonies` table, CLI recovery token, recovery-request listing, grant rotation on polling).
 - 2026-11-26 rev 13 (TL, backend question): recovery email delivery is best effort through a bounded in-memory queue (no bearer secret in the outbox, no durability claim; durable delivery in M4); notifier config.
+- 2026-11-26 rev 14 (TL, QA gate findings F-1, F-3): the DPoP replay record is authoritative only in `dpop_jti` (Valkey off the replay path); every authenticated route checks the session at `sgen` through one shared extractor.
