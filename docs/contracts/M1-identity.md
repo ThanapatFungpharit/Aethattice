@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 8)
+# M1 Contracts: Identity (FROZEN rev 9)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -69,6 +69,15 @@ Outbox events: `identity.user.created|updated|disabled`, `identity.group.members
     - It is created once with `INSERT … ON CONFLICT DO NOTHING`, and every node then re-reads the stored row, never using its own candidate.
     - Nodes unwrap it into memory only at startup. It is never logged.
     - Rotation adds a new version, and each registration records its version.
+- (rev 9) **Re-registration by a step-up session** (password change and transparent KSF or key-version upgrade):
+  - `register/start` and `register/finish` take the session's access token instead of `grant`, using `Authorization: DPoP|Bearer` per rev 8 and a proof when the session is bound.
+    - `register/start {purpose, registration_request}`, where `purpose` is `password_change` or `ksf_upgrade`. The login is taken from the session's user; a `login` in the body is refused.
+    - The session must satisfy the step-up window, otherwise the response is `unauthenticated` with `step_up_required`. The `registration_txn` is bound to the session's `sid`, user and generation.
+  - `register/finish` replaces the user's OPAQUE registration with the current KSF parameters and key version. The user stays active, and no setup link is consumed.
+    - It emits `identity.credentials.changed` with reason = `purpose`.
+    - In the same identity transaction, it revokes **every other** session and refresh family of the user, keeping the current one.
+    - The server cannot tell whether the password changed (OPAQUE hides it), so `purpose` never weakens the revocation. A `ksf_upgrade` therefore also signs out other devices. The trade-off is accepted because upgrades are rare.
+  - `login/finish` returns `"reregister": true` (absent otherwise) when the stored KSF parameters are below the current defaults, or the registration's server key version is not current. The web client then runs `ksf_upgrade` immediately, with the same password, while still inside the step-up window.
 - (rev 7) **KSF parameter bounds.** Valid `ksf_params` satisfy `65536 ≤ m_kib ≤ 262144`, `3 ≤ t ≤ 10` and `1 ≤ p ≤ 4`.
   - The client refuses anything outside these bounds before running Argon2id. A hostile or broken server cannot make it exhaust memory.
   - The server never stores or offers parameters outside them.
@@ -231,3 +240,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-25 rev 6 (TL, backend question): §2.1 adds the `auth_txns` and `opaque_server_keys` tables (sealed state, KEK envelope, single-use and cross-node creation rules) and fixes `iss` and `aud`.
 - 2026-11-25 rev 7 (TL, frontend slice 2): KSF parameter bounds; `opaque/reauth/*` for password step-up on the existing session; `GET /api/v2/me`.
 - 2026-11-25 rev 8 (TL, frontend DPoP questions): DPoP wire details (algorithms, no nonce in M1, binding of session and refresh family, `DPoP` auth scheme, `htu`, key lifetime).
+- 2026-11-25 rev 9 (TL, backend question): re-registration by a step-up session (password change and KSF/key upgrade), the `reregister` signal, and revocation of the user's other sessions on every re-registration.
