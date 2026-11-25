@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 7)
+# M1 Contracts: Identity (FROZEN rev 8)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -114,6 +114,19 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
   - Clock skew `[R12]`: `iat` may be at most 60 s in the future; `exp` is enforced with 0 s leeway on the server and 60 s on the client's proactive refresh.
   - Verifiers accept only EdDSA and only known `kid`s. `alg: none`, HS*, and `jwk`/`jku`/`x5u` headers are all rejected.
 - **DPoP (RFC 9449):** mandatory for third-party OAuth clients (M5) and optional for first-party clients (policy). Proofs are checked for `htm`, `htu`, `iat` within ±60 s, `jti` replay, `ath`, and key thumbprint against `cnf.jkt`.
+  - (rev 8) **Wire details:**
+    - **Proof algorithms:** the server accepts `ES256` (P-256) and `EdDSA` (Ed25519) and refuses every other `alg`. The web client uses `ES256`, because WebCrypto supports it everywhere. `typ` must be `dpop+jwt`. The `jwk` header carries only public members; a `jwk` with private members is refused.
+    - **No nonces in M1:** the server never sends `DPoP-Nonce` or `use_dpop_nonce`. A client that receives one retries once with the nonce.
+    - **The first-party web client always sends proofs:** on `login/finish`, `token/refresh`, `reauth/*`, and every request carrying an access token.
+      - When `login/finish` carries a valid proof, the session, its access tokens (`cnf.jkt`) and the whole refresh family are bound to that key's thumbprint.
+      - A bound refresh token must present a proof from the same key. A proof from a different key, or none, is treated like refresh-token theft: the refresh is refused with `unauthenticated` and the session is revoked, exactly as for reuse.
+      - A session started without a proof stays unbound (policy `dpop_first_party = optional`). Third-party clients must use DPoP (M5).
+    - **Authorization header:** a token carrying `cnf.jkt` must be sent as `Authorization: DPoP <token>` with a matching proof that includes `ath`. Presenting it as `Bearer` is refused.
+    - **`htu`:** the absolute request URI as the client sends it, without query or fragment. The server compares it with `https://<deployment domain>` plus the request path, so the web shell and the API share one origin.
+    - **Key lifetime:**
+      - One key pair per session, created before `login/finish` and stored as a non-extractable CryptoKey in IndexedDB, shared by all tabs.
+      - It is deleted on sign-out, and on any `unauthenticated` response that ends the session, such as revocation or reuse.
+      - The next sign-in generates a new key.
   - `[R6]` The replay check is shared across nodes. It uses Valkey (`SET NX` with TTL 120 s). If Valkey is unavailable it falls back to the identity-domain `dpop_jti` table, never to a per-node cache. Losing Valkey costs latency only (§18.5). If both are unavailable, DPoP-bound requests fail closed with `unavailable` (503, retryable).
 - **Refresh:** `POST /api/v2/auth/token/refresh` rotates the token on every use.
   - Format `[R8]`: `rt1.<tenant_id base64url>.<256-bit random base64url>`. The server stores SHA-256 of the whole string. The tenant segment only selects the partition for the lookup `(tenant_id, token_hash)`; it is not trusted, because a changed tenant segment changes the hash and finds nothing. The same format is used for setup links and recovery grants.
@@ -217,3 +230,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-25 rev 5 (TL, frontend question): §2.1 OPAQUE wire format fixed: crate versions, shared `cs-identity-wire` suite and normalization, base64url encoding, ksf_params shape, context and identifiers, tenant as UUID, register endpoint shapes; register/finish returns 204.
 - 2026-11-25 rev 6 (TL, backend question): §2.1 adds the `auth_txns` and `opaque_server_keys` tables (sealed state, KEK envelope, single-use and cross-node creation rules) and fixes `iss` and `aud`.
 - 2026-11-25 rev 7 (TL, frontend slice 2): KSF parameter bounds; `opaque/reauth/*` for password step-up on the existing session; `GET /api/v2/me`.
+- 2026-11-25 rev 8 (TL, frontend DPoP questions): DPoP wire details (algorithms, no nonce in M1, binding of session and refresh family, `DPoP` auth scheme, `htu`, key lifetime).
