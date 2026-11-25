@@ -128,16 +128,59 @@ export function decodeLoginFinish(body: unknown): AuthResult | MfaChallenge {
 
 // ---- errors ----
 
+/** Lifetime of `auth_txn` (rev 11: 5 min); the retained password is zeroed after it at the latest. */
+export const MFA_PASSWORD_RETENTION_MS = 300_000;
+
 /**
- * Sign-in needs a second factor (§2.3). Completing it (`webauthn/assert` or a recovery code) is a later slice;
- * the UI tells the user and offers no session.
+ * The password bytes of a sign-in that stopped at `mfa_required`, kept only so that a `"reregister": true` on the
+ * MFA completion can still run the rev 9 `ksf_upgrade`. Zeroed after use, on {@link MfaRequired.dispose}, or after
+ * {@link MFA_PASSWORD_RETENTION_MS}, whichever comes first.
+ */
+export class RetainedPassword {
+  readonly tenant: string;
+  readonly login: string;
+  private bytes: Uint8Array | undefined;
+  private readonly timer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(bytes: Uint8Array, tenant: string, login: string, ttlMs: number = MFA_PASSWORD_RETENTION_MS) {
+    this.bytes = bytes;
+    this.tenant = tenant;
+    this.login = login;
+    this.timer = ttlMs > 0 ? setTimeout(() => {
+      this.wipe();
+    }, ttlMs) : undefined;
+  }
+
+  /** The bytes, or undefined once wiped. */
+  get value(): Uint8Array | undefined {
+    return this.bytes;
+  }
+
+  wipe(): void {
+    this.bytes?.fill(0);
+    this.bytes = undefined;
+    if (this.timer !== undefined) clearTimeout(this.timer);
+  }
+}
+
+/**
+ * Sign-in needs a second factor (§2.3). The UI completes it with `webauthn/assert` ({@link completeMfaWithPasskey})
+ * or a recovery code ({@link completeMfaWithRecoveryCode}), passing this error back; or calls {@link dispose}.
  */
 export class MfaRequired extends Error {
   readonly challenge: MfaChallenge;
-  constructor(challenge: MfaChallenge) {
+  /** @internal Password kept for a possible rev 9 re-registration after MFA. */
+  readonly retained: RetainedPassword | undefined;
+  constructor(challenge: MfaChallenge, retained?: RetainedPassword) {
     super("mfa_required");
     this.name = "MfaRequired";
     this.challenge = challenge;
+    this.retained = retained;
+  }
+
+  /** Zeroes the retained password (MFA cancelled). */
+  dispose(): void {
+    this.retained?.wipe();
   }
 }
 
@@ -146,7 +189,7 @@ export function isMfaRequired(e: unknown): e is MfaRequired {
 }
 
 /** Input the client rejects before any request. `field` names the form field to mark. */
-export type IdentityInputField = "tenant" | "login" | "password" | "setup_link";
+export type IdentityInputField = "tenant" | "login" | "password" | "setup_link" | "recovery_code";
 
 export class IdentityInputError extends Error {
   readonly field: IdentityInputField;
@@ -244,7 +287,21 @@ export interface IdentityDeps {
   readonly client: ApiClient;
   readonly engine: OpaqueEngine;
   readonly session: AuthSession;
+  /**
+   * Client whose auth hook is `session` (rev 9). {@link signIn} needs it for the transparent re-registration when
+   * `login/finish` answers `"reregister": true`; without it the upgrade is reported as failed and retried at the
+   * next sign-in.
+   */
+  readonly authedClient?: ApiClient;
+  /** Told how a transparent re-registration (rev 9 `ksf_upgrade`) went. Never called when none was requested. */
+  readonly onReregister?: (outcome: ReregisterOutcome) => void;
 }
+
+/** Purposes of a re-registration by a step-up session (rev 9). */
+export type ReregisterPurpose = "password_change" | "ksf_upgrade";
+
+/** Result of the transparent `ksf_upgrade` after sign-in (rev 9). A failure never fails the sign-in. */
+export type ReregisterOutcome = { readonly ok: true } | { readonly ok: false; readonly error: unknown };
 
 /**
  * OPAQUE sign-in (§2.1): `login/start` → Argon2id + KE3 in WASM → `login/finish`. On `authenticated` the result is
@@ -264,28 +321,103 @@ export async function signIn(deps: IdentityDeps, tenant: string, login: string, 
       ...(signal !== undefined && { signal }),
     });
     const fin = await finishFlow(flow, pw, start.data.credential_response, start.data.ksf_params);
-    const keys = deps.session.dpopKeys;
-    const finish = async (): Promise<AuthResult | MfaChallenge> => {
-      // Rev 8: a new key pair for the new session, created before login/finish and shared by all tabs; the
-      // proof on login/finish binds the session and its refresh family to it.
-      await keys?.rotate();
-      const r = await deps.client.post(OPAQUE_LOGIN_FINISH_PATH, {
-        body: { login_txn: start.data.login_txn, credential_finalization: base64urlEncode(fin) },
-        decode: decodeLoginFinish,
-        ...(keys !== undefined && { dpop: true }),
-        ...(signal !== undefined && { signal }),
-      });
-      if (r.data.state === "authenticated") deps.session.signedIn(r.data);
-      return r.data;
-    };
-    // Under the cross-tab lock, so no other tab refreshes or signs in between the key change and the new token.
-    const result = keys ? await deps.session.exclusive(finish) : await finish();
-    if (result.state === "mfa_required") throw new MfaRequired(result);
+    const result = await issueSession(
+      deps,
+      OPAQUE_LOGIN_FINISH_PATH,
+      { login_txn: start.data.login_txn, credential_finalization: base64urlEncode(fin) },
+      decodeLoginFinish,
+      signal,
+    );
+    // The password is kept (bounded) only so that an MFA completion answering `reregister` can still upgrade.
+    if (result.state === "mfa_required") throw new MfaRequired(result, new RetainedPassword(pw.slice(), tenant, normalized));
+    // Rev 9: upgrade the stored KSF parameters / server key version now, with the password still in memory and
+    // the session inside its step-up window. The password buffer is zeroed in `finally` right after.
+    if (result.reregister === true) await transparentReregister(deps, tenant, normalized, pw, signal);
     return result;
   } finally {
     flow?.abandon();
     pw.fill(0);
   }
+}
+
+/**
+ * Posts a call that may issue a session (`opaque/login/finish`, `webauthn/login/finish`, `webauthn/assert/finish` for
+ * MFA, `mfa/recovery-code`) and hands an `authenticated` result to the session.
+ * Rev 8: a new key pair for the new session is created before the call and shared by all tabs; the proof on the
+ * call binds the session and its refresh family to it. Runs under the cross-tab lock, so no other tab refreshes or
+ * signs in between the key change and the new token.
+ */
+export async function issueSession<T extends AuthResult | MfaChallenge>(
+  deps: Pick<IdentityDeps, "client" | "session">,
+  path: string,
+  body: unknown,
+  decode: (body: unknown) => T,
+  signal?: AbortSignal,
+): Promise<T> {
+  const keys = deps.session.dpopKeys;
+  const finish = async (): Promise<T> => {
+    await keys?.rotate();
+    const r = await deps.client.post(path, {
+      body,
+      decode,
+      ...(keys !== undefined && { dpop: true }),
+      ...(signal !== undefined && { signal }),
+    });
+    if (r.data.state === "authenticated") deps.session.signedIn(r.data);
+    return r.data;
+  };
+  return keys ? deps.session.exclusive(finish) : finish();
+}
+
+/** `POST /api/v2/auth/mfa/recovery-code` (rev 10). */
+export const MFA_RECOVERY_CODE_PATH = "/api/v2/auth/mfa/recovery-code";
+
+/**
+ * Runs the rev 9 re-registration after an MFA completion that answered `"reregister": true`, with the password
+ * retained by {@link signIn}; always zeroes it afterwards. Exported for the WebAuthn module.
+ */
+export async function afterMfa(deps: IdentityDeps, mfa: MfaRequired, result: AuthResult, signal?: AbortSignal): Promise<AuthResult> {
+  const retained = mfa.retained;
+  try {
+    if (result.reregister === true) {
+      const pw = retained?.value;
+      if (retained && pw) await transparentReregister(deps, retained.tenant, retained.login, pw, signal);
+      else reportReregister(deps, { ok: false, error: new Error("password no longer in memory") });
+    }
+  } finally {
+    mfa.dispose();
+  }
+  return result;
+}
+
+const RECOVERY_CODE = /^[A-Z2-7]{8}-[A-Z2-7]{20}$/;
+
+/**
+ * Rev 11 wire format of a recovery code: `<code_id: 8 base32>-<secret: 20 base32>` (RFC 4648 alphabet). Accepts the
+ * code as typed (case, surrounding and inner spaces); throws IdentityInputError("recovery_code") otherwise.
+ */
+export function normalizeRecoveryCode(code: string): string {
+  const c = code.replace(/\s+/g, "").toUpperCase();
+  if (!RECOVERY_CODE.test(c)) throw new IdentityInputError("recovery_code");
+  return c;
+}
+
+/**
+ * Completes an `mfa_required` sign-in with a recovery code (rev 10): `POST /api/v2/auth/mfa/recovery-code
+ * {auth_txn, code}` → §2.4 result. A wrong or used code rejects with `unauthenticated`. Rev 11 addendum: the retained
+ * password is zeroed on success (after the upgrade) and on failure; a malformed code is refused before any request
+ * and keeps it.
+ */
+export async function completeMfaWithRecoveryCode(deps: IdentityDeps, mfa: MfaRequired, code: string, signal?: AbortSignal): Promise<AuthResult> {
+  const c = normalizeRecoveryCode(code);
+  let result: AuthResult;
+  try {
+    result = await issueSession(deps, MFA_RECOVERY_CODE_PATH, { auth_txn: mfa.challenge.auth_txn, code: c }, decodeAuthResult, signal);
+  } catch (e) {
+    mfa.dispose();
+    throw e;
+  }
+  return afterMfa(deps, mfa, result, signal);
 }
 
 /**
@@ -367,6 +499,84 @@ export async function reauthenticate(
     });
   } finally {
     flow?.abandon();
+    pw.fill(0);
+  }
+}
+
+/**
+ * Re-registration by the step-up session (rev 9): `register/start {purpose, registration_request}` →
+ * `register/finish {registration_txn, registration_upload}` (204), both with the session's access token (and a DPoP
+ * proof when bound) through `authedClient`. The login comes from the session on the server; the client identifier
+ * is still `<tenant>/<normalized login>`. Rejects with StepUpRequired when the session is outside its step-up window.
+ * `pw` is not zeroed here; the caller owns it.
+ */
+async function reregisterBytes(
+  engine: OpaqueEngine,
+  authedClient: ApiClient,
+  purpose: ReregisterPurpose,
+  tenant: string,
+  normalized: string,
+  pw: Uint8Array,
+  signal?: AbortSignal,
+): Promise<void> {
+  let flow: OpaqueFlow | undefined;
+  try {
+    flow = await startFlow(engine, "registration", pw, tenant, normalized);
+    const start = await authedClient.post(OPAQUE_REGISTER_START_PATH, {
+      body: { purpose, registration_request: base64urlEncode(flow.request) },
+      decode: decodeRegisterStart,
+      ...(signal !== undefined && { signal }),
+    });
+    const upload = await finishFlow(flow, pw, start.data.registration_response, start.data.ksf_params);
+    await authedClient.post(OPAQUE_REGISTER_FINISH_PATH, {
+      body: { registration_txn: start.data.registration_txn, registration_upload: base64urlEncode(upload) },
+      ...(signal !== undefined && { signal }),
+    });
+  } finally {
+    flow?.abandon();
+  }
+}
+
+/** Runs the rev 9 `ksf_upgrade` after sign-in. Never throws: a failure is reported and retried at the next sign-in. */
+async function transparentReregister(deps: IdentityDeps, tenant: string, normalized: string, pw: Uint8Array, signal?: AbortSignal): Promise<void> {
+  let outcome: ReregisterOutcome;
+  try {
+    if (!deps.authedClient) throw new Error("no authenticated client for re-registration");
+    await reregisterBytes(deps.engine, deps.authedClient, "ksf_upgrade", tenant, normalized, pw, signal);
+    outcome = { ok: true };
+  } catch (error) {
+    outcome = { ok: false, error };
+  }
+  reportReregister(deps, outcome);
+}
+
+function reportReregister(deps: IdentityDeps, outcome: ReregisterOutcome): void {
+  try {
+    deps.onReregister?.(outcome);
+  } catch {
+    // A failing listener must not break the sign-in either.
+  }
+}
+
+/**
+ * Password change on the current session (rev 9, purpose `password_change`). The server revokes every other session
+ * of the user in the same transaction and keeps this one. Rejects with StepUpRequired outside the step-up window;
+ * the UI re-authenticates and calls again. The new password's bytes are zeroed after use.
+ */
+export async function changePassword(
+  deps: Pick<IdentityDeps, "engine">,
+  authedClient: ApiClient,
+  tenant: string,
+  login: string,
+  newPassword: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!isCanonicalTenantId(tenant)) throw new IdentityInputError("tenant");
+  const normalized = await normalizeOrThrow(deps.engine, login);
+  const pw = passwordBytes(newPassword);
+  try {
+    await reregisterBytes(deps.engine, authedClient, "password_change", tenant, normalized, pw, signal);
+  } finally {
     pw.fill(0);
   }
 }

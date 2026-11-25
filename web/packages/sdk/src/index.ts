@@ -11,5 +11,7 @@ export * from "./auth";
 export * from "./dpop";
 export * from "./opaque";
 export * from "./identity";
+export * from "./webauthn";
+export * from "./account";
 export * from "./i18n";
 export * from "./tokens";

@@ -1,5 +1,5 @@
 // Web shell entry (spec §14.1).
-import { ApiClient, AuthSession, DpopKeyManager, httpRefreshTransport, installTokens, workerOpaqueEngine } from "@cs/sdk";
+import { ApiClient, AuthSession, DpopKeyManager, browserCredentials, httpRefreshTransport, installTokens, workerOpaqueEngine } from "@cs/sdk";
 import "./cs-shell-app";
 import { registerShellMessages } from "./messages";
 
@@ -23,5 +23,7 @@ const app = document.createElement("cs-shell-app");
 app.client = client;
 app.identity = { client, engine, session };
 app.authedClient = authedClient;
+// WebAuthn (contract §2.2): the browser API directly; passkey options are hidden where it is unavailable.
+app.credentials = browserCredentials();
 app.showDevLink = import.meta.env.DEV;
 document.body.appendChild(app);

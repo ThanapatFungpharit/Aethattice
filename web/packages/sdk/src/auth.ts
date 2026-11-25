@@ -24,6 +24,11 @@ export interface AuthResult {
   /** Lifetime in seconds. */
   readonly expires_in: number;
   readonly session_id: string;
+  /**
+   * `login/finish` only (rev 9): the stored KSF parameters or server key version are not current, so the client
+   * re-registers with the same password right away (`register/start {purpose: "ksf_upgrade"}`). Absent otherwise.
+   */
+  readonly reregister?: true;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -39,7 +44,7 @@ export function decodeAuthResult(body: unknown): AuthResult {
     throw new TypeError("expires_in must be a positive integer");
   }
   if (typeof session_id !== "string" || session_id.length === 0) throw new TypeError("session_id missing");
-  return { state: "authenticated", access_token, expires_in, session_id };
+  return { state: "authenticated", access_token, expires_in, session_id, ...(body.reregister === true && { reregister: true as const }) };
 }
 
 /**
@@ -71,6 +76,29 @@ export function httpRefreshTransport(opts: Omit<ApiClientOptions, "auth" | "idem
     },
   };
 }
+
+/**
+ * Reads one string claim from a JWS compact token's payload WITHOUT verifying it (display and routing only).
+ * Returns undefined for anything malformed.
+ */
+export function unverifiedClaim(token: string, claim: string): string | undefined {
+  const payload = token.split(".")[1];
+  if (payload === undefined || payload.length === 0) return undefined;
+  try {
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+    const text = new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+    const v: unknown = JSON.parse(text);
+    if (!isRecord(v)) return undefined;
+    const c = v[claim];
+    return typeof c === "string" ? c : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `scp` of an enrolment-only session (rev 11). */
+export const MFA_ENROLMENT_SCOPE = "mfa_enrolment";
 
 // ---- cross-tab serialization ----
 
@@ -386,6 +414,14 @@ export class AuthSession implements AuthHook {
    */
   exclusive<T>(fn: () => Promise<T>): Promise<T> {
     return this.lock.run(fn);
+  }
+
+  /**
+   * The `scp` claim of the current access token (rev 11: `"mfa_enrolment"` for an enrolment-only session), read for
+   * display and routing only. The token is not verified here and this value is never trusted for security.
+   */
+  get scope(): string | undefined {
+    return this.accessToken === undefined ? undefined : unverifiedClaim(this.accessToken, "scp");
   }
 
   /** The DPoP key manager, when the session is DPoP-bound. */
