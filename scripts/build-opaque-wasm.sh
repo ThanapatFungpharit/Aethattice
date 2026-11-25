@@ -14,8 +14,12 @@ if ! have="$("$bindgen" --version 2>/dev/null)" || [[ "$have" != "$want" ]]; the
   echo "build-opaque-wasm: needs $want (found: ${have:-none})" >&2
   exit 2
 fi
-# Remap absolute paths so the binary is the same on every machine.
-RUSTFLAGS="--remap-path-prefix=$root=/cs --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo" \
+# Remap absolute paths so the binary is the same on every machine (and leaks no local paths).
+# Standard-library sources map to /rustc/<commit-hash>, which is what toolchains without the
+# rust-src component (e.g. CI) embed anyway.
+sysroot_src="$(rustc --print sysroot)/lib/rustlib/src/rust"
+rustc_hash="$(rustc -vV | sed -n 's/^commit-hash: //p')"
+RUSTFLAGS="--remap-path-prefix=$root=/cs --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$sysroot_src=/rustc/$rustc_hash" \
   cargo build --locked -p cs-opaque-wasm --target wasm32-unknown-unknown --release
 out=web/packages/opaque-wasm/pkg
 rm -rf "$out"
