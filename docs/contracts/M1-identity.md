@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 10)
+# M1 Contracts: Identity (FROZEN rev 11)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -186,6 +186,29 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
   - **Administrator-assisted:** `cs admin recovery start` creates an email-method request with the waiting period.
   - **Cancel:** any session of the user can list pending requests (`GET /api/v2/me/recovery-requests`) and cancel one with `DELETE …/{id}`, which sets the state to `cancelled`.
   - **Completion:** unchanged ([R5]). `register/start {grant, login, registration_request}` → `register/finish` → normal sign-in.
+- (rev 11) **Schema and policy additions (migration 0103, expand only):**
+  - **Recovery codes:**
+    - Table `recovery_code_entries ((tenant_id, user_id) HASH, code_id ASC)`, holding an Argon2id PHC hash, `used_at` and `set_version`. Each set has 10 codes.
+    - Wire format `<code_id: 8 base32 chars>-<secret: 20 base32 chars>`. The lookup is by `code_id`, and exactly one Argon2id verification runs, with a dummy hash for unknown IDs so timing is the same.
+    - The old `recovery_codes` table is unused, and a later contract migration drops it.
+  - **Email:** `users.email` and `users.email_verified_at`, set in M1 only by `cs admin user set-email --verified`. An email-method recovery for a user with no verified address behaves like an unknown account.
+  - **Sessions and passkeys:**
+    - `sessions.last_seen_at` is updated on refresh. `sessions.user_agent` is taken at `login/finish` and truncated to 200 characters.
+    - `webauthn_credentials` gains `label` (1–100 characters), `last_used_at` and the serialized `passkey_state`. On the wire, the passkey `id` is the base64url credential ID.
+  - **MFA:**
+    - A user "has MFA" when policy `mfa_required` = 1 (deployment default, overridable by the tenant through `tenants.policy`) or the user has at least one passkey.
+    - `login/finish` then returns `200 {state: "mfa_required", auth_txn, methods}`. `auth_txn` uses the `rt1` format with a **5 min** TTL and single use. Presenting it to the wrong endpoint returns 401 with `mfa_required`.
+    - **Enrolment:** when policy requires MFA but the user has no passkey and no unused recovery code, `login/finish` issues an **enrolment-only session**.
+      - Its access token carries `scp: "mfa_enrolment"`.
+      - It may call only `webauthn/register/*`, `me/recovery-codes`, `GET /me` and logout. Every other endpoint answers 401 with `mfa_required`.
+      - Once a factor is enrolled, the user signs in again normally.
+  - **New policy keys** (ranges are provisional until the owner records them in erratum C13):
+    - `mfa_required` 0 (0–1);
+    - `dpop_first_party_required` 0 (0–1);
+    - `rate_limit_source_per_min` 30 (5–1000);
+    - `rate_limit_account_per_min` 10 (3–100);
+    - `rate_limit_tenant_per_min` 600 (60–100000), all over fixed 60 s windows.
+    The rate-limit fallback is local buckets at limit/N per §5, using `[cluster] node_count` (≥ 1, checked by `check-config`).
 - (rev 10) **Timestamps and recovery requests.**
   - Every timestamp field in M1 JSON bodies is an RFC 3339 UTC string, for example `created_at`, `last_seen_at`, `last_used_at` and `available_at`. JWT claims and the `auth_time` mirrored from them stay in unix seconds (RFC 7519).
   - `GET /api/v2/me/recovery-requests` → `{items: [{id, method: "email"|"device_approval", state: "pending"|"granted", created_at, available_at, requester_user_agent}]}`. It is bounded and not paginated. `requester_user_agent` may be null; it helps the user tell whether a request is their own.
@@ -274,3 +297,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-25 rev 9 (TL, backend question): re-registration by a step-up session (password change and KSF/key upgrade), the `reregister` signal, and revocation of the user's other sessions on every re-registration.
 - 2026-11-26 rev 10 (TL, frontend proposal): recovery endpoints per method (code without a waiting period; email by link with a waiting period, plus a recovery code for MFA users; device approval; admin-assisted; cancel), and WebAuthn, passkey, session and recovery-code wire shapes.
 - 2026-11-26 rev 10 addendum: RFC 3339 timestamps in bodies; `me/recovery-requests` item shape; `status` body and response.
+- 2026-11-26 rev 11 (TL, backend proposals): recovery-code sets, user email, session and passkey columns, MFA definition and the enrolment-only session, `mfa_required` response and 5 min `auth_txn`, new policy keys (ranges pending owner approval, C13).
