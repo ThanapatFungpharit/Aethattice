@@ -19,8 +19,24 @@ jobs:
           done
           docker logs yb | tail -50; exit 1
       - uses: dtolnay/rust-toolchain@master
-        with: { toolchain: "1.99.1", components: "rustfmt, clippy" }
+        with: { toolchain: "1.99.1", components: "rustfmt, clippy", targets: "wasm32-unknown-unknown" }
       - uses: Swatinem/rust-cache@v2
+      # wasm-bindgen-cli, pinned to the crate's wasm-bindgen version, so scripts/build-opaque-wasm.sh --check
+      # verifies the committed opaque-wasm pkg/ (M1 rev 5 §2.1) instead of skipping it.
+      - name: Cache wasm-bindgen-cli 0.2.130
+        id: wasm-bindgen-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cs-tools/wasm-bindgen-0.2.130
+          key: wasm-bindgen-cli-0.2.130-${{ runner.os }}-rust-1.99.1
+      - name: Install wasm-bindgen-cli 0.2.130
+        if: steps.wasm-bindgen-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.130 --locked --root ~/.cache/cs-tools/wasm-bindgen-0.2.130
+      - name: Put wasm-bindgen on PATH
+        run: echo "$HOME/.cache/cs-tools/wasm-bindgen-0.2.130/bin" >> "$GITHUB_PATH"
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - run: scripts/ci.sh --with-db
+        env:
+          # In GitHub Actions a missing wasm-bindgen is a failure, not a skip.
+          CS_REQUIRE_WASM_BINDGEN: "1"

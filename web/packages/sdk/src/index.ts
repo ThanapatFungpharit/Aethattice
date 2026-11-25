@@ -8,6 +8,7 @@ export * from "./retry";
 export * from "./idempotency";
 export * from "./client";
 export * from "./auth";
+export * from "./dpop";
 export * from "./opaque";
 export * from "./identity";
 export * from "./i18n";

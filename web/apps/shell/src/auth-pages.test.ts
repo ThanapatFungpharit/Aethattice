@@ -56,25 +56,40 @@ function server(overrides: Record<string, () => Response> = {}) {
     "/api/v2/auth/opaque/register/start": () => json({ registration_txn: "r", registration_response: base64urlEncode(new Uint8Array(64)), ksf_params: KSF }),
     "/api/v2/auth/opaque/register/finish": () => new Response(null, { status: 204 }),
     "/api/v2/auth/logout": () => new Response(null, { status: 204 }),
+    "/api/v2/auth/opaque/reauth/start": () => json({ reauth_txn: "rt", credential_response: base64urlEncode(new Uint8Array(320)), ksf_params: KSF }),
+    "/api/v2/auth/opaque/reauth/finish": () => new Response(null, { status: 204 }),
+    "/api/v2/me": () =>
+      json({
+        user_id: "u-1",
+        tenant_id: TENANT,
+        login: "alice",
+        display_name: "Alice Example",
+        state: "active",
+        amr: ["pwd"],
+        auth_time: 1_700_000_000,
+        sid: `s${sessionCounter}`,
+      }),
     "/readyz": () => json({}),
     ...overrides,
   };
-  const fetchFn = vi.fn((input: RequestInfo | URL) => {
+  const auths: (string | null)[] = [];
+  const fetchFn = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const path = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url).pathname;
     paths.push(path);
+    auths.push(new Headers(init?.headers).get("Authorization"));
     const r = routes[path];
     return Promise.resolve(r ? r() : problem(404, "not_found"));
   });
-  return { paths, fetchFn };
+  return { paths, auths, fetchFn };
 }
 
 function setup(lock: RefreshLock = noCrossTabLock, overrides: Record<string, () => Response> = {}) {
-  const { paths, fetchFn } = server(overrides);
+  const { paths, auths, fetchFn } = server(overrides);
   const client = new ApiClient({ baseUrl: "https://shell.test", fetch: fetchFn, clock, retryPolicy: new RetryPolicy() });
   const session = new AuthSession({ transport: { refresh: () => Promise.reject(new Error("none")) }, lock, channel: noAuthChannel, clock });
   const identity: IdentityDeps = { client, engine, session };
   const authedClient = new ApiClient({ baseUrl: "https://shell.test", fetch: fetchFn, clock, auth: session });
-  return { paths, identity, session, authedClient, client };
+  return { paths, auths, identity, session, authedClient, client };
 }
 
 async function mount(s: ReturnType<typeof setup>, hash: string): Promise<CsShellApp> {
@@ -193,6 +208,8 @@ describe("registration page", () => {
       "/api/v2/auth/opaque/register/finish",
       "/api/v2/auth/opaque/login/start",
       "/api/v2/auth/opaque/login/finish",
+      // The account page it lands on loads GET /me (rev 7).
+      "/api/v2/me",
     ]);
     expect(location.hash).toBe("#/account");
   });
@@ -233,6 +250,30 @@ async function signedInShell(lock: RefreshLock = noCrossTabLock, overrides: Reco
 }
 
 describe("account page", () => {
+  it("shows the account from GET /api/v2/me (rev 7)", async () => {
+    const { s, shell } = await signedInShell();
+    const account = q<CsAccountPage>(shell, "cs-account-page");
+    await account.load();
+    await account.updateComplete;
+    expect(s.paths).toContain("/api/v2/me");
+    expect(s.auths[s.paths.indexOf("/api/v2/me")]).toMatch(/^Bearer at\d+$/);
+    expect(q(account, ".display-name").textContent).toBe("Alice Example");
+    expect(q(account, ".login").textContent).toBe("alice");
+    expect(q(account, ".tenant").textContent).toBe(TENANT);
+    expect(q(account, ".session").textContent).toBe(s.session.state.sessionId);
+    expect(q(account, ".amr").textContent).toBe("pwd");
+    expect(q(account, ".auth-time time").getAttribute("datetime")).toBe(new Date(1_700_000_000_000).toISOString());
+  });
+
+  it("shows the problem when /me fails and keeps what sign-in knew", async () => {
+    const { shell } = await signedInShell(noCrossTabLock, { "/api/v2/me": () => problem(503, "unavailable") });
+    const account = q<CsAccountPage>(shell, "cs-account-page");
+    await account.load();
+    await account.updateComplete;
+    expect(q(account, ".login").textContent).toBe("alice");
+    expect(q<HTMLElement & { problem?: { code: string } }>(account, "cs-error-banner").problem?.code).toBe("unavailable");
+  });
+
   it("signs out through POST /api/v2/auth/logout and returns to sign-in", async () => {
     const { s, shell } = await signedInShell();
     const account = q<CsAccountPage>(shell, "cs-account-page");
@@ -275,8 +316,9 @@ describe("step-up (§2.3 [R2])", () => {
       { httpStatus: 401, synthesized: false, attempts: 1 },
     );
 
-  it("asks for the password, re-authenticates with OPAQUE, and retries the operation once", async () => {
+  it("asks for the password, re-authenticates on the current session (reauth/*, rev 7), and retries the operation once", async () => {
     const { s, shell } = await signedInShell();
+    const sessionBefore = s.session.state.sessionId;
     let calls = 0;
     const op = vi.fn(() => (++calls === 1 ? Promise.reject(stepUp()) : Promise.resolve("done")));
     const result = shell.runWithStepUp(op);
@@ -288,7 +330,14 @@ describe("step-up (§2.3 [R2])", () => {
     await dialog.submit();
     expect(await result).toBe("done");
     expect(op).toHaveBeenCalledTimes(2);
-    expect(s.paths.filter((p) => p === "/api/v2/auth/opaque/login/finish").length).toBe(2);
+    // No new session: login/finish ran only for the original sign-in, reauth carried the access token.
+    expect(s.paths.filter((p) => p === "/api/v2/auth/opaque/login/finish").length).toBe(1);
+    expect(s.paths.filter((p) => p.startsWith("/api/v2/auth/opaque/reauth/"))).toEqual([
+      "/api/v2/auth/opaque/reauth/start",
+      "/api/v2/auth/opaque/reauth/finish",
+    ]);
+    expect(s.auths[s.paths.indexOf("/api/v2/auth/opaque/reauth/start")]).toBe(`Bearer at${String(sessionCounter)}`);
+    expect(s.session.state.sessionId).toBe(sessionBefore);
     expect(dialog.open).toBe(false);
   });
 

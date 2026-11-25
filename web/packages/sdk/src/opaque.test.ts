@@ -6,6 +6,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 import * as wasm from "../../opaque-wasm/pkg/cs_opaque_wasm.js";
 import {
   DEFAULT_KSF_PARAMS,
+  KSF_MAX,
+  KSF_MIN,
   OpaqueClientError,
   WASM_INVALID_LOGIN,
   base64urlDecode,
@@ -51,6 +53,18 @@ describe("decodeKsfParams", () => {
       expect(() => decodeKsfParams(bad)).toThrow(TypeError);
     }
   });
+
+  it("enforces exactly the rev 7 bounds 65536 ≤ m_kib ≤ 262144, 3 ≤ t ≤ 10, 1 ≤ p ≤ 4", () => {
+    const base = { algorithm: "argon2id", m_kib: 65536, t: 3, p: 1 } as const;
+    expect(KSF_MIN).toEqual({ m_kib: 65536, t: 3, p: 1 });
+    expect(KSF_MAX).toEqual({ m_kib: 262144, t: 10, p: 4 });
+    for (const ok of [base, { ...base, m_kib: 262144 }, { ...base, t: 10 }, { ...base, p: 4 }, { ...base, m_kib: 131072, t: 5, p: 2 }]) {
+      expect(decodeKsfParams(ok)).toEqual(ok);
+    }
+    for (const bad of [{ m_kib: 65535 }, { m_kib: 262145 }, { t: 2 }, { t: 11 }, { p: 5 }, { m_kib: 0xffff_ffff }]) {
+      expect(() => decodeKsfParams({ ...base, ...bad }), JSON.stringify(bad)).toThrow(TypeError);
+    }
+  });
 });
 
 describe("wasmOpaqueEngine with the real opaque-ke WASM build", () => {
@@ -89,6 +103,16 @@ describe("wasmOpaqueEngine with the real opaque-ke WASM build", () => {
     await expect(login.finish(new Uint8Array([1]), new Uint8Array(3), DEFAULT_KSF_PARAMS)).rejects.toMatchObject({ reason: "invalid_input" });
     const reg = await engine.start("registration", new Uint8Array([1]), TENANT, "a");
     await expect(reg.finish(new Uint8Array([1]), new Uint8Array(64), { ...DEFAULT_KSF_PARAMS, t: 2 })).rejects.toMatchObject({ reason: "invalid_input" });
+  });
+
+  it("refuses KSF parameters above the rev 7 bounds at login and registration before Argon2id runs", async () => {
+    const engine = wasmOpaqueEngine(wasm);
+    // 4 TiB of memory: refused at once, never attempted.
+    const huge = { ...DEFAULT_KSF_PARAMS, m_kib: 0xffff_ffff };
+    const login = await engine.start("login", new Uint8Array([1]), TENANT, "a");
+    await expect(login.finish(new Uint8Array([1]), new Uint8Array(320), huge)).rejects.toMatchObject({ reason: "invalid_input" });
+    const reg = await engine.start("registration", new Uint8Array([1]), TENANT, "a");
+    await expect(reg.finish(new Uint8Array([1]), new Uint8Array(64), { ...DEFAULT_KSF_PARAMS, p: 5 })).rejects.toMatchObject({ reason: "invalid_input" });
   });
 });
 

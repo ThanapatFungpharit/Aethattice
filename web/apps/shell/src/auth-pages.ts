@@ -4,9 +4,11 @@ import "@cs/components";
 import { LocaleController } from "@cs/components";
 import {
   ApiError,
+  getMe,
   isApiError,
   isIdentityInputError,
   isMfaRequired,
+  reauthenticate,
   register,
   signIn,
   signOut,
@@ -17,6 +19,7 @@ import {
   type AuthSession,
   type IdentityDeps,
   type IdentityInputField,
+  type Me,
   type Problem,
 } from "@cs/sdk";
 import { LitElement, css, html, nothing, type TemplateResult } from "lit";
@@ -254,6 +257,7 @@ export class CsRegisterPage extends LitElement {
 
 // ---- account ----
 
+/** The account page: who is signed in, from `GET /api/v2/me` (rev 7), and sign-out. */
 export class CsAccountPage extends LitElement {
   static override properties = {
     user: { attribute: false },
@@ -261,6 +265,7 @@ export class CsAccountPage extends LitElement {
     authedClient: { attribute: false },
     busy: { state: true },
     problem: { state: true },
+    me: { state: true },
   };
   static override styles = pageStyles;
 
@@ -269,6 +274,9 @@ export class CsAccountPage extends LitElement {
   declare authedClient: ApiClient | undefined;
   declare busy: boolean;
   declare problem: Problem | undefined;
+  declare me: Me | undefined;
+
+  private loading: Promise<void> | undefined;
 
   constructor() {
     super();
@@ -277,21 +285,52 @@ export class CsAccountPage extends LitElement {
     this.authedClient = undefined;
     this.busy = false;
     this.problem = undefined;
+    this.me = undefined;
     new LocaleController(this);
+  }
+
+  override connectedCallback(): void {
+    super.connectedCallback();
+    void this.load();
+  }
+
+  /** Loads `GET /api/v2/me`. Until it answers, the page shows what this tab knows from sign-in. */
+  load(): Promise<void> {
+    const client = this.authedClient;
+    if (!client) return Promise.resolve();
+    this.loading ??= getMe(client)
+      .then((me) => {
+        this.me = me;
+      })
+      .catch((e: unknown) => {
+        this.problem = isApiError(e) ? e.problem : synthesizeProblem("internal");
+      })
+      .finally(() => {
+        this.loading = undefined;
+      });
+    return this.loading;
   }
 
   override render(): TemplateResult {
     const u = this.user;
+    const me = this.me;
     return html`<h1>${t("auth.account_heading")}</h1>
-      <section class="card" aria-labelledby="who">
+      <section class="card" aria-labelledby="who" aria-busy=${this.loading !== undefined && me === undefined ? "true" : "false"}>
         <h2 id="who">${t("auth.signed_in_as")}</h2>
         <dl>
+          ${me && me.display_name.length > 0 ? html`<dt>${t("auth.display_name")}</dt><dd class="display-name">${me.display_name}</dd>` : nothing}
           <dt>${t("auth.login")}</dt>
-          <dd class="login">${u?.login ?? ""}</dd>
+          <dd class="login">${me?.login ?? u?.login ?? ""}</dd>
           <dt>${t("auth.tenant")}</dt>
-          <dd>${u?.tenant ?? ""}</dd>
+          <dd class="tenant">${me?.tenant_id ?? u?.tenant ?? ""}</dd>
           <dt>${t("auth.session")}</dt>
-          <dd>${this.session?.state.sessionId ?? ""}</dd>
+          <dd class="session">${me?.sid ?? this.session?.state.sessionId ?? ""}</dd>
+          ${me
+            ? html`<dt>${t("auth.signed_in_at")}</dt>
+                <dd class="auth-time"><time datetime=${new Date(me.auth_time * 1000).toISOString()}>${new Date(me.auth_time * 1000).toLocaleString()}</time></dd>
+                <dt>${t("auth.methods")}</dt>
+                <dd class="amr">${me.amr.join(", ")}</dd>`
+            : nothing}
         </dl>
         ${this.problem ? html`<cs-error-banner .problem=${this.problem}></cs-error-banner>` : nothing}
         <div class="actions">
@@ -320,19 +359,21 @@ export class CsAccountPage extends LitElement {
 // ---- step-up ----
 
 /**
- * Password re-entry for `StepUpRequired` (§2.3 [R2]). Runs a full OPAQUE sign-in for the signed-in user and fires
- * `cs-step-up-done` on success; closing fires `cs-step-up-cancel`.
+ * Password re-entry for `StepUpRequired` (§2.3 [R2]). Runs `opaque/reauth/{start,finish}` (rev 7) on the current
+ * session, so no new session is created, and fires `cs-step-up-done` on success; closing fires `cs-step-up-cancel`.
  */
 export class CsStepUpDialog extends LitElement {
   static override properties = {
     open: { type: Boolean },
     user: { attribute: false },
     identity: { attribute: false },
+    authedClient: { attribute: false },
     busy: { state: true },
     failure: { state: true },
   };
   static override styles = pageStyles;
 
+  declare authedClient: ApiClient | undefined;
   declare open: boolean;
   declare user: SignedInUser | undefined;
   declare identity: IdentityDeps | undefined;
@@ -344,6 +385,7 @@ export class CsStepUpDialog extends LitElement {
     this.open = false;
     this.user = undefined;
     this.identity = undefined;
+    this.authedClient = undefined;
     this.busy = false;
     this.failure = undefined;
     new LocaleController(this);
@@ -367,13 +409,14 @@ export class CsStepUpDialog extends LitElement {
   async submit(): Promise<void> {
     const identity = this.identity;
     const user = this.user;
-    if (!identity || !user || this.busy) return;
+    const client = this.authedClient;
+    if (!identity || !user || !client || this.busy) return;
     const field = this.renderRoot.querySelector<HTMLElement & { value: string }>('cs-text-field[name="password"]');
     const password = field?.value ?? "";
     this.busy = true;
     this.failure = undefined;
     try {
-      await signIn(identity, user.tenant, user.login, password);
+      await reauthenticate(identity, client, user.tenant, user.login, password);
       if (field) field.value = "";
       this.open = false;
       this.dispatchEvent(new CustomEvent("cs-step-up-done", { bubbles: true, composed: true }));

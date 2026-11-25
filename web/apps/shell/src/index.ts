@@ -1,5 +1,5 @@
 // Web shell entry (spec §14.1).
-import { ApiClient, AuthSession, httpRefreshTransport, installTokens, workerOpaqueEngine } from "@cs/sdk";
+import { ApiClient, AuthSession, DpopKeyManager, httpRefreshTransport, installTokens, workerOpaqueEngine } from "@cs/sdk";
 import "./cs-shell-app";
 import { registerShellMessages } from "./messages";
 
@@ -9,11 +9,13 @@ registerShellMessages();
 // Base URL comes from configuration; by default the shell talks to its own origin.
 const configured = import.meta.env.VITE_CS_API_BASE_URL as string | undefined;
 const baseUrl = configured ?? window.location.origin;
-const client = new ApiClient({ baseUrl });
-
 // Identity (contract M1 §7): the access token lives only in this session object; refreshes use the cookie.
-const session = new AuthSession({ transport: httpRefreshTransport({ baseUrl }) });
-const authedClient = new ApiClient({ baseUrl, auth: session });
+// DPoP (rev 8): one non-extractable ES256 key per session in IndexedDB, shared by all tabs; every client that
+// sends login/finish, token/refresh or an access token signs a proof with it.
+const dpop = new DpopKeyManager();
+const client = new ApiClient({ baseUrl, dpop });
+const session = new AuthSession({ transport: httpRefreshTransport({ baseUrl, dpop }), dpop });
+const authedClient = new ApiClient({ baseUrl, auth: session, dpop });
 const worker = new Worker(new URL("./opaque-worker.ts", import.meta.url), { type: "module" });
 const engine = workerOpaqueEngine(worker);
 

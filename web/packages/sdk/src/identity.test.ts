@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { AuthSession, noAuthChannel, noCrossTabLock, type RefreshTransport } from "./auth";
 import { ApiClient } from "./client";
+import { DpopKeyManager, memoryDpopKeyStore } from "./dpop";
 import {
   IdentityInputError,
   LOGOUT_PATH,
@@ -9,7 +10,12 @@ import {
   OPAQUE_LOGIN_START_PATH,
   OPAQUE_REGISTER_FINISH_PATH,
   OPAQUE_REGISTER_START_PATH,
+  OPAQUE_REAUTH_FINISH_PATH,
+  OPAQUE_REAUTH_START_PATH,
+  ME_PATH,
+  getMe,
   isCanonicalTenantId,
+  reauthenticate,
   register,
   signIn,
   signOut,
@@ -255,5 +261,122 @@ describe("signOut (§3 [R10])", () => {
     const { d, authed } = signedInSession(fetchFn);
     await expect(signOut(authed, d.session)).rejects.toBeInstanceOf(ApiError);
     expect(d.session.state.authenticated).toBe(true);
+  });
+});
+
+// ---- rev 7 / rev 8 ----
+
+function dpopDeps(fetchFn: typeof fetch) {
+  const store = memoryDpopKeyStore();
+  const keys = new DpopKeyManager({ store, clock: instantClock });
+  const client = new ApiClient({ baseUrl: "https://cs.test", fetch: fetchFn, clock: instantClock, retryPolicy: new RetryPolicy(), dpop: keys });
+  const transport: RefreshTransport = { refresh: () => Promise.reject(new Error("no refresh in these tests")) };
+  const session = new AuthSession({ transport, lock: noCrossTabLock, channel: noAuthChannel, clock: instantClock, dpop: keys });
+  const authed = new ApiClient({ baseUrl: "https://cs.test", fetch: fetchFn, clock: instantClock, auth: session, dpop: keys });
+  return { client, engine: new FakeEngine(), session, authed, keys, store };
+}
+
+function proofPayload(h: Headers): Record<string, unknown> {
+  const p = (h.get("DPoP") ?? "").split(".")[1] ?? "";
+  return JSON.parse(new TextDecoder().decode(base64urlDecode(p))) as Record<string, unknown>;
+}
+
+describe("signIn with DPoP (rev 8)", () => {
+  it("creates a new session key before login/finish, proves possession on login/finish only, and sends tokens as DPoP", async () => {
+    const { requests, fetchFn } = fakeServer({ [OPAQUE_LOGIN_START_PATH]: loginStartOk, [OPAQUE_LOGIN_FINISH_PATH]: () => json(AUTH) });
+    const d = dpopDeps(fetchFn);
+    const old = await d.keys.rotate();
+    await signIn(d, TENANT, "alice", "pw");
+    const jwk = await d.keys.publicKey();
+    expect(jwk).toBeDefined();
+    expect(jwk).not.toEqual(old);
+    expect(requests[0]!.headers.get("DPoP")).toBeNull();
+    expect(proofPayload(requests[1]!.headers)).toMatchObject({ htm: "POST", htu: `https://cs.test${OPAQUE_LOGIN_FINISH_PATH}` });
+    expect(proofPayload(requests[1]!.headers)).not.toHaveProperty("ath");
+    expect(await d.session.authorization()).toBe("DPoP at.jws");
+  });
+
+  it("signOut deletes the session key", async () => {
+    const { fetchFn } = fakeServer({
+      [OPAQUE_LOGIN_START_PATH]: loginStartOk,
+      [OPAQUE_LOGIN_FINISH_PATH]: () => json(AUTH),
+      [LOGOUT_PATH]: () => new Response(null, { status: 204 }),
+    });
+    const d = dpopDeps(fetchFn);
+    await signIn(d, TENANT, "alice", "pw");
+    await signOut(d.authed, d.session);
+    expect(await d.store.get()).toBeUndefined();
+  });
+});
+
+describe("reauthenticate (rev 7 opaque/reauth/*: step-up on the existing session)", () => {
+  const reauthStartOk: Handler = () => json({ reauth_txn: "rtx", credential_response: base64urlEncode(new Uint8Array(320).fill(6)), ksf_params: KSF });
+
+  it("runs reauth/start + reauth/finish with the access token and proofs; creates no session and keeps the key", async () => {
+    const { requests, fetchFn } = fakeServer({
+      [OPAQUE_LOGIN_START_PATH]: loginStartOk,
+      [OPAQUE_LOGIN_FINISH_PATH]: () => json(AUTH),
+      [OPAQUE_REAUTH_START_PATH]: reauthStartOk,
+      [OPAQUE_REAUTH_FINISH_PATH]: () => new Response(null, { status: 204 }),
+    });
+    const d = dpopDeps(fetchFn);
+    await signIn(d, TENANT, "alice", "pw");
+    const keyBefore = await d.keys.publicKey();
+    const states: unknown[] = [];
+    d.session.subscribe((s) => states.push(s));
+    requests.length = 0;
+    await reauthenticate(d, d.authed, TENANT, "Alice", "pw");
+    expect(requests.map((q) => q.path)).toEqual([OPAQUE_REAUTH_START_PATH, OPAQUE_REAUTH_FINISH_PATH]);
+    expect(requests[0]!.body).toEqual({ credential_request: base64urlEncode(new Uint8Array(96).fill(1)) });
+    expect(requests[1]!.body).toEqual({ reauth_txn: "rtx", credential_finalization: base64urlEncode(new Uint8Array(64).fill(3)) });
+    for (const q of requests) {
+      expect(q.headers.get("Authorization")).toBe("DPoP at.jws");
+      expect(proofPayload(q.headers)).toHaveProperty("ath");
+    }
+    expect(d.engine.calls.at(-1)).toMatchObject({ kind: "login", tenant: TENANT, login: "alice", ksf: KSF });
+    // No new session: no login/finish, no session change, same key.
+    expect(states).toEqual([]);
+    expect(d.session.state.sessionId).toBe(AUTH.session_id);
+    expect(await d.keys.publicKey()).toEqual(keyBefore);
+    for (const pw of d.engine.passwords) expect(pw.every((b) => b === 0)).toBe(true);
+  });
+
+  it("refuses KSF parameters outside the rev 7 bounds before Argon2id runs", async () => {
+    const { requests, fetchFn } = fakeServer({
+      [OPAQUE_LOGIN_START_PATH]: loginStartOk,
+      [OPAQUE_LOGIN_FINISH_PATH]: () => json(AUTH),
+      [OPAQUE_REAUTH_START_PATH]: () =>
+        json({ reauth_txn: "rtx", credential_response: base64urlEncode(new Uint8Array(320)), ksf_params: { ...KSF, m_kib: 262145 } }),
+    });
+    const d = dpopDeps(fetchFn);
+    await signIn(d, TENANT, "alice", "pw");
+    const finishes = d.engine.calls.filter((c) => c.ksf !== undefined).length;
+    await expect(reauthenticate(d, d.authed, TENANT, "alice", "pw")).rejects.toMatchObject({ problem: { code: "internal" } });
+    expect(d.engine.calls.filter((c) => c.ksf !== undefined).length).toBe(finishes); // the KSF never ran
+    expect(requests.map((q) => q.path)).not.toContain(OPAQUE_REAUTH_FINISH_PATH);
+  });
+
+  it("a wrong password is `unauthenticated` and reauth/finish is not called", async () => {
+    const { requests, fetchFn } = fakeServer({ [OPAQUE_REAUTH_START_PATH]: reauthStartOk });
+    const d = dpopDeps(fetchFn);
+    d.engine.finishError = new OpaqueClientError("invalid_login");
+    await expect(reauthenticate(d, d.authed, TENANT, "alice", "bad")).rejects.toMatchObject({ problem: { code: "unauthenticated" } });
+    expect(requests.map((q) => q.path)).toEqual([OPAQUE_REAUTH_START_PATH]);
+  });
+});
+
+describe("getMe (rev 7 GET /api/v2/me)", () => {
+  const ME = { user_id: "u", tenant_id: TENANT, login: "alice", display_name: "", state: "active", amr: ["pwd"], auth_time: 1_700_000_000, sid: "s" };
+
+  it("decodes the contract shape", async () => {
+    const { fetchFn } = fakeServer({ [ME_PATH]: () => json(ME) });
+    expect(await getMe(dpopDeps(fetchFn).authed)).toEqual(ME);
+  });
+
+  it("rejects malformed bodies as internal", async () => {
+    for (const bad of [{ ...ME, amr: "pwd" }, { ...ME, auth_time: "x" }, { ...ME, sid: "" }, []]) {
+      const { fetchFn } = fakeServer({ [ME_PATH]: () => json(bad) });
+      await expect(getMe(dpopDeps(fetchFn).authed)).rejects.toMatchObject({ problem: { code: "internal" } });
+    }
   });
 });

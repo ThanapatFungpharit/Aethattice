@@ -3,6 +3,7 @@
 // refreshes within a tab and across tabs so that a rotated refresh token is never presented twice.
 // Knows only the HTTP contract (POST /api/v2/auth/token/refresh), never backend internals.
 import { ApiClient, type ApiClientOptions, type AuthHook } from "./client";
+import type { DpopKeyManager } from "./dpop";
 import { idempotencyKey as defaultIdempotencyKey } from "./idempotency";
 import { isApiError } from "./problem";
 import { systemClock, type Clock } from "./retry";
@@ -54,6 +55,7 @@ export interface RefreshTransport {
  * HTTP transport for `POST /api/v2/auth/token/refresh`. The browser sends the `__Secure-cs_rt` cookie, so the
  * API must be same-origin with the page. It builds its own ApiClient without an auth hook, so a 401 from the
  * refresh endpoint can never recurse into another refresh. ApiClient retries reuse the given key (D.3).
+ * With `dpop`, every attempt carries a fresh proof from the session key (rev 8: a bound refresh family needs one).
  */
 export function httpRefreshTransport(opts: Omit<ApiClientOptions, "auth" | "idempotencyKeyFactory">): RefreshTransport {
   const client = new ApiClient(opts);
@@ -62,6 +64,7 @@ export function httpRefreshTransport(opts: Omit<ApiClientOptions, "auth" | "idem
       const r = await client.post<AuthResult>(REFRESH_PATH, {
         idempotencyKey,
         decode: decodeAuthResult,
+        dpop: true,
         ...(signal !== undefined && { signal }),
       });
       return r.data;
@@ -277,6 +280,12 @@ export interface AuthSessionOptions {
   readonly idempotencyKeyFactory?: () => string;
   /** Default {@link PROACTIVE_REFRESH_LEEWAY_MS}. */
   readonly leewayMs?: number;
+  /**
+   * The session's DPoP key (M1 rev 8). When set, tokens are sent as `Authorization: DPoP <token>`, the key is
+   * deleted when the session ends (sign-out, or a refresh refused with `unauthenticated`), and the tab re-reads the
+   * shared key whenever another tab signs in or out. The same manager must be the ApiClients' `dpop` prover.
+   */
+  readonly dpop?: DpopKeyManager;
 }
 
 export interface AuthState {
@@ -319,6 +328,7 @@ export class AuthSession implements AuthHook {
   private readonly clock: Clock;
   private readonly newKey: () => string;
   private readonly leewayMs: number;
+  private readonly dpop: DpopKeyManager | undefined;
   private readonly unsubscribe: () => void;
   private readonly listeners = new Set<(state: AuthState) => void>();
 
@@ -336,6 +346,7 @@ export class AuthSession implements AuthHook {
     this.clock = opts.clock ?? systemClock;
     this.newKey = opts.idempotencyKeyFactory ?? defaultIdempotencyKey;
     this.leewayMs = opts.leewayMs ?? PROACTIVE_REFRESH_LEEWAY_MS;
+    this.dpop = opts.dpop;
     this.unsubscribe = this.channel.subscribe((m) => {
       this.onChannelMessage(m);
     });
@@ -363,9 +374,23 @@ export class AuthSession implements AuthHook {
     this.adopt(result.access_token, this.clock.now() + result.expires_in * 1000, result.session_id, true);
   }
 
-  /** Forgets the token locally and in the other tabs (e.g. after logout, §3 [R10]). */
-  signedOut(): void {
+  /** Forgets the token locally and in the other tabs (e.g. after logout, §3 [R10]) and deletes the DPoP key. */
+  async signedOut(): Promise<void> {
     this.clear(true);
+    await this.discardKey();
+  }
+
+  /**
+   * Runs `fn` under the cross-tab refresh lock. Sign-in uses it so that creating the session's DPoP key,
+   * `login/finish` and sharing the result cannot interleave with a refresh or a sign-in in another tab.
+   */
+  exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    return this.lock.run(fn);
+  }
+
+  /** The DPoP key manager, when the session is DPoP-bound. */
+  get dpopKeys(): DpopKeyManager | undefined {
+    return this.dpop;
   }
 
   /** Stops listening to the channel. */
@@ -383,7 +408,8 @@ export class AuthSession implements AuthHook {
   async authorization(): Promise<string | undefined> {
     if (this.accessToken !== undefined && this.needsRefresh()) await this.refresh();
     if (this.accessToken === undefined || this.clock.now() >= this.expiresAt) return undefined;
-    return `Bearer ${this.accessToken}`;
+    // Rev 8: a token bound to a key (cnf.jkt) is sent with the DPoP scheme; Bearer is refused for it.
+    return `${this.dpop ? "DPoP" : "Bearer"} ${this.accessToken}`;
   }
 
   /**
@@ -412,7 +438,11 @@ export class AuthSession implements AuthHook {
       } catch (e) {
         // `unauthenticated`: the refresh cookie is missing, expired, or its session was revoked (reuse).
         // The cookie is shared by all tabs, so they are all signed out.
-        if (isApiError(e) && e.problem.code === "unauthenticated") this.clear(true);
+        // Rev 8: the session has ended (revoked, reuse, or a proof from another key), so its DPoP key goes too.
+        if (isApiError(e) && e.problem.code === "unauthenticated") {
+          this.clear(true);
+          await this.discardKey();
+        }
         return false;
       }
       this.adopt(result.access_token, this.clock.now() + result.expires_in * 1000, result.session_id, true);
@@ -421,6 +451,8 @@ export class AuthSession implements AuthHook {
   }
 
   private onChannelMessage(m: AuthChannelMessage): void {
+    // Another tab signed in (new key) or out: re-read the shared key before the next proof.
+    if (m.type === "signed_out" || m.session_id !== this.sessionId) this.dpop?.invalidate();
     if (m.type === "signed_out") this.clear(false);
     else this.adopt(m.access_token, m.expires_at, m.session_id, false);
   }
@@ -443,6 +475,14 @@ export class AuthSession implements AuthHook {
     this.version++;
     if (share) this.channel.post({ type: "signed_out" });
     if (had || share) this.notify();
+  }
+
+  private async discardKey(): Promise<void> {
+    try {
+      await this.dpop?.discard();
+    } catch {
+      // Store unavailable: the key is useless without its session, and the next sign-in replaces it.
+    }
   }
 
   private notify(): void {

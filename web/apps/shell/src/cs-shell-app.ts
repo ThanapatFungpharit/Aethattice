@@ -187,7 +187,11 @@ export class CsShellApp extends LitElement {
     this.applyHash();
     this.unsubscribeSession = this.identity?.session.subscribe((s) => {
       // Signed out here or in another tab (or the refresh cookie was rejected).
-      if (!s.authenticated) this.user = undefined;
+      // Rev 8: a session that ended (revoked, reuse, refresh refused) goes back to sign-in.
+      if (!s.authenticated && this.user !== undefined) {
+        this.user = undefined;
+        if (this.route === "account") this.navigate("#/sign-in");
+      }
       this.requestUpdate();
     });
     void this.refreshReadiness();
@@ -303,6 +307,7 @@ export class CsShellApp extends LitElement {
             ?open=${this.stepUpOpen}
             .user=${this.user}
             .identity=${this.identity}
+            .authedClient=${this.authedClient}
             @cs-step-up-done=${() => {
               this.settleStepUp(true);
             }}
