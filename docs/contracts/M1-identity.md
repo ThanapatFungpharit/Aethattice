@@ -186,6 +186,11 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
   - **Administrator-assisted:** `cs admin recovery start` creates an email-method request with the waiting period.
   - **Cancel:** any session of the user can list pending requests (`GET /api/v2/me/recovery-requests`) and cancel one with `DELETE …/{id}`, which sets the state to `cancelled`.
   - **Completion:** unchanged ([R5]). `register/start {grant, login, registration_request}` → `register/finish` → normal sign-in.
+- (rev 10) **Timestamps and recovery requests.**
+  - Every timestamp field in M1 JSON bodies is an RFC 3339 UTC string, for example `created_at`, `last_seen_at`, `last_used_at` and `available_at`. JWT claims and the `auth_time` mirrored from them stay in unix seconds (RFC 7519).
+  - `GET /api/v2/me/recovery-requests` → `{items: [{id, method: "email"|"device_approval", state: "pending"|"granted", created_at, available_at, requester_user_agent}]}`. It is bounded and not paginated. `requester_user_agent` may be null; it helps the user tell whether a request is their own.
+  - `POST …/{id}/approve` and `DELETE …/{id}` each return `204`.
+  - The `status` body is `{token, code?}` (email) or `{recovery_txn}` (device approval). The response is `{state, available_at?, grant?, grant_expires_in?}`.
 - (rev 10) **WebAuthn and session wire shapes** (L3 JSON forms, binary as base64url without padding):
   - Passkey registration: `webauthn/register/start {}` (access token, DPoP, step-up) → `{registration_txn, public_key}`; `webauthn/register/finish {registration_txn, credential, label}` → `{id, label, created_at, prf}`.
   - Passwordless sign-in: `webauthn/login/start {tenant}` → `{login_txn, public_key}`, with discoverable credentials and empty `allowCredentials`; `webauthn/login/finish {login_txn, credential}` → §2.4 result, with a DPoP proof as for OPAQUE.
@@ -268,3 +273,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-25 rev 8 (TL, frontend DPoP questions): DPoP wire details (algorithms, no nonce in M1, binding of session and refresh family, `DPoP` auth scheme, `htu`, key lifetime).
 - 2026-11-25 rev 9 (TL, backend question): re-registration by a step-up session (password change and KSF/key upgrade), the `reregister` signal, and revocation of the user's other sessions on every re-registration.
 - 2026-11-26 rev 10 (TL, frontend proposal): recovery endpoints per method (code without a waiting period; email by link with a waiting period, plus a recovery code for MFA users; device approval; admin-assisted; cancel), and WebAuthn, passkey, session and recovery-code wire shapes.
+- 2026-11-26 rev 10 addendum: RFC 3339 timestamps in bodies; `me/recovery-requests` item shape; `status` body and response.
