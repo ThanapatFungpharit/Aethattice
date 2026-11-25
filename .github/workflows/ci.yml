@@ -7,8 +7,17 @@ jobs:
     env:
       # Same toolchain as the dev host, so rustfmt/clippy output matches. Overrides rust-toolchain.toml.
       RUSTUP_TOOLCHAIN: "1.99.1"
+      # Smaller test binaries: line tables only (enough for panic locations). The runner disk was
+      # exhausted by target/ + rust-cache + the YugabyteDB image (YB then refuses writes).
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v4
+      - name: Free runner disk space (unused preinstalled SDKs)
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h /
       - name: Start Valkey (same image as dev/docker-compose.yml; DPoP replay-store tests)
         run: docker run -d --name valkey -p 6379:6379 valkey/valkey:9.2.0-alpine
       - name: Start YugabyteDB (same image as dev/docker-compose.yml)
