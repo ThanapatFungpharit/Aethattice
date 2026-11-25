@@ -1217,7 +1217,11 @@ async fn revoked_session_access_token_refused_on_every_me_route() {
     exec(e.pool(), "UPDATE sessions SET generation = generation + 1").await;
     for r in routes {
         let (s, _, b) = e.req("GET", r, Some(&at), None, &[]).await;
-        assert_eq!(s, StatusCode::UNAUTHORIZED, "{r} after generation bump: {b}");
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "{r} after generation bump: {b}"
+        );
         assert_eq!(b["code"], "unauthenticated");
     }
     // Revoked session.
