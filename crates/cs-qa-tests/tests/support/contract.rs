@@ -47,7 +47,12 @@ fn ev_ops(e: OpsError) -> ErrorView {
 
 // ======================================================================= binary and config
 pub const DEPLOYMENT_DOMAIN: &str = "qa.example";
-/// Contract rev 2: no JSON-body routes in M0 (malformed-body test moved to M1).
+/// Contract rev 2: no JSON-body routes in M0 (malformed-body test moved to M1). M1 contract
+/// §2.1: `opaque/login/start` takes a JSON body and is mounted whenever the identity domain and
+/// a KMS are configured (the body is parsed before any database access).
+#[cfg(feature = "m1-contract")]
+pub const JSON_POST_ROUTE: Option<&str> = Some("/api/v2/auth/opaque/login/start");
+#[cfg(not(feature = "m1-contract"))]
 pub const JSON_POST_ROUTE: Option<&str> = None;
 
 pub fn server_args(config: &Path) -> Vec<String> {

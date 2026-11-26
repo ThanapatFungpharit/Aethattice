@@ -1059,25 +1059,37 @@ dependencies = [
 name = "cs-qa-tests"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
+ "ciborium",
  "cs-api",
  "cs-common",
  "cs-crypto",
  "cs-db",
  "cs-identity",
+ "cs-identity-wire",
  "cs-kms",
  "cs-ops",
+ "ed25519-dalek 3.0.0",
  "futures",
  "hex",
  "http",
+ "http-body-util",
+ "p256 0.13.2",
  "proptest",
+ "rand_core 0.6.4",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "sqlx",
  "tempfile",
  "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -3211,6 +3223,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9807af0e638c12e753aa1b4e601791bf2a8f71274023c8bbeec12fc149950857"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

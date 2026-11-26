@@ -1,4 +1,27 @@
-//! Database fixtures. Every test creates its own uniquely named databases and drops them.
+//! Database fixtures: leased, reused and reset databases (no CREATE/DROP DATABASE per test).
+//!
+//! On YugabyteDB, `CREATE DATABASE` / `DROP DATABASE` per test bloats the master's sys catalog
+//! and degrades the whole dev cluster (docs/design/M0-backend.md decision record; M0 gate F-4).
+//! The QA harness therefore uses the same lease-and-reset approach as `cs_db::testing`, with
+//! its own pool, so QA never depends on engineer test code:
+//!
+//! * **Pool.** Up to `CS_QA_POOL_SIZE` (default 24) databases named `qa_pool_<n>`, created once
+//!   on first use (lowest free index first, so only the peak concurrency is ever created) and
+//!   never dropped by the harness.
+//! * **Lease.** `TestDb::create` takes a session-level advisory lock (class "qatp") on a
+//!   dedicated admin connection. It is cross-process (other test binaries and worktrees share
+//!   the pool) and dies with the connection, so a crashed test never pins a database. When
+//!   every database is leased the test waits up to `CS_QA_POOL_WAIT_SECS` (default 900 s).
+//! * **Reset.** `drop_now` re-enables connections, terminates leftover sessions, drops every
+//!   non-system schema (`DROP SCHEMA … CASCADE`), re-creates `public` and **verifies the
+//!   database is empty** before the lease is released. A failure is loud (`QA HARNESS LEAK`,
+//!   counted in [`LEAKED`], and the test fails). A database found non-empty at lease time (its
+//!   previous holder crashed) is reset first, with a warning. A `TestDb` dropped without
+//!   `drop_now` (panic path) is reset from a fallback thread.
+//! * `CS_QA_POOL_LOG=<file>` appends one line per `create` / `lease` / `reset` / `release`; the
+//!   gate report counts catalog churn from it.
+//!
+//! The harness only ever touches databases whose name starts with [`POOL_PREFIX`].
 //!
 //! Environment:
 //! * `CS_TEST_DATABASE_URL` — admin URL (e.g. `postgres://yugabyte@localhost:5433/yugabyte`).
@@ -12,13 +35,21 @@ use tokio::sync::OnceCell;
 
 static ADMIN: OnceCell<Option<String>> = OnceCell::const_new();
 static CREATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static DDL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Prefix of every database the QA harness touches.
+pub const POOL_PREFIX: &str = "qa_pool_";
+const DEFAULT_POOL_SIZE: u32 = 24;
+const DEFAULT_POOL_WAIT_SECS: u64 = 900;
+/// Advisory-lock class for QA pool leases ("qatp"); distinct from `cs_db::testing` ("cstp").
+const LEASE_LOCK_CLASS: i32 = 0x7161_7470;
+const RESET_ATTEMPTS: u32 = 8;
 
 /// YugabyteDB DDL contends on the cluster-wide catalog (40001) when tests running in parallel
 /// migrate their own databases at the same time. Fixture setup (migrations, QA tables) holds
-/// this guard; it shares the lock with database creation, so callers must not hold it while
-/// calling `TestDb::create`.
+/// this guard.
 pub async fn ddl_guard() -> tokio::sync::MutexGuard<'static, ()> {
-    CREATE_LOCK.lock().await
+    DDL_LOCK.lock().await
 }
 
 fn require_db() -> bool {
@@ -86,53 +117,274 @@ pub fn with_db_name(url: &str, db: &str) -> String {
     }
 }
 
-/// A uniquely named database owned by one test.
+fn pool_size() -> u32 {
+    std::env::var("CS_QA_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_POOL_SIZE)
+}
+
+fn pool_wait() -> Duration {
+    Duration::from_secs(
+        std::env::var("CS_QA_POOL_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_POOL_WAIT_SECS),
+    )
+}
+
+/// One line per pool event (`create`, `lease`, `reset`, `release`) to `$CS_QA_POOL_LOG`.
+fn churn_log(event: &str, name: &str) {
+    use std::io::Write as _;
+    if let Ok(path) = std::env::var("CS_QA_POOL_LOG")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    {
+        // One write(2) per line: O_APPEND keeps concurrent writers' lines intact.
+        let _ = f.write_all(format!("{event} {name}\n").as_bytes());
+    }
+}
+
+/// Lease key: FNV-1a (stable across processes and toolchains, unlike `DefaultHasher`).
+fn lease_key(name: &str) -> i32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for x in name.as_bytes() {
+        h ^= u64::from(*x);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    let b = h.to_le_bytes();
+    i32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+async fn conn(url: &str) -> Result<PgConnection, String> {
+    PgConnection::connect(url).await.map_err(|e| e.to_string())
+}
+
+/// User objects left in the database: relations, types and functions in `public`, plus any
+/// non-system schema.
+async fn leftover_objects(c: &mut PgConnection) -> Result<i64, String> {
+    sqlx::query_scalar(
+        "SELECT \
+           (SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace) \
+         + (SELECT count(*) FROM pg_type WHERE typnamespace = 'public'::regnamespace) \
+         + (SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace) \
+         + (SELECT count(*) FROM pg_namespace WHERE nspname NOT IN \
+              ('public', 'information_schema', 'pg_catalog', 'pg_toast') \
+              AND nspname NOT LIKE 'pg\\_temp\\_%' AND nspname NOT LIKE 'pg\\_toast\\_temp\\_%')",
+    )
+    .fetch_one(c)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+async fn enable_connections(admin: &str, name: &str) {
+    if let Ok(mut c) = conn(admin).await {
+        let allowed: bool =
+            sqlx::query_scalar("SELECT datallowconn FROM pg_database WHERE datname = $1")
+                .bind(name)
+                .fetch_optional(&mut c)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(true);
+        if !allowed {
+            let _ = sqlx::query(AssertSqlSafe(format!(
+                "ALTER DATABASE {name} ALLOW_CONNECTIONS true"
+            )))
+            .execute(&mut c)
+            .await;
+        }
+        let _ = c.close().await;
+    }
+}
+
+/// Create pool database `name` unless it exists (only while holding its lease).
+async fn ensure_database(admin: &str, name: &str) -> Result<(), String> {
+    let _guard = CREATE_LOCK.lock().await;
+    let mut last = String::new();
+    for attempt in 1..=30u64 {
+        match conn(admin).await {
+            Ok(mut c) => {
+                // An inspection error must never be read as "missing": that turned a degraded
+                // cluster into a CREATE retry storm (dozens of failed CREATEs for existing pool
+                // databases, 2026-11-26 full run). Retry the inspection instead.
+                let exists: bool = match sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
+                )
+                .bind(name)
+                .fetch_one(&mut c)
+                .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        last = e.to_string();
+                        let _ = c.close().await;
+                        tokio::time::sleep(Duration::from_millis(500 * attempt.min(20))).await;
+                        continue;
+                    }
+                };
+                if exists {
+                    let _ = c.close().await;
+                    // A previous holder may have disabled connections (readiness stimulus)
+                    // and crashed before its reset.
+                    enable_connections(admin, name).await;
+                    if let Ok(t) = conn(&with_db_name(admin, name)).await {
+                        let _ = t.close().await;
+                        return Ok(());
+                    }
+                } else {
+                    churn_log("create", name);
+                    let r = sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}")))
+                        .execute(&mut c)
+                        .await;
+                    let _ = c.close().await;
+                    match r {
+                        // Re-check through pg_database on the next iteration.
+                        Ok(_) => continue,
+                        Err(e) => {
+                            last = e.to_string();
+                            eprintln!("CREATE DATABASE {name} attempt {attempt}: {last}");
+                        }
+                    }
+                }
+            }
+            Err(e) => last = e,
+        }
+        tokio::time::sleep(Duration::from_millis(500 * attempt.min(20))).await;
+    }
+    Err(format!(
+        "CREATE DATABASE {name} failed after retries: {last}"
+    ))
+}
+
+/// Drop every object in pool database `name` and verify it is empty.
+async fn reset_database(admin: &str, name: &str) -> Result<(), String> {
+    if !name.starts_with(POOL_PREFIX) {
+        return Err(format!("refusing to reset {name}: not a QA pool database"));
+    }
+    let url = with_db_name(admin, name);
+    let mut last = String::from("no attempt made");
+    for attempt in 1..=RESET_ATTEMPTS {
+        enable_connections(admin, name).await;
+        if let Ok(mut a) = conn(admin).await {
+            let _ = sqlx::query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = $1 AND pid <> pg_backend_pid()",
+            )
+            .bind(name)
+            .execute(&mut a)
+            .await;
+            let _ = a.close().await;
+        }
+        match conn(&url).await {
+            Ok(mut c) => {
+                if let Ok(0) = leftover_objects(&mut c).await {
+                    let _ = c.close().await;
+                    return Ok(());
+                }
+                churn_log("reset", name);
+                let schemas: Vec<String> = sqlx::query_scalar(
+                    "SELECT nspname::text FROM pg_namespace WHERE nspname NOT IN \
+                       ('information_schema', 'pg_catalog', 'pg_toast') \
+                       AND nspname NOT LIKE 'pg\\_temp\\_%' \
+                       AND nspname NOT LIKE 'pg\\_toast\\_temp\\_%'",
+                )
+                .fetch_all(&mut c)
+                .await
+                .unwrap_or_else(|_| vec!["public".to_owned()]);
+                let mut sql = String::new();
+                for s in &schemas {
+                    sql.push_str(&format!("DROP SCHEMA IF EXISTS \"{s}\" CASCADE;"));
+                }
+                sql.push_str("CREATE SCHEMA IF NOT EXISTS public;");
+                if let Err(e) = sqlx::raw_sql(AssertSqlSafe(sql)).execute(&mut c).await {
+                    last = format!("reset failed: {e}");
+                }
+                match leftover_objects(&mut c).await {
+                    Ok(0) => {
+                        let _ = c.close().await;
+                        return Ok(());
+                    }
+                    Ok(n) => last = format!("{last}; {n} objects remain"),
+                    Err(e) => last = format!("verification failed: {e}"),
+                }
+                let _ = c.close().await;
+            }
+            Err(e) => last = e,
+        }
+        tokio::time::sleep(Duration::from_secs(attempt.min(10).into())).await;
+    }
+    Err(format!(
+        "QA pool database {name} could not be reset after {RESET_ATTEMPTS} attempts ({last})"
+    ))
+}
+
+/// A leased pool database owned by one test until `drop_now`.
 #[derive(Debug)]
 pub struct TestDb {
     pub name: String,
     pub url: String,
     admin: String,
-    dropped: bool,
+    /// The admin session holding the advisory lock (the lease).
+    lease: Option<PgConnection>,
 }
 
 impl TestDb {
-    /// Create `qa_<label>_<random>`. Labels must be `[a-z0-9_]`.
+    /// Lease an empty pool database. `label` (`[a-z0-9_]`) names the user in the churn log.
     pub async fn create(admin: &str, label: &str) -> TestDb {
         assert!(
             label
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         );
-        // YugabyteDB DDL on the shared catalog conflicts under concurrency (40001 "could not
-        // serialize access"), and a failed CREATE can leave the name half-created. So creates
-        // are serialized within this process, each attempt uses a fresh name, and a failed
-        // name is dropped best-effort.
-        let _guard = CREATE_LOCK.lock().await;
-        let mut c = PgConnection::connect(admin).await.expect("admin connect");
-        let mut attempt: u64 = 0;
-        let name = loop {
-            let suffix = uuid::Uuid::new_v4().simple().to_string();
-            let name = format!("qa_{label}_{}", &suffix[..12]);
-            match sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}")))
-                .execute(&mut c)
-                .await
-            {
-                Ok(_) => break name,
-                Err(e) if attempt < 10 => {
-                    attempt += 1;
-                    eprintln!("CREATE DATABASE {name} attempt {attempt} failed: {e}");
-                    drop_database_unlocked(admin, &name).await;
-                    tokio::time::sleep(Duration::from_millis(300 * attempt)).await;
+        let size = pool_size();
+        let deadline = Instant::now() + pool_wait();
+        let mut lc = conn(admin).await.expect("admin connect (lease session)");
+        loop {
+            for n in 0..size {
+                let name = format!("{POOL_PREFIX}{n}");
+                let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, $2)")
+                    .bind(LEASE_LOCK_CLASS)
+                    .bind(lease_key(&name))
+                    .fetch_one(&mut lc)
+                    .await
+                    .unwrap_or_else(|e| panic!("lease lock on {name}: {e}"));
+                if !got {
+                    continue;
                 }
-                Err(e) => panic!("CREATE DATABASE {name}: {e}"),
+                churn_log("lease", &format!("{name} {label}"));
+                ensure_database(admin, &name)
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"));
+                let url = with_db_name(admin, &name);
+                let mut c = conn(&url).await.expect("connect leased database");
+                let left = leftover_objects(&mut c).await.unwrap_or(1);
+                let _ = c.close().await;
+                if left != 0 {
+                    eprintln!(
+                        "WARNING: QA pool database {name} was not reset by its previous \
+                         holder; resetting it now"
+                    );
+                    reset_database(admin, &name)
+                        .await
+                        .unwrap_or_else(|e| panic!("{e}"));
+                }
+                return TestDb {
+                    name,
+                    url,
+                    admin: admin.to_string(),
+                    lease: Some(lc),
+                };
             }
-        };
-        let _ = c.close().await;
-        TestDb {
-            url: with_db_name(admin, &name),
-            name,
-            admin: admin.to_string(),
-            dropped: false,
+            assert!(
+                Instant::now() < deadline,
+                "no free QA pool database after {:?} ({size} leased; raise CS_QA_POOL_SIZE)",
+                pool_wait()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -160,130 +412,84 @@ impl TestDb {
         v
     }
 
-    /// Drop several databases concurrently (on YugabyteDB concurrent DROPs complete in the same
-    /// barrier cycle, so this is much faster than dropping them one after another).
+    /// Make the database refuse new connections and end the existing ones (readiness
+    /// stimulus "a domain database disappears"). The reset re-enables connections.
+    pub async fn make_unavailable(&self) {
+        let mut c = conn(&self.admin).await.expect("admin connect");
+        sqlx::query(AssertSqlSafe(format!(
+            "ALTER DATABASE {} ALLOW_CONNECTIONS false",
+            self.name
+        )))
+        .execute(&mut c)
+        .await
+        .expect("disable connections");
+        let _ = sqlx::query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = $1 AND pid <> pg_backend_pid()",
+        )
+        .bind(&self.name)
+        .execute(&mut c)
+        .await;
+        let _ = c.close().await;
+    }
+
+    /// Reset several databases concurrently and release their leases.
     pub async fn drop_all(dbs: Vec<TestDb>) {
         futures::future::join_all(dbs.into_iter().map(TestDb::drop_now)).await;
     }
 
-    /// Drop this database now, or, with `CS_QA_DEFER_DROP=1`, record it for a batch cleanup
-    /// after the run (on a degraded YugabyteDB a single DROP DATABASE can take minutes). The
-    /// gate's leftover check (docs/qa/M0-gate.md §3.5) runs after that cleanup.
+    /// Reset this database (verified empty) and release the lease. Fails the test loudly if
+    /// the reset fails (the database would carry state into the next test).
     pub async fn drop_now(mut self) {
-        if defer_drop() {
-            record_deferred(&self.name);
-            self.dropped = true;
-            return;
+        let lease = self.lease.take();
+        let r = reset_database(&self.admin, &self.name).await;
+        if let Some(l) = lease {
+            let _ = l.close().await;
         }
-        self.drop_forced().await;
-    }
-
-    /// Always drops immediately and verifies, regardless of `CS_QA_DEFER_DROP` (used by the
-    /// harness self-test so drop correctness is always exercised).
-    pub async fn drop_forced(mut self) {
-        let before = LEAKED.load(std::sync::atomic::Ordering::SeqCst);
-        drop_database(&self.admin, &self.name).await;
-        self.dropped = true;
-        assert_eq!(
-            LEAKED.load(std::sync::atomic::Ordering::SeqCst),
-            before,
-            "QA harness could not drop test database {} (would leak)",
-            self.name
-        );
-    }
-}
-
-/// Drop a test database: retried, verified and time-bounded. A database that still exists
-/// afterwards is reported loudly (`QA HARNESS LEAK`) instead of being silently leaked; leaked
-/// databases slow the whole cluster and skew timing-sensitive tests. Not serialized with the
-/// harness lock: a stalled DROP must never block every other test.
-async fn drop_database(admin: &str, name: &str) {
-    drop_database_unlocked(admin, name).await;
-}
-
-/// One attempt: terminate attached backends, DROP, then verify. On the dev YugabyteDB
-/// (2026.1) a DROP DATABASE waits on a cluster-wide ProcSignalBarrier and was measured at
-/// 0.1–98 s (typically ~60 s after a cluster restart), so no statement timeout is set: cancelling
-/// a slow DROP only restarts the wait. The caller bounds each attempt instead.
-async fn drop_attempt(admin: &str, name: &str) -> Result<bool, String> {
-    let mut c = PgConnection::connect(admin)
-        .await
-        .map_err(|e| e.to_string())?;
-    let _ = sqlx::query(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-         WHERE datname = $1 AND pid <> pg_backend_pid()",
-    )
-    .bind(name)
-    .execute(&mut c)
-    .await;
-
-    let r = sqlx::query(AssertSqlSafe(format!(
-        "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
-    )))
-    .execute(&mut c)
-    .await;
-    let gone = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pg_database WHERE datname = $1")
-        .bind(name)
-        .fetch_one(&mut c)
-        .await
-        .map(|n| n == 0)
-        .map_err(|e| e.to_string())?;
-    let _ = c.close().await;
-    match (gone, r) {
-        (true, _) => Ok(true),
-        (false, Err(e)) => Err(e.to_string()),
-        (false, Ok(_)) => Ok(false),
-    }
-}
-
-async fn drop_database_unlocked(admin: &str, name: &str) {
-    // On a healthy cluster DROP is fast but often aborts with 40001 ("could not serialize
-    // access due to concurrent update") while parallel tests run catalog DDL. Retry with a
-    // capped exponential backoff, de-synchronized per database so concurrent drops do not
-    // collide again in lockstep (5 attempts / ~3 s was not enough: TL gate rerun 2026-11-21).
-    use std::hash::{Hash as _, Hasher as _};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut h);
-    let spread = h.finish() % 250;
-    let mut last = String::new();
-    for attempt in 0..30u64 {
-        match tokio::time::timeout(Duration::from_secs(180), drop_attempt(admin, name)).await {
-            Ok(Ok(true)) => return,
-            Ok(Ok(false)) => last = "still present".into(),
-            Ok(Err(e)) => last = e,
-            Err(_) => last = "drop attempt timed out after 180 s".into(),
+        churn_log("release", &self.name);
+        if let Err(e) = r {
+            eprintln!("QA HARNESS LEAK: {e}");
+            LEAKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("QA HARNESS LEAK: {e}");
         }
-        let backoff = (250u64 << attempt.min(5)).min(5_000) + (spread * (attempt + 1)) % 500;
-        tokio::time::sleep(Duration::from_millis(backoff)).await;
     }
-    eprintln!("QA HARNESS LEAK: could not drop test database {name}: {last}");
-    LEAKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    /// Whether this value still holds its lease (harness self-test).
+    pub fn is_leased(&self) -> bool {
+        self.lease.is_some()
+    }
 }
 
-/// Number of test databases this process failed to drop (checked by the harness self-test).
+/// Number of pool databases this process failed to reset (checked by the harness self-test).
 pub static LEAKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl Drop for TestDb {
     fn drop(&mut self) {
-        if self.dropped {
+        let Some(lease) = self.lease.take() else {
             return;
-        }
-        if defer_drop() {
-            record_deferred(&self.name);
-            return;
-        }
-        // Best effort when a test panics before `drop_now`: drop on a fresh runtime/thread.
+        };
+        // A test panicked (or forgot `drop_now`): reset from a fresh runtime/thread while the
+        // lease is still held, then release it.
         let admin = self.admin.clone();
         let name = self.name.clone();
-        let _ = std::thread::spawn(move || {
-            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        let r = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-            {
-                rt.block_on(drop_database(&admin, &name));
-            }
+                .map_err(|e| e.to_string())?;
+            rt.block_on(reset_database(&admin, &name))
         })
-        .join();
+        .join()
+        .unwrap_or_else(|_| Err("reset thread panicked".into()));
+        drop(lease);
+        churn_log("release", &self.name);
+        if let Err(e) = r {
+            eprintln!("QA HARNESS LEAK: {e}");
+            LEAKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !std::thread::panicking() {
+                panic!("QA HARNESS LEAK: {e}");
+            }
+        }
     }
 }
 
@@ -294,7 +500,7 @@ pub fn unreachable_url(db: &str) -> String {
 
 /// Run QA fixture SQL (test-only DDL/DML, never product schema). YugabyteDB aborts DDL with
 /// 40001 when it races catalog changes made by tests running in parallel, so 40001 is retried
-/// (bounded). Every fixture statement is idempotent or runs on a fresh database.
+/// (bounded). Every fixture statement is idempotent or runs on an empty database.
 pub async fn fixture_sql(url: &str, sql: &str) -> Result<(), String> {
     let mut attempt: u64 = 0;
     loop {
@@ -315,30 +521,5 @@ pub async fn fixture_sql(url: &str, sql: &str) -> Result<(), String> {
             }
             Err(e) => return Err(e.to_string()),
         }
-    }
-}
-
-/// `CS_QA_DEFER_DROP=1`: record test databases instead of dropping them (batch cleanup later).
-pub fn defer_drop() -> bool {
-    std::env::var("CS_QA_DEFER_DROP")
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
-
-/// Append a database name to `$CS_QA_DEFER_FILE` (default `target/qa-deferred-drops.txt`).
-fn record_deferred(name: &str) {
-    use std::io::Write as _;
-    let path = std::env::var("CS_QA_DEFER_FILE").unwrap_or_else(|_| {
-        format!(
-            "{}/../../target/qa-deferred-drops.txt",
-            env!("CARGO_MANIFEST_DIR")
-        )
-    });
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{name}");
     }
 }
