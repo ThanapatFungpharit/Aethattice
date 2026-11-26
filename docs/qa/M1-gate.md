@@ -104,7 +104,7 @@ Recorded by QA on `m1/qa` (base `milestone/m1-identity` c88e83c, merged with 86e
 
 Measured on the binaries that completed in the full run (config through m1): 57 leases, 1 CREATE (a pool database not needed before), 0 DROP. The old harness would have issued 57 CREATE and 57 DROP for the same binaries. The M0 binaries that did not complete (migrations, readiness, sagas, outbox) add about 40 more leases, which means about 40 more CREATE+DROP pairs under the old harness. **Harness defect found and fixed** during the cut-off rerun: a failed `pg_database` inspection on the degraded cluster was read as "database missing". That produced 127 failed CREATE attempts for existing pool databases; none of them succeeded, and nothing was dropped. An inspection error now retries the inspection, never a CREATE. Method: `CS_QA_POOL_LOG` counts `create`, `lease`, `reset` and `release`. Each lease replaces one CREATE and one DROP of the old harness. QA itself created and dropped one probe database (`qa_probe_allowconn`) to confirm that `ALLOW_CONNECTIONS` works on YugabyteDB 2026.1.
 
-### 7.2 Findings against the implementation (reported to the TL; all accepted, fixes in progress)
+### 7.2 Findings against the implementation (reported to the TL; all accepted and fixed, see §7.5)
 
 | ID | Severity | Finding | Test (reproduction) | Ruling |
 |---|---|---|---|---|
@@ -127,3 +127,48 @@ Updated rows: 5.2-4, 5.2-5, 5.5-5, 5.5-6, 5.5-8, 5.6-4, 15.4-2, 18.5-2, CT.M1-3,
 ### 7.4 Recommendation
 
 **Do not pass the M1 gate yet.** F-1, F-2, F-3 and F-4 are open blockers. All other M1 QA tests pass, including the complete M0-gate §6.1 negative list, [R5] atomicity, cross-tenant isolation, step-up and enrolment scope, and the §9 log scan. Once the backend slice lands, rerun §3.3 three times (§4) and then §2. The suite needs no change for the rev 14 rulings: no test relies on Valkey-first replay semantics.
+
+### 7.5 Team Leader closure (2026-11-26)
+
+The fixes and reruns after QA's report were done on `milestone/m1-identity`. The final verification ran on the merged tree at d525071, plus the change that enables the e2e replay test.
+
+**Findings**
+
+| Finding | Status | Fix | Verified by |
+|---|---|---|---|
+| F-1, DPoP replay across nodes | fixed | rev 14: `dpop_jti` is the only authoritative replay record; Valkey is off the replay path | `dpop::proof_replay_rejected_across_nodes` |
+| F-2, recovery-email timing oracle | fixed | rev 13: the notifier runs off the request path in a bounded queue | `enumeration::recovery_email_202_independent_of_delivery_time` |
+| F-3, revoked session's token accepted | fixed | rev 14: one shared extractor checks the session at `sgen` on every authenticated route | `refresh::revoked_session_access_token_refused_on_every_route`, all 19 routes |
+| F-4, `[R7]` dev log sink and SMTP notifier | fixed | `--dev` on `serve` and `check-config`, plus `[notifier]` config | engineer tests |
+
+**Further defects found by the e2e suite (all fixed)**
+- `/me` `display_name` and `/me/sessions` `last_seen_at` can be null (rev 14 and rev 15 addenda).
+- `decodePasskey` required a field the server may omit.
+- The SDK retried a 2xx response whose body failed to decode. It now raises a non-retryable `ResponseDecodeError` (rev 15).
+- Identity writes did not replay by `Idempotency-Key` as spec D.3 requires. They now do (rev 15 and 16, P1–P4), with secret-bearing results sealed and tombstoned after the secret's lifetime.
+
+**Final verification on the dev host**
+- `scripts/ci.sh --with-db` with `--no-fail-fast` and 2 test threads, because the host is memory-constrained:
+  - Rust: 414 passed, 0 failed;
+  - web unit tests: 418/418;
+  - e2e (the real SDK and WASM against `cs serve --dev`): 16/16, including the `Idempotency-Key` replay;
+  - trace-lint: OK.
+- QA suite (`cs-qa-tests --features m0-contract,m1-contract --no-fail-fast`): 160 passed, 0 failed, 0 ignored. `malformed_json_body_returns_400_problem` now runs and passes.
+- QA harness: steady state is 1 CREATE and 0 DROP per run (previously about 100 of each).
+- The opaque-wasm freshness check is skipped on the dev host, because the tool was removed by a reboot. It is enforced in GitHub Actions.
+
+**Plan gate items (plan §5, M1)**
+- The auth negative suite, token tampering and replay, refresh reuse detection, enumeration resistance and cross-tenant identity isolation all pass in the QA m1-contract suite.
+- The contract §9 additions pass: the M0-gate §6.1 negative list, the malformed-JSON test, and the log scan for secrets, including `cs serve` at TRACE.
+
+**Traceability**
+- No M1 row remains `in-progress`, `implemented` or `deferred(M1)`.
+- Rows outside the approved M1 scope were moved to the milestone that delivers them, with reasons (commit 326e08b). Milestones M4–M9 are provisional.
+
+**Known coverage limits** (recorded here, not gate blockers)
+- Replay of identity writes has dedicated tests on the main routes. These routes share the code path but have no dedicated test: webauthn login/assert finish, mfa/recovery-code, reauth, passkey delete, recovery status, approve and cancel.
+- The e2e suite runs in Node. It does not exercise the browser's own Web Locks, BroadcastChannel, IndexedDB or cookie store across real tabs, or a hardware authenticator. The email and device-approval recovery flows are covered by the QA suite, not by e2e.
+- Recovery email delivery is best effort and non-durable (rev 13). Durable delivery is an M4 follow-up.
+- Durability: this is a single-node dev host with one NVMe, so there is one failure domain. Nothing in M1 claims more. Nothing is `production-ready`.
+
+**Gate decision:** `PASS` (Team Leader, 2026-11-26), subject to GitHub Actions passing on the final commit. QA's own re-verification of the fixes ran as the QA suite above; QA may re-review when available.
