@@ -554,6 +554,119 @@ describe("localStorage lease fallback (M1 §3 [R1])", () => {
   });
 });
 
+/**
+ * BroadcastChannel whose delivery lags the lock release, as on a slow runner: messages are delivered `delayMs`
+ * after posting (macrotask), or never (`drop`), while the next lock holder runs as soon as the lock is released.
+ */
+class LaggingHub {
+  posted: AuthChannelMessage[] = [];
+  private subs: { id: number; h: (m: AuthChannelMessage) => void }[] = [];
+  private next = 0;
+  constructor(private readonly delayMs: number | "drop") {}
+  channel(): AuthChannel {
+    const id = this.next++;
+    return {
+      post: (m) => {
+        this.posted.push(m);
+        if (this.delayMs === "drop") return;
+        const targets = this.subs.filter((s) => s.id !== id);
+        setTimeout(() => {
+          for (const s of targets) s.h(m);
+        }, this.delayMs);
+      },
+      subscribe: (h) => {
+        const entry = { id, h };
+        this.subs.push(entry);
+        return () => {
+          this.subs = this.subs.filter((s) => s !== entry);
+        };
+      },
+    };
+  }
+}
+
+describe("broadcast delivered after the lock release (WEB.M1-1, M1 §3 [R1], CI race)", () => {
+  const fast = { clock: systemClock, leaseMs: 1_000, settleMs: 5, pollMs: 2 } as const;
+  const modes = {
+    "web-locks": (storage: StorageLike): (() => RefreshLock) => {
+      const locks = new FakeLockManager();
+      return () => webLocksRefreshLock(locks, REFRESH_LOCK_NAME, storage);
+    },
+    lease: (storage: StorageLike): (() => RefreshLock) => {
+      let n = 0;
+      return () => localStorageLeaseLock(storage, { ...fast, ownerId: `tab-${n++}` });
+    },
+  } as const;
+
+  for (const mode of ["web-locks", "lease"] as const) {
+    function setup(delay: number | "drop", opts: { clock?: Clock; sharedTokenWaitMs?: number } = {}) {
+      const storage = new MemoryStorage();
+      const hub = new LaggingHub(delay);
+      const server = new FakeRefreshServer(opts.clock ?? systemClock, 5);
+      const lock = modes[mode](storage);
+      const mk = (transport: RefreshTransport = server.transport()): AuthSession =>
+        new AuthSession({
+          transport,
+          lock: lock(),
+          channel: hub.channel(),
+          idempotencyKeyFactory: keys,
+          ...(opts.clock !== undefined && { clock: opts.clock }),
+          ...(opts.sharedTokenWaitMs !== undefined && { sharedTokenWaitMs: opts.sharedTokenWaitMs }),
+        });
+      return { storage, hub, server, mk, a: mk(), b: mk() };
+    }
+
+    it(`${mode}: the waiting tab sees the generation advance and waits for the token instead of refreshing`, async () => {
+      const { server, a, b, storage } = setup(30);
+      const res = await Promise.all([a.refresh(), b.refresh()]);
+      expect(res).toEqual([true, true]);
+      expect(server.calls).toHaveLength(1);
+      expect(server.reuseDetected).toBe(0);
+      expect(await a.authorization()).toBe("Bearer at-1");
+      expect(await b.authorization()).toBe("Bearer at-1");
+      // The marker holds a generation id and an expiry only, never a token.
+      for (const v of storage.data.values()) expect(v.includes("at-") || v.includes("rt-")).toBe(false);
+    });
+
+    it(`${mode}: when the announced token never arrives, the waiter refreshes exactly once after the bounded wait`, async () => {
+      const { server, a, b } = setup("drop", { sharedTokenWaitMs: 50 });
+      const started = Date.now();
+      const res = await Promise.all([a.refresh(), b.refresh()]);
+      expect(res).toEqual([true, true]);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(45);
+      expect(server.calls.map((c) => c.cookie)).toEqual(["rt-0", "rt-1"]);
+      expect(server.reuseDetected).toBe(0);
+      expect(await b.authorization()).toBe("Bearer at-2");
+    });
+
+    it(`${mode}: a holder that fails (or crashes) without announcing a refresh does not make the waiter wait`, async () => {
+      const { server, mk } = setup("drop", { sharedTokenWaitMs: 60_000 });
+      let failOnce = true;
+      const inner = server.transport();
+      const flaky: RefreshTransport = {
+        refresh: (key) => {
+          if (failOnce) {
+            failOnce = false;
+            return Promise.reject(apiError("unavailable", 503, true));
+          }
+          return inner.refresh(key);
+        },
+      };
+      const [a, b] = [mk(flaky), mk()];
+      const res = await Promise.all([a.refresh(), b.refresh()]);
+      expect(res).toEqual([false, true]);
+      expect(server.calls.map((c) => c.cookie)).toEqual(["rt-0"]);
+    });
+
+    it(`${mode}: a new tab with no refresh in between refreshes at once, even if an older marker exists`, async () => {
+      const { server, a, b } = setup("drop", { sharedTokenWaitMs: 60_000 });
+      await a.refresh();
+      expect(await b.refresh()).toBe(true);
+      expect(server.calls.map((c) => c.cookie)).toEqual(["rt-0", "rt-1"]);
+    });
+  }
+});
+
 describe("environment selection", () => {
   it("prefers Web Locks, then the localStorage lease, then none", () => {
     const locks: LockManagerLike = { request: (_n, _o, cb) => cb() };

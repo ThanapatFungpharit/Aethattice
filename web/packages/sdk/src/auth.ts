@@ -16,6 +16,11 @@ export const REFRESH_LOCK_NAME = "cs-refresh";
 export const AUTH_CHANNEL_NAME = "cs-auth";
 /** Client leeway for proactive refresh (contract M1 §3 [R12]): refresh when the token expires within 60 s. */
 export const PROACTIVE_REFRESH_LEEWAY_MS = 60_000;
+/**
+ * How long a tab that waited on the refresh lock waits for the token another tab announced (refresh generation
+ * marker) to arrive on the channel before it refreshes itself.
+ */
+export const SHARED_TOKEN_WAIT_MS = 1_000;
 
 /** Authentication result (contract M1 §2.4). */
 export interface AuthResult {
@@ -106,6 +111,25 @@ export const MFA_ENROLMENT_SCOPE = "mfa_enrolment";
 export interface RefreshLock {
   readonly mode: "web-locks" | "lease" | "none";
   run<T>(fn: () => Promise<T>): Promise<T>;
+  /** Refresh generation marker shared by the tabs that share this lock, when there is shared storage. */
+  readonly marker?: RefreshMarker;
+}
+
+/** The last refresh announced by any tab: a random generation id and the new token's expiry. Never the token. */
+export interface RefreshGeneration {
+  readonly gen: string;
+  readonly expiresAt: number;
+}
+
+/**
+ * Non-secret record of the latest refresh, written by the lock holder after it has broadcast the new token and
+ * before it releases the lock. BroadcastChannel delivery is asynchronous and not ordered with the lock: a tab that
+ * gets the lock next may not have received the token yet. Seeing the generation advance since it started waiting
+ * tells it a fresh token is on its way, so it waits for that instead of presenting the cookie again.
+ */
+export interface RefreshMarker {
+  read(): RefreshGeneration | undefined;
+  write(expiresAt: number): void;
 }
 
 /** The subset of the Web Locks API the SDK uses. */
@@ -113,11 +137,15 @@ export interface LockManagerLike {
   request<T>(name: string, options: { mode: "exclusive" }, callback: () => Promise<T>): Promise<T>;
 }
 
-/** Serializes refreshes across tabs with `navigator.locks.request("cs-refresh", …)` (contract M1 §3 [R1]). */
-export function webLocksRefreshLock(locks: LockManagerLike, name: string = REFRESH_LOCK_NAME): RefreshLock {
+/**
+ * Serializes refreshes across tabs with `navigator.locks.request("cs-refresh", …)` (contract M1 §3 [R1]).
+ * With `storage` (localStorage), the holder also records the refresh generation marker there.
+ */
+export function webLocksRefreshLock(locks: LockManagerLike, name: string = REFRESH_LOCK_NAME, storage?: StorageLike): RefreshLock {
   return {
     mode: "web-locks",
     run: (fn) => locks.request(name, { mode: "exclusive" }, fn),
+    ...(storage !== undefined && { marker: storageRefreshMarker(storage, `${name}:gen`) }),
   };
 }
 
@@ -147,6 +175,30 @@ interface LeaseRecord {
   readonly until: number;
 }
 
+/** Refresh generation marker in localStorage: `{gen, expires_at}` only, never a token. Storage errors are ignored. */
+export function storageRefreshMarker(storage: StorageLike, key: string): RefreshMarker {
+  return {
+    read() {
+      try {
+        const raw = storage.getItem(key);
+        if (raw === null) return undefined;
+        const v: unknown = JSON.parse(raw);
+        if (isRecord(v) && typeof v.gen === "string" && typeof v.expires_at === "number") return { gen: v.gen, expiresAt: v.expires_at };
+      } catch {
+        // Unavailable or malformed: no marker, so the waiting tab simply refreshes.
+      }
+      return undefined;
+    },
+    write(expiresAt) {
+      try {
+        storage.setItem(key, JSON.stringify({ gen: defaultIdempotencyKey(), expires_at: expiresAt }));
+      } catch {
+        // Quota or storage unavailable: waiting tabs then refresh themselves (still serialized, no reuse).
+      }
+    },
+  };
+}
+
 function readLease(storage: StorageLike, key: string): LeaseRecord | undefined {
   let raw: string | null;
   try {
@@ -170,7 +222,7 @@ function readLease(storage: StorageLike, key: string): LeaseRecord | undefined {
  * assumption: announce in `<key>:x`, claim `<key>:y` if free, and when another tab announced in between,
  * wait `settleMs` and keep the lease only if `<key>:y` still names this tab. The holder renews the lease every
  * `leaseMs / 3`; a lease whose `until` has passed belongs to a crashed tab and may be taken over.
- * The lease records only a tab id and an expiry, never a token.
+ * The lease records only a tab id and an expiry, never a token; the generation marker (`<key>:gen`) likewise.
  * Because this is weaker than Web Locks, the UI degrades to a single active tab in this mode (§3 [R1]).
  */
 export function localStorageLeaseLock(storage: StorageLike, opts: LeaseOptions = {}): RefreshLock {
@@ -212,6 +264,7 @@ export function localStorageLeaseLock(storage: StorageLike, opts: LeaseOptions =
 
   return {
     mode: "lease",
+    marker: storageRefreshMarker(storage, `${key}:gen`),
     async run(fn) {
       await acquire();
       const stop = new AbortController();
@@ -308,6 +361,8 @@ export interface AuthSessionOptions {
   readonly idempotencyKeyFactory?: () => string;
   /** Default {@link PROACTIVE_REFRESH_LEEWAY_MS}. */
   readonly leewayMs?: number;
+  /** Default {@link SHARED_TOKEN_WAIT_MS}. */
+  readonly sharedTokenWaitMs?: number;
   /**
    * The session's DPoP key (M1 rev 8). When set, tokens are sent as `Authorization: DPoP <token>`, the key is
    * deleted when the session ends (sign-out, or a refresh refused with `unauthenticated`), and the tab re-reads the
@@ -324,13 +379,13 @@ export interface AuthState {
 /** Picks Web Locks when available, else a localStorage lease, else no cross-tab lock. */
 export function defaultRefreshLock(g: typeof globalThis = globalThis): RefreshLock {
   const locks = (g as { navigator?: { locks?: LockManagerLike } }).navigator?.locks;
-  if (locks && typeof locks.request === "function") return webLocksRefreshLock(locks);
   let storage: StorageLike | undefined;
   try {
     storage = (g as { localStorage?: StorageLike }).localStorage;
   } catch {
     storage = undefined;
   }
+  if (locks && typeof locks.request === "function") return webLocksRefreshLock(locks, REFRESH_LOCK_NAME, storage);
   return storage ? localStorageLeaseLock(storage) : noCrossTabLock;
 }
 
@@ -356,6 +411,7 @@ export class AuthSession implements AuthHook {
   private readonly clock: Clock;
   private readonly newKey: () => string;
   private readonly leewayMs: number;
+  private readonly sharedTokenWaitMs: number;
   private readonly dpop: DpopKeyManager | undefined;
   private readonly unsubscribe: () => void;
   private readonly listeners = new Set<(state: AuthState) => void>();
@@ -366,6 +422,8 @@ export class AuthSession implements AuthHook {
   /** Bumped on every change of the token, from this tab or another. */
   private version = 0;
   private inFlight: Promise<boolean> | undefined;
+  /** Resolved on every version change. */
+  private readonly versionWaiters = new Set<() => void>();
 
   constructor(opts: AuthSessionOptions) {
     this.transport = opts.transport;
@@ -374,6 +432,7 @@ export class AuthSession implements AuthHook {
     this.clock = opts.clock ?? systemClock;
     this.newKey = opts.idempotencyKeyFactory ?? defaultIdempotencyKey;
     this.leewayMs = opts.leewayMs ?? PROACTIVE_REFRESH_LEEWAY_MS;
+    this.sharedTokenWaitMs = opts.sharedTokenWaitMs ?? SHARED_TOKEN_WAIT_MS;
     this.dpop = opts.dpop;
     this.unsubscribe = this.channel.subscribe((m) => {
       this.onChannelMessage(m);
@@ -463,10 +522,20 @@ export class AuthSession implements AuthHook {
 
   private async refreshSerialized(): Promise<boolean> {
     const seen = this.version;
+    const seenGen = this.lock.marker?.read()?.gen;
+    const receivedFresh = (): boolean => this.version !== seen && this.accessToken !== undefined && !this.needsRefresh();
     return this.lock.run(async () => {
       // Another tab refreshed while this one waited, and its token reached us: the cookie has rotated
       // already and the shared token is fresh, so no request is needed.
-      if (this.version !== seen && this.accessToken !== undefined && !this.needsRefresh()) return true;
+      if (receivedFresh()) return true;
+      // Another tab refreshed while this one waited, but its broadcast has not arrived yet (delivery is not ordered
+      // with the lock release). Wait for it, bounded; a crashed or silent holder only costs this wait, after which
+      // this tab refreshes itself once with the cookie the browser now holds.
+      const m = this.lock.marker?.read();
+      if (m !== undefined && m.gen !== seenGen && this.clock.now() < m.expiresAt - this.leewayMs) {
+        await this.waitForVersionChange(seen, this.sharedTokenWaitMs);
+        if (receivedFresh()) return true;
+      }
       const key = this.newKey();
       let result: AuthResult;
       try {
@@ -486,6 +555,30 @@ export class AuthSession implements AuthHook {
     });
   }
 
+  /** Resolves on the next token change after `seen`, or after `ms`. */
+  private async waitForVersionChange(seen: number, ms: number): Promise<void> {
+    if (this.version !== seen) return;
+    const stop = new AbortController();
+    let waiter: (() => void) | undefined;
+    const changed = new Promise<void>((resolve) => {
+      waiter = resolve;
+      this.versionWaiters.add(resolve);
+    });
+    try {
+      await Promise.race([changed, this.clock.sleep(ms, stop.signal).catch(() => undefined)]);
+    } finally {
+      stop.abort();
+      if (waiter !== undefined) this.versionWaiters.delete(waiter);
+    }
+  }
+
+  private bumpVersion(): void {
+    this.version++;
+    const waiters = [...this.versionWaiters];
+    this.versionWaiters.clear();
+    for (const w of waiters) w();
+  }
+
   private onChannelMessage(m: AuthChannelMessage): void {
     // Another tab signed in (new key) or out: re-read the shared key before the next proof.
     if (m.type === "signed_out" || m.session_id !== this.sessionId) this.dpop?.invalidate();
@@ -497,9 +590,13 @@ export class AuthSession implements AuthHook {
     this.accessToken = token;
     this.expiresAt = expiresAt;
     this.sessionId = sessionId;
-    this.version++;
-    // Shared before the lock is released, so waiting tabs normally receive it before they would refresh.
-    if (share) this.channel.post({ type: "token", access_token: token, expires_at: expiresAt, session_id: sessionId });
+    this.bumpVersion();
+    // Shared before the lock is released; delivery may still lag the release, so the generation marker is
+    // recorded only after the broadcast was posted: a tab that sees it advance knows the token is on its way.
+    if (share) {
+      this.channel.post({ type: "token", access_token: token, expires_at: expiresAt, session_id: sessionId });
+      this.lock.marker?.write(expiresAt);
+    }
     this.notify();
   }
 
@@ -508,7 +605,7 @@ export class AuthSession implements AuthHook {
     this.accessToken = undefined;
     this.expiresAt = 0;
     this.sessionId = undefined;
-    this.version++;
+    this.bumpVersion();
     if (share) this.channel.post({ type: "signed_out" });
     if (had || share) this.notify();
   }
