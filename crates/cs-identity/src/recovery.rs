@@ -31,8 +31,10 @@
 
 use crate::admin::AdminResult as AuthResult;
 use crate::auth::{AuthService, invalid, mfa_required_error, parse_tenant, unauthenticated};
+use crate::idem::{Entry, Idem, IdemRequest, Out, Ran};
 use crate::jws::AccessClaims;
 use crate::login::normalize_login;
+use crate::wire;
 use crate::ratelimit::{Dimension, Key};
 use crate::token::{self, TokenHash};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -356,9 +358,20 @@ impl AuthService {
     pub async fn recovery_codes_generate(
         &self,
         claims: &AccessClaims,
-    ) -> AuthResult<Vec<Secret<String>>> {
-        self.require_step_up(claims).await?;
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<Vec<Secret<String>>>> {
         let (tenant, user, _) = Self::subject(claims)?;
+        let idem = match idem {
+            Some(_) => {
+                let keys = self.keys().await?;
+                self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?
+            }
+            None => None,
+        };
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
+        self.require_step_up(claims).await?;
         let codes: Vec<(String, String)> = (0..CODES_PER_SET)
             .map(|_| new_code())
             .collect::<Result<_, _>>()?;
@@ -371,8 +384,13 @@ impl AuthService {
         })
         .await
         .map_err(Error::internal)??;
-        self.pool
-            .transaction(move |tx| {
+        let plain: Vec<Secret<String>> = plain.into_iter().map(Secret::new).collect();
+        // rev 15: the generated set is stored sealed for 24 h.
+        let reply = wire::codes(&plain)?;
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 let hashed = hashed.clone();
                 Box::pin(async move {
                     let v: i64 = sqlx::query_scalar(
@@ -421,9 +439,11 @@ impl AuthService {
                     .await?;
                     Ok(())
                 })
-            })
-            .await?;
-        Ok(plain.into_iter().map(Secret::new).collect())
+            },
+            move |()| Ok(Entry::secret(reply.clone(), crate::idem::CODES_TTL_SECS)),
+        )
+        .await?;
+        self.ran_plain(idem.as_ref(), ran, |()| plain)
     }
 
     /// `GET /api/v2/me/recovery-codes` → `{remaining}`.
@@ -483,7 +503,8 @@ impl AuthService {
         code: Option<&str>,
         source: &str,
         user_agent: Option<&str>,
-    ) -> AuthResult<RecoveryStart> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<RecoveryStart>> {
         let tenant_id = parse_tenant(tenant)?;
         let login = normalize_login(login).map_err(|e| invalid("/login", &e.to_string()))?;
         let method = match method {
@@ -504,6 +525,28 @@ impl AuthService {
         self.limit("recovery", source, Some(tenant), Some(&login))
             .await?;
         self.sweep();
+        // rev 16 P3: principal H(route ‖ tenant ‖ login), known account or not.
+        let idem = match idem {
+            Some(_) => {
+                let keys = self.keys().await?;
+                self.bind_idem(
+                    idem,
+                    tenant_id,
+                    || {
+                        crate::idem::start_principal(
+                            crate::idem::ROUTE_RECOVERY_START,
+                            tenant_id,
+                            &login,
+                        )
+                    },
+                    &keys,
+                )?
+            }
+            None => None,
+        };
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
         let account = self.account(tenant_id, &login).await?;
         let ua = user_agent.map(|u| clip_bytes(u, 256));
         match method {
@@ -518,9 +561,15 @@ impl AuthService {
                 let grant = token::generate(tenant_id).map_err(Error::internal)?;
                 let ghash = grant.hash;
                 let request_id = cs_common::id::new_random128().map_err(Error::internal)?;
-                let ok = self
-                    .pool
-                    .transaction(move |tx| {
+                let out = RecoveryStart::Granted {
+                    grant: grant.token,
+                    grant_expires_in: GRANT_TTL_SECS,
+                };
+                let reply = wire::recovery_start(&out)?;
+                let ran = crate::idem::run(
+                    &self.pool,
+                    idem.clone(),
+                    move |tx| {
                         let (code_id, ua) = (code_id.clone(), ua.clone());
                         Box::pin(async move {
                             let unused: Option<bool> = sqlx::query_scalar(
@@ -533,7 +582,9 @@ impl AuthService {
                             .fetch_optional(tx.conn())
                             .await?;
                             if unused != Some(true) {
-                                return Ok(false);
+                                // Nothing changes; roll back so no record is kept (the same
+                                // as an unknown account, which fails before any write).
+                                return Err(DbError::app(unauthenticated().into_inner()));
                             }
                             sqlx::query(
                                 "INSERT INTO recovery_requests (tenant_id, request_id, user_id, method, \
@@ -560,27 +611,41 @@ impl AuthService {
                                 "recovery_code",
                             )
                             .await?;
-                            Ok(true)
+                            Ok(())
                         })
-                    })
-                    .await?;
-                if !ok {
-                    return Err(unauthenticated());
-                }
-                Ok(RecoveryStart::Granted {
-                    grant: grant.token,
-                    grant_expires_in: GRANT_TTL_SECS,
-                })
+                    },
+                    move |()| Ok(Entry::secret(reply.clone(), GRANT_TTL_SECS)),
+                )
+                .await?;
+                self.ran_plain(idem.as_ref(), ran, |()| out)
             }
             "email" => {
+                let pending = RecoveryStart::Pending { recovery_txn: None };
                 let Some((user, email)) =
                     account.and_then(|a| a.email_verified.map(|e| (a.user, e)))
                 else {
-                    return Ok(RecoveryStart::Pending { recovery_txn: None });
+                    // Unknown account: the same record a known one gets (no enumeration).
+                    return self
+                        .record_only(idem, Entry::plain(wire::recovery_start(&pending)?), pending)
+                        .await;
                 };
-                let link = self
-                    .create_email_request(tenant_id, user, ua, "email")
-                    .await?;
+                let ran = create_email_request_idem(
+                    &self.pool,
+                    tenant_id,
+                    user,
+                    self.policy.recovery_wait_secs,
+                    ua,
+                    "email",
+                    idem.clone(),
+                    wire::recovery_start(&pending)?,
+                )
+                .await?;
+                let link = match ran {
+                    Ran::Fresh(l) => l,
+                    Ran::Replay(r) => {
+                        return self.ran_plain(idem.as_ref(), Ran::<()>::Replay(r), |()| pending);
+                    }
+                };
                 // Rev 13 (QA F-2): never await the Notifier on the request path, so the 202
                 // takes the same time for known and unknown accounts whatever delivery costs.
                 let notifier = self.notifier.clone();
@@ -589,18 +654,33 @@ impl AuthService {
                         tracing::warn!(error = %e.code(), "recovery link hand-off failed");
                     }
                 });
-                Ok(RecoveryStart::Pending { recovery_txn: None })
+                Ok(Out::Value(pending))
             }
             _ => {
                 let txn = token::generate(tenant_id).map_err(Error::internal)?;
-                if let Some(a) = account {
+                let out = RecoveryStart::Pending {
+                    recovery_txn: Some(txn.token.clone()),
+                };
+                // The recovery_txn is a bearer without its own expiry: sealed and kept for the
+                // C13 retention.
+                let entry = || -> AuthResult<Entry> {
+                    Ok(Entry::secret(wire::recovery_start(&out)?, i64::MAX))
+                };
+                let Some(a) = account else {
+                    let e = entry()?;
+                    return self.record_only(idem, e, out).await;
+                };
+                {
+                    let reply = wire::recovery_start(&out)?;
                     let (thash, user, request_id) = (
                         txn.hash,
                         a.user,
                         cs_common::id::new_random128().map_err(Error::internal)?,
                     );
-                    self.pool
-                        .transaction(move |tx| {
+                    let ran = crate::idem::run(
+                        &self.pool,
+                        idem.clone(),
+                        move |tx| {
                             let ua = ua.clone();
                             Box::pin(async move {
                                 sqlx::query(
@@ -625,14 +705,35 @@ impl AuthService {
                                 )
                                 .await
                             })
-                        })
-                        .await?;
+                        },
+                        move |()| Ok(Entry::secret(reply.clone(), i64::MAX)),
+                    )
+                    .await?;
+                    self.ran_plain(idem.as_ref(), ran, |()| out)
                 }
-                Ok(RecoveryStart::Pending {
-                    recovery_txn: Some(txn.token),
-                })
             }
         }
+    }
+
+    /// Record `entry` for a result without an effect (an unknown account, a status read), so
+    /// a retry replays it exactly as for a request with an effect.
+    async fn record_only<T: Send + 'static>(
+        &self,
+        idem: Option<Idem>,
+        entry: Entry,
+        value: T,
+    ) -> AuthResult<Out<T>> {
+        let Some(i) = idem else {
+            return Ok(Out::Value(value));
+        };
+        let ran = crate::idem::run(
+            &self.pool,
+            Some(i.clone()),
+            |_| Box::pin(async { Ok(()) }),
+            move |()| Ok(entry.clone()),
+        )
+        .await?;
+        self.ran_plain(Some(&i), ran, |()| value)
     }
 
     /// Create an email-method request with the waiting period and return its link token
@@ -660,20 +761,53 @@ impl AuthService {
         &self,
         by: StatusBy<'_>,
         source: &str,
-    ) -> AuthResult<RecoveryStatus> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<RecoveryStatus>> {
         self.limit("recovery", source, None, None).await?;
         let (tok, by_link, code) = match by {
             StatusBy::Link { token, code } => (token, true, code),
             StatusBy::Txn(t) => (t, false, None),
         };
         let Ok(p) = token::parse(tok) else {
+            // No tenant to scope a record: nothing is stored (this is a pure read).
             return if by_link {
                 Err(unauthenticated())
             } else {
-                Ok(RecoveryStatus::only("pending"))
+                Ok(Out::Value(RecoveryStatus::only("pending")))
             };
         };
         let (tenant, hash, default_mfa) = (p.tenant_id, p.hash, self.policy.mfa_required);
+        // rev 16 P3: keyed by the link or txn token.
+        let idem = match idem {
+            Some(_) => {
+                let keys = self.keys().await?;
+                self.bind_idem(idem, tenant, || crate::idem::token_principal(&hash), &keys)?
+            }
+            None => None,
+        };
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
+        let s = match self
+            .recovery_status_inner(tenant, hash, by_link, code, default_mfa, idem.clone())
+            .await?
+        {
+            Status::Done(o) => return Ok(o),
+            Status::Read(s) => s,
+        };
+        let entry = Entry::plain(wire::recovery_status(&s)?);
+        self.record_only(idem, entry, s).await
+    }
+
+    async fn recovery_status_inner(
+        &self,
+        tenant: TenantId,
+        hash: TokenHash,
+        by_link: bool,
+        code: Option<&str>,
+        default_mfa: bool,
+        idem: Option<Idem>,
+    ) -> AuthResult<Status> {
         let found: Option<Found> = self
             .pool
             .read_snapshot(move |tx| {
@@ -714,22 +848,22 @@ impl AuthService {
             return if by_link {
                 Err(unauthenticated())
             } else {
-                Ok(RecoveryStatus::only("pending"))
+                Ok(Status::Read(RecoveryStatus::only("pending")))
             };
         };
         match f.state.as_str() {
             "pending" | "granted" => {}
-            s => return Ok(RecoveryStatus::only(state_static(s))),
+            s => return Ok(Status::Read(RecoveryStatus::only(state_static(s)))),
         }
         let mut code_id: Option<String> = None;
         if f.state == "pending" {
             if by_link {
                 if !f.due {
-                    return Ok(RecoveryStatus {
+                    return Ok(Status::Read(RecoveryStatus {
                         state: "pending",
                         available_at: Some(f.available_at),
                         ..RecoveryStatus::default()
-                    });
+                    }));
                 }
                 // §4: users with MFA also present a recovery code.
                 if f.has_mfa {
@@ -741,21 +875,43 @@ impl AuthService {
                     );
                 }
             } else if !f.approved {
-                return Ok(RecoveryStatus::only("pending"));
+                return Ok(Status::Read(RecoveryStatus::only("pending")));
             }
         }
         let grant = token::generate(tenant).map_err(Error::internal)?;
         let (ghash, rid, user) = (grant.hash, f.request_id, f.user);
-        let out = self
-            .pool
-            .transaction(move |tx| {
+        let render = {
+            let (token, available_at) = (grant.token.clone(), f.available_at.clone());
+            move |g: &Grant| -> Result<Entry, DbError> {
+                Ok(match g {
+                    Grant::Issued(expires_in) => Entry::secret(
+                        wire::recovery_status(&RecoveryStatus {
+                            state: "granted",
+                            available_at: by_link.then(|| available_at.clone()),
+                            grant: Some(token.clone()),
+                            grant_expires_in: Some(*expires_in),
+                        })?,
+                        GRANT_TTL_SECS,
+                    ),
+                    Grant::State(s) => {
+                        Entry::plain(wire::recovery_status(&RecoveryStatus::only(s))?)
+                    }
+                })
+            }
+        };
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 let code_id = code_id.clone();
                 Box::pin(async move {
                     grant_in_tx(tx, tenant, rid, user, ghash, code_id, by_link).await
                 })
-            })
-            .await?;
-        Ok(match out {
+            },
+            render,
+        )
+        .await?;
+        let out = self.ran_plain(idem.as_ref(), ran, |out| match out {
             Grant::Issued(expires_in) => RecoveryStatus {
                 state: "granted",
                 available_at: by_link.then_some(f.available_at),
@@ -763,7 +919,8 @@ impl AuthService {
                 grant_expires_in: Some(expires_in),
             },
             Grant::State(s) => RecoveryStatus::only(s),
-        })
+        })?;
+        Ok(Status::Done(out))
     }
 
     /// `GET /api/v2/me/recovery-requests` (rev 10 addendum): pending and granted email and
@@ -812,12 +969,22 @@ impl AuthService {
 
     /// `POST /api/v2/me/recovery-requests/{id}/approve` (step-up): approve a pending
     /// device-approval request of the caller. 404 for anything else.
-    pub async fn recovery_approve(&self, claims: &AccessClaims, id: Uuid) -> AuthResult<()> {
-        self.require_step_up(claims).await?;
+    pub async fn recovery_approve(
+        &self,
+        claims: &AccessClaims,
+        id: Uuid,
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<()>> {
         let (tenant, user, _) = Self::subject(claims)?;
-        let ok = self
-            .pool
-            .transaction(move |tx| {
+        let idem = self.user_idem(idem, tenant, user).await?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
+        self.require_step_up(claims).await?;
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 Box::pin(async move {
                     let n = sqlx::query(
                         "UPDATE recovery_requests SET approved_at = now(), version = version + 1, \
@@ -844,18 +1011,53 @@ impl AuthService {
                     }
                     Ok(n == 1)
                 })
-            })
-            .await?;
-        if ok { Ok(()) } else { Err(not_found()) }
+            },
+            done_or_not_found,
+        )
+        .await?;
+        self.done_or_404(idem.as_ref(), ran)
+    }
+
+    async fn user_idem(
+        &self,
+        idem: Option<IdemRequest>,
+        tenant: TenantId,
+        user: UserId,
+    ) -> AuthResult<Option<Idem>> {
+        match idem {
+            Some(_) => {
+                let keys = self.keys().await?;
+                self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn done_or_404(&self, idem: Option<&Idem>, ran: Ran<bool>) -> AuthResult<Out<()>> {
+        match self.ran_plain(idem, ran, |ok| ok)? {
+            Out::Value(true) => Ok(Out::Value(())),
+            Out::Value(false) => Err(not_found()),
+            Out::Reply(r) => Ok(Out::Reply(r)),
+        }
     }
 
     /// `DELETE /api/v2/me/recovery-requests/{id}`: any session of the user cancels a pending
     /// or granted request (rev 10). 404 for anything else.
-    pub async fn recovery_cancel(&self, claims: &AccessClaims, id: Uuid) -> AuthResult<()> {
+    pub async fn recovery_cancel(
+        &self,
+        claims: &AccessClaims,
+        id: Uuid,
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<()>> {
         let (tenant, user, _) = Self::subject(claims)?;
-        let ok = self
-            .pool
-            .transaction(move |tx| {
+        let idem = self.user_idem(idem, tenant, user).await?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 Box::pin(async move {
                     let m: Option<String> = sqlx::query_scalar(
                         "UPDATE recovery_requests SET state = 'cancelled', version = version + 1, \
@@ -881,9 +1083,11 @@ impl AuthService {
                     }
                     Ok(m.is_some())
                 })
-            })
-            .await?;
-        if ok { Ok(()) } else { Err(not_found()) }
+            },
+            done_or_not_found,
+        )
+        .await?;
+        self.done_or_404(idem.as_ref(), ran)
     }
 
     /// The user and login a recovery grant may re-register (`register/start`, [R5]).
@@ -959,11 +1163,43 @@ pub async fn create_email_request(
     requester_user_agent: Option<String>,
     actor: &'static str,
 ) -> AuthResult<Secret<String>> {
+    match create_email_request_idem(
+        pool,
+        tenant,
+        user,
+        wait_secs,
+        requester_user_agent,
+        actor,
+        None,
+        crate::idem::Reply::empty(202),
+    )
+    .await?
+    {
+        Ran::Fresh(l) => Ok(l),
+        Ran::Replay(_) => Err(Error::new(ErrorCode::Internal).into()),
+    }
+}
+
+/// [`create_email_request`] with an idempotency record storing `reply` (plain: the `202`
+/// carries no secret; the link never leaves the node's delivery queue, rev 13).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_email_request_idem(
+    pool: &cs_db::DomainPool,
+    tenant: TenantId,
+    user: UserId,
+    wait_secs: i64,
+    requester_user_agent: Option<String>,
+    actor: &'static str,
+    idem: Option<Idem>,
+    reply: crate::idem::Reply,
+) -> AuthResult<Ran<Secret<String>>> {
     let link = token::generate(tenant).map_err(Error::internal)?;
     let lhash = link.hash;
     let request_id = cs_common::id::new_random128().map_err(Error::internal)?;
-    let ok = pool
-        .transaction(move |tx| {
+    let ran = crate::idem::run(
+        pool,
+        idem,
+        move |tx| {
             let ua = requester_user_agent.clone();
             Box::pin(async move {
                 let active: Option<bool> = sqlx::query_scalar(
@@ -976,7 +1212,7 @@ pub async fn create_email_request(
                 .fetch_optional(tx.conn())
                 .await?;
                 if active != Some(true) {
-                    return Ok(false);
+                    return Err(DbError::app(not_found_user().into_inner()));
                 }
                 sqlx::query(
                     "INSERT INTO recovery_requests (tenant_id, request_id, user_id, method, \
@@ -1001,14 +1237,36 @@ pub async fn create_email_request(
                     if actor == "admin" { "admin" } else { "email" },
                 )
                 .await?;
-                Ok(true)
+                Ok(())
             })
-        })
-        .await?;
-    if !ok {
-        return Err(not_found_user());
-    }
-    Ok(link.token)
+        },
+        move |()| Ok(Entry::plain(reply.clone())),
+    )
+    .await?;
+    Ok(match ran {
+        Ran::Fresh(()) => Ran::Fresh(link.token),
+        Ran::Replay(r) => Ran::Replay(r),
+    })
+}
+
+/// Encode an approve/cancel outcome: `204`, or the `404` that committed nothing.
+fn done_or_not_found(ok: &bool) -> Result<Entry, DbError> {
+    Ok(if *ok {
+        Entry::plain(wire::no_content(false))
+    } else {
+        Entry::Failed {
+            status: 404,
+            code: ErrorCode::NotFound,
+        }
+    })
+}
+
+/// Outcome of [`AuthService::recovery_status_inner`].
+enum Status {
+    /// A grant transaction ran (or replayed).
+    Done(Out<RecoveryStatus>),
+    /// A read-only answer.
+    Read(RecoveryStatus),
 }
 
 fn not_found_user() -> crate::admin::AdminError {

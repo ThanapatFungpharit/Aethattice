@@ -20,6 +20,7 @@
 
 use crate::admin::{AdminError as AuthError, AdminResult as AuthResult};
 use crate::dpop::{self, ReplayStore, VerifiedProof};
+use crate::idem::{Entry, Idem, IdemRequest, Out, Ran, Reply};
 use crate::jws::{AccessClaims, AccessTokens};
 use crate::keys::{OpaqueKeys, ServerKeyVersion};
 use crate::login::normalize_login;
@@ -300,7 +301,14 @@ struct TxnInsert<'a> {
     sealed: Vec<u8>,
 }
 
-async fn insert_txn(pool: &DomainPool, t: TxnInsert<'_>) -> AuthResult<()> {
+/// Insert a txn; with `idem`, in the same transaction as the idempotency record, storing
+/// `reply` sealed for the txn's lifetime (contract rev 16 P3).
+async fn insert_txn(
+    pool: &DomainPool,
+    t: TxnInsert<'_>,
+    idem: Option<Idem>,
+    reply: Reply,
+) -> AuthResult<Ran<()>> {
     let (login, source) = (t.login.to_owned(), t.source.to_owned());
     let (tenant, hash, kind, user, session, grant, kv, sealed) = (
         t.tenant,
@@ -312,7 +320,10 @@ async fn insert_txn(pool: &DomainPool, t: TxnInsert<'_>) -> AuthResult<()> {
         t.key_version,
         t.sealed,
     );
-    pool.transaction(move |tx| {
+    crate::idem::run(
+        pool,
+        idem,
+        move |tx| {
         let (login, source, sealed) = (login.clone(), source.clone(), sealed.clone());
         Box::pin(async move {
             sqlx::query(
@@ -336,7 +347,9 @@ async fn insert_txn(pool: &DomainPool, t: TxnInsert<'_>) -> AuthResult<()> {
             .await?;
             Ok(())
         })
-    })
+    },
+        move |_| Ok(Entry::secret(reply.clone(), TXN_TTL_SECS)),
+    )
     .await
     .map_err(AuthError::from)
 }
@@ -731,7 +744,8 @@ impl AuthService {
         login: &str,
         credential_request: &[u8],
         source: &str,
-    ) -> AuthResult<LoginStart> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<LoginStart>> {
         let tenant_text = tenant;
         let tenant = parse_tenant(tenant)?;
         let login = normalize_login(login).map_err(|e| invalid("/login", &e.to_string()))?;
@@ -742,6 +756,16 @@ impl AuthService {
             .map_err(|_| invalid("/credential_request", "malformed credential_request"))?;
         let keys = self.keys().await?;
         self.sweep();
+        // rev 16 P3: principal H(route ‖ tenant ‖ login), whether or not the account exists.
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::start_principal(ROUTE_LOGIN_START, tenant, &login),
+            &keys,
+        )?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
 
         type Reg = (Uuid, String, Vec<u8>, i32, i32, i32, String);
         type DistRow = (i32, i32, i32, i64);
@@ -827,7 +851,12 @@ impl AuthService {
         let txn = token::generate(tenant).map_err(Error::internal)?;
         let state = zeroize::Zeroizing::new(start.state.serialize().to_vec());
         let sealed = k.seal(&state, &txn_ad(&tenant, &txn.hash, "login"))?;
-        insert_txn(
+        let out = LoginStart {
+            login_txn: txn.token,
+            credential_response: start.message.serialize().to_vec(),
+            ksf_params: ksf,
+        };
+        let ran = insert_txn(
             &self.pool,
             TxnInsert {
                 tenant,
@@ -841,13 +870,11 @@ impl AuthService {
                 key_version: k.version,
                 sealed,
             },
+            idem.clone(),
+            crate::wire::login_start(&out)?,
         )
         .await?;
-        Ok(LoginStart {
-            login_txn: txn.token,
-            credential_response: start.message.serialize().to_vec(),
-            ksf_params: ksf,
-        })
+        self.ran_plain(idem.as_ref(), ran, |()| out)
     }
 
     /// `login/finish` (contract §2.1): on success, a session (contract §2.4).
@@ -858,7 +885,8 @@ impl AuthService {
         source: &str,
         user_agent: Option<&str>,
         ctx: &RequestCtx<'_>,
-    ) -> AuthResult<LoginResult> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<LoginResult>> {
         let parsed = token::parse(login_txn).map_err(|_| unauthenticated())?;
         // rev 8: a valid proof binds the new session; an invalid one is refused.
         let jkt = self
@@ -879,12 +907,27 @@ impl AuthService {
         )?;
         let keys = self.keys().await?;
         let (tenant, hash) = (parsed.tenant_id, parsed.hash);
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::token_principal(&hash),
+            &keys,
+        )?;
+        if let Some(r) = self
+            .early_replay(idem.as_ref(), LoginResult::Authenticated)
+            .await?
+        {
+            return Ok(r);
+        }
+        let kid = self.signing_kid().await?;
+        let kid_enc = kid.clone();
         let policy = self.policy;
         let source = source.to_owned();
         let ua = user_agent.map(str::to_owned);
-        let out = self
-            .pool
-            .transaction(move |tx| {
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 let (keys, fin, source, ua) =
                     (keys.clone(), fin.clone(), source.clone(), ua.clone());
                 Box::pin(async move {
@@ -981,20 +1024,32 @@ impl AuthService {
                     .await?;
                     Ok(LoginOutcome::Ok(Box::new(nt), reregister))
                 })
-            })
-            .await?;
+            },
+            move |o| match o {
+                LoginOutcome::Ok(nt, rr) => crate::idem::session_entry(nt, &kid_enc, *rr),
+                LoginOutcome::Mfa(auth_txn, methods) => Ok(Entry::secret(
+                    crate::wire::mfa_required(auth_txn, methods)?,
+                    crate::ceremony::MFA_TTL_SECS,
+                )),
+                LoginOutcome::Failed => Ok(Entry::unauthenticated()),
+            },
+        )
+        .await?;
+        let out = match ran {
+            Ran::Fresh(o) => o,
+            Ran::Replay(r) => {
+                return self
+                    .open_replay(idem.as_ref(), r, LoginResult::Authenticated)
+                    .await;
+            }
+        };
         match out {
-            LoginOutcome::Ok(nt, reregister) => {
-                let mut a = self.finish_tokens(*nt).await?;
-                a.reregister = reregister;
-                Ok(LoginResult::Authenticated(a))
-            }
-            LoginOutcome::Mfa(auth_txn, methods) => {
-                Ok(LoginResult::MfaRequired(crate::mfa::MfaChallenge {
-                    auth_txn,
-                    methods,
-                }))
-            }
+            LoginOutcome::Ok(nt, reregister) => Ok(Out::Value(LoginResult::Authenticated(
+                self.finish_tokens_with(&kid, *nt, reregister).await?,
+            ))),
+            LoginOutcome::Mfa(auth_txn, methods) => Ok(Out::Value(LoginResult::MfaRequired(
+                crate::mfa::MfaChallenge { auth_txn, methods },
+            ))),
             LoginOutcome::Failed => Err(self.mfa_or(login_txn, unauthenticated()).await),
         }
     }
@@ -1021,7 +1076,8 @@ impl AuthService {
         login: &str,
         registration_request: &[u8],
         source: &str,
-    ) -> AuthResult<RegisterStart> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<RegisterStart>> {
         let g = token::parse(grant).map_err(|_| grant_required())?;
         let login = normalize_login(login).map_err(|e| invalid("/login", &e.to_string()))?;
         // Contract §5: registration is rate limited per source, tenant and account.
@@ -1037,6 +1093,15 @@ impl AuthService {
         let keys = self.keys().await?;
         self.sweep();
         let (tenant, ghash) = (g.tenant_id, g.hash);
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::token_principal(&ghash),
+            &keys,
+        )?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
         let user: Option<(Uuid, String)> = self
             .pool
             .read_snapshot(move |tx| {
@@ -1080,7 +1145,12 @@ impl AuthService {
             &ksf_bytes(&ksf),
             &txn_ad(&tenant, &txn.hash, "registration"),
         )?;
-        insert_txn(
+        let out = RegisterStart {
+            registration_txn: txn.token,
+            registration_response: resp.message.serialize().to_vec(),
+            ksf_params: ksf,
+        };
+        let ran = insert_txn(
             &self.pool,
             TxnInsert {
                 tenant,
@@ -1094,13 +1164,11 @@ impl AuthService {
                 key_version: k.version,
                 sealed,
             },
+            idem.clone(),
+            crate::wire::register_start(&out)?,
         )
         .await?;
-        Ok(RegisterStart {
-            registration_txn: txn.token,
-            registration_response: resp.message.serialize().to_vec(),
-            ksf_params: ksf,
-        })
+        self.ran_plain(idem.as_ref(), ran, |()| out)
     }
 
     /// `register/finish {registration_txn, registration_upload}` → 204, consuming the grant.
@@ -1119,12 +1187,8 @@ impl AuthService {
         registration_txn: &str,
         registration_upload: &[u8],
         source: &str,
-        idempotency_key: Option<&cs_common::idempotency::IdempotencyKey>,
-    ) -> AuthResult<()> {
-        use cs_db::idempotency::{
-            Begin, IdempotencyRecords, IdempotencyScope, RequestBody, StoredResponse,
-            request_digest,
-        };
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<()>> {
         let parsed = token::parse(registration_txn).map_err(|_| grant_required())?;
         self.limit(
             "register",
@@ -1141,82 +1205,38 @@ impl AuthService {
         let keys = self.keys().await?;
         let (tenant, hash) = (parsed.tenant_id, parsed.hash);
         let source = source.to_owned();
-        // Idempotency scope: the registration txn (a deterministic v7-shaped principal id
-        // derived from its hash, so a retry after the txn was consumed finds the record).
-        let idem = match idempotency_key {
-            Some(k) => {
-                let mut b = [0u8; 16];
-                b.copy_from_slice(&hash.as_bytes()[..16]);
-                let u = uuid::Builder::from_bytes(b)
-                    .with_variant(uuid::Variant::RFC4122)
-                    .with_version(uuid::Version::SortRand)
-                    .into_uuid();
-                let principal =
-                    cs_common::id::PrincipalId::from_uuid(u).map_err(Error::internal)?;
-                let body = serde_json::json!({
-                    "registration_txn": registration_txn,
-                    "registration_upload": hash_hex(registration_upload),
-                })
-                .to_string();
-                let digest = request_digest(
-                    "POST",
-                    "/api/v2/auth/opaque/register/finish",
-                    &std::collections::BTreeMap::new(),
-                    RequestBody::Json(body.as_bytes()),
-                )?;
-                Some((
-                    IdempotencyScope {
-                        tenant_id: tenant,
-                        principal_id: principal,
-                        key: k.clone(),
-                    },
-                    digest,
-                ))
-            }
-            None => None,
-        };
-        let retention = self.policy.idempotency_retention_hours;
-        let out = self
-            .pool
-            .transaction(move |tx| {
-                let (keys, file, source, idem) =
-                    (keys.clone(), file.clone(), source.clone(), idem.clone());
+        // Idempotency scope: the registration txn (rev 16 P3), so a retry after the txn was
+        // consumed finds the record.
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::token_principal(&hash),
+            &keys,
+        )?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
+                let (keys, file, source) = (keys.clone(), file.clone(), source.clone());
                 Box::pin(async move {
-                    if let Some((scope, digest)) = &idem
-                        && let Begin::Replay(r) =
-                            IdempotencyRecords::begin(tx, scope, digest, retention).await?
-                    {
-                        return Ok(if r.status == 204 {
-                            RegOutcome::Done
-                        } else {
-                            RegOutcome::Refused
-                        });
-                    }
-                    let out =
-                        register_finish_in_tx(tx, &keys, tenant, &hash, &file, &source).await?;
-                    if let Some((scope, _)) = &idem {
-                        let status = if matches!(out, RegOutcome::Done) {
-                            204
-                        } else {
-                            401
-                        };
-                        IdempotencyRecords::complete(
-                            tx,
-                            scope,
-                            &StoredResponse {
-                                status,
-                                body: Vec::new(),
-                            },
-                        )
-                        .await?;
-                    }
-                    Ok(out)
+                    register_finish_in_tx(tx, &keys, tenant, &hash, &file, &source).await
                 })
-            })
-            .await?;
-        match out {
-            RegOutcome::Done => Ok(()),
-            RegOutcome::Refused => Err(unauthenticated()),
+            },
+            |o| {
+                Ok(match o {
+                    RegOutcome::Done => Entry::plain(crate::wire::no_content(false)),
+                    RegOutcome::Refused => Entry::unauthenticated(),
+                })
+            },
+        )
+        .await?;
+        match self.ran_plain(idem.as_ref(), ran, |o| o)? {
+            Out::Value(RegOutcome::Done) => Ok(Out::Value(())),
+            Out::Value(RegOutcome::Refused) => Err(unauthenticated()),
+            Out::Reply(r) => Ok(Out::Reply(r)),
         }
     }
 
@@ -1229,7 +1249,8 @@ impl AuthService {
         purpose: &str,
         registration_request: &[u8],
         source: &str,
-    ) -> AuthResult<RegisterStart> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<RegisterStart>> {
         let (tenant, user, session) = Self::subject(claims)?;
         let purpose_idx = PURPOSES
             .iter()
@@ -1238,8 +1259,17 @@ impl AuthService {
             .ok_or_else(|| invalid("/purpose", "purpose must be password_change or ksf_upgrade"))?;
         let request = RegistrationRequest::<Suite>::deserialize(registration_request)
             .map_err(|_| invalid("/registration_request", "malformed registration_request"))?;
-        self.require_step_up(claims).await?;
         let keys = self.keys().await?;
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::user_principal(user),
+            &keys,
+        )?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
+        self.require_step_up(claims).await?;
         self.sweep();
         let sgen = claims.sgen;
         let login: Option<String> = self
@@ -1269,7 +1299,12 @@ impl AuthService {
             &rereg_bytes(&ksf, purpose_idx, sgen),
             &txn_ad(&tenant, &txn.hash, "registration"),
         )?;
-        insert_txn(
+        let out = RegisterStart {
+            registration_txn: txn.token,
+            registration_response: resp.message.serialize().to_vec(),
+            ksf_params: ksf,
+        };
+        let ran = insert_txn(
             &self.pool,
             TxnInsert {
                 tenant,
@@ -1283,13 +1318,11 @@ impl AuthService {
                 key_version: k.version,
                 sealed,
             },
+            idem.clone(),
+            crate::wire::register_start(&out)?,
         )
         .await?;
-        Ok(RegisterStart {
-            registration_txn: txn.token,
-            registration_response: resp.message.serialize().to_vec(),
-            ksf_params: ksf,
-        })
+        self.ran_plain(idem.as_ref(), ran, |()| out)
     }
 
     /// `register/finish {registration_txn, registration_upload}` with the session's access
@@ -1303,7 +1336,8 @@ impl AuthService {
         registration_txn: &str,
         registration_upload: &[u8],
         source: &str,
-    ) -> AuthResult<()> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<()>> {
         let (tenant, user, session) = Self::subject(claims)?;
         let parsed = token::parse(registration_txn).map_err(|_| unauthenticated())?;
         if parsed.tenant_id != tenant {
@@ -1315,10 +1349,21 @@ impl AuthService {
             .serialize()
             .to_vec();
         let keys = self.keys().await?;
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::user_principal(user),
+            &keys,
+        )?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
         let hash = parsed.hash;
         let (source, sgen, window) = (source.to_owned(), claims.sgen, self.policy.step_up_secs);
-        self.pool
-            .transaction(move |tx| {
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 let (keys, file, source) = (keys.clone(), file.clone(), source.clone());
                 Box::pin(async move {
                     let fail = || DbError::app(unauthenticated());
@@ -1431,9 +1476,11 @@ impl AuthService {
                     .await?;
                     Ok(())
                 })
-            })
-            .await
-            .map_err(AuthError::from)
+            },
+            |()| Ok(Entry::plain(crate::wire::no_content(false))),
+        )
+        .await?;
+        self.ran_plain(idem.as_ref(), ran, |()| ())
     }
 
     // ----- tokens -----
@@ -1482,19 +1529,77 @@ impl AuthService {
 
     /// `POST /api/v2/auth/logout` (contract §3 `[R10]`): revoke the session named by `sid`
     /// (generation bump) and its whole refresh family in one identity transaction.
-    pub async fn logout(&self, claims: &AccessClaims) -> AuthResult<()> {
-        let uuid = |s: &str| Uuid::parse_str(s).map_err(|_| unauthenticated());
-        let tenant = TenantId::from_uuid(uuid(&claims.tid)?).map_err(|_| unauthenticated())?;
-        let session = SessionId::from_uuid(uuid(&claims.sid)?).map_err(|_| unauthenticated())?;
-        self.pool
-            .transaction(move |tx| {
+    ///
+    /// With an `Idempotency-Key` the stored reply is `204` plus the cookie clear; rev 16 P4
+    /// lets a retry of a logout replay it after the session is revoked
+    /// ([`Self::logout_replay`]).
+    pub async fn logout(
+        &self,
+        claims: &AccessClaims,
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<()>> {
+        let (tenant, user, session) = Self::subject(claims)?;
+        let idem = match idem {
+            Some(_) => {
+                let keys = self.keys().await?;
+                self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?
+            }
+            None => None,
+        };
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 Box::pin(async move {
                     session::revoke_session(tx, tenant, session, "logout").await?;
                     Ok(())
                 })
-            })
-            .await
-            .map_err(AuthError::from)
+            },
+            |()| Ok(Entry::plain(crate::wire::no_content(true))),
+        )
+        .await?;
+        self.ran_plain(idem.as_ref(), ran, |()| ())
+    }
+
+    /// Rev 16 P4: a logout (or `DELETE /me/sessions/{own sid}`) retried after its session was
+    /// revoked. The access token must verify (signature, expiry) and satisfy its DPoP binding;
+    /// then only a stored record with the same key and digest is replayed. Anything else —
+    /// no record, another digest, an undecodable record — is `unauthenticated`, exactly as
+    /// rev 14 answers a revoked session.
+    pub async fn logout_replay(
+        &self,
+        authorization: Option<&str>,
+        ctx: &RequestCtx<'_>,
+        idem: IdemRequest,
+    ) -> AuthResult<Reply> {
+        let (scheme, token) = authorization
+            .and_then(|v| v.split_once(' '))
+            .map(|(s, t)| (s, t.trim()))
+            .ok_or_else(unauthenticated)?;
+        let claims = self.tokens.verify(token, unix_now()).await?;
+        self.require_binding(scheme, token, &claims, ctx).await?;
+        let (tenant, user, _) = Self::subject(&claims)?;
+        let keys = self.keys().await?;
+        let idem = self
+            .bind_idem(
+                Some(idem),
+                tenant,
+                || crate::idem::user_principal(user),
+                &keys,
+            )?
+            .ok_or_else(unauthenticated)?;
+        match idem.peek(&self.pool).await {
+            Ok(Some(r)) => match idem.open(r) {
+                Ok(crate::idem::Opened::Reply(r)) if r.status == 204 => Ok(r),
+                _ => Err(unauthenticated()),
+            },
+            Ok(None) => Err(unauthenticated()),
+            Err(e) if matches!(e.code(), Code::Core(ErrorCode::Unavailable)) => Err(e),
+            Err(_) => Err(unauthenticated()),
+        }
     }
 
     /// Tenant, user and session named by verified access-token claims.
@@ -1515,11 +1620,21 @@ impl AuthService {
         claims: &AccessClaims,
         credential_request: &[u8],
         source: &str,
-    ) -> AuthResult<LoginStart> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<LoginStart>> {
         let (tenant, user, session) = Self::subject(claims)?;
         let request = CredentialRequest::<Suite>::deserialize(credential_request)
             .map_err(|_| invalid("/credential_request", "malformed credential_request"))?;
         let keys = self.keys().await?;
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::user_principal(user),
+            &keys,
+        )?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
         let sgen = claims.sgen;
         type Reg = (String, Vec<u8>, i32, i32, i32, String);
         let reg: Option<Reg> = self
@@ -1574,7 +1689,12 @@ impl AuthService {
         let txn = token::generate(tenant).map_err(Error::internal)?;
         let state = zeroize::Zeroizing::new(start.state.serialize().to_vec());
         let sealed = k.seal(&state, &txn_ad(&tenant, &txn.hash, "reauth"))?;
-        insert_txn(
+        let out = LoginStart {
+            login_txn: txn.token,
+            credential_response: start.message.serialize().to_vec(),
+            ksf_params: ksf,
+        };
+        let ran = insert_txn(
             &self.pool,
             TxnInsert {
                 tenant,
@@ -1588,13 +1708,11 @@ impl AuthService {
                 key_version: k.version,
                 sealed,
             },
+            idem.clone(),
+            crate::wire::reauth_start(&out)?,
         )
         .await?;
-        Ok(LoginStart {
-            login_txn: txn.token,
-            credential_response: start.message.serialize().to_vec(),
-            ksf_params: ksf,
-        })
+        self.ran_plain(idem.as_ref(), ran, |()| out)
     }
 
     /// `opaque/reauth/finish {reauth_txn, credential_finalization}` → 204 (contract rev 7):
@@ -1605,7 +1723,8 @@ impl AuthService {
         reauth_txn: &str,
         credential_finalization: &[u8],
         source: &str,
-    ) -> AuthResult<()> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<()>> {
         let (tenant, user, session) = Self::subject(claims)?;
         let parsed = token::parse(reauth_txn).map_err(|_| unauthenticated())?;
         if parsed.tenant_id != tenant {
@@ -1620,11 +1739,21 @@ impl AuthService {
             },
         )?;
         let keys = self.keys().await?;
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::user_principal(user),
+            &keys,
+        )?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
         let hash = parsed.hash;
         let (source, sgen) = (source.to_owned(), claims.sgen);
-        let ok = self
-            .pool
-            .transaction(move |tx| {
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 let (keys, fin, source) = (keys.clone(), fin.clone(), source.clone());
                 Box::pin(async move {
                     let Some(t) = take_txn(tx, tenant, &hash, "reauth").await? else {
@@ -1671,9 +1800,21 @@ impl AuthService {
                     .rows_affected();
                     Ok(n == 1)
                 })
-            })
-            .await?;
-        if ok { Ok(()) } else { Err(unauthenticated()) }
+            },
+            |ok| {
+                Ok(if *ok {
+                    Entry::plain(crate::wire::no_content(false))
+                } else {
+                    Entry::unauthenticated()
+                })
+            },
+        )
+        .await?;
+        match self.ran_plain(idem.as_ref(), ran, |ok| ok)? {
+            Out::Value(true) => Ok(Out::Value(())),
+            Out::Value(false) => Err(unauthenticated()),
+            Out::Reply(r) => Ok(Out::Reply(r)),
+        }
     }
 
     /// `GET /api/v2/me` (contract rev 7). The session must be active at the token's `sgen`.
@@ -1828,11 +1969,6 @@ enum RegOutcome {
     Done,
     /// A used or expired recovery grant (`unauthenticated`); the state change commits.
     Refused,
-}
-
-/// BLAKE3 hex of a request part (idempotency digest input).
-fn hash_hex(b: &[u8]) -> String {
-    blake3::hash(b).to_hex().to_string()
 }
 
 #[derive(Serialize)]

@@ -28,6 +28,8 @@ use crate::auth::{
     parse_tenant, unauthenticated,
 };
 use crate::ceremony::{self, Kind};
+use crate::idem::{Entry, IdemRequest, Out, Ran, Reply};
+use crate::wire::{self, CeremonyField};
 use crate::jws::AccessClaims;
 use crate::recovery::RFC3339;
 use crate::session::{self, NewSession};
@@ -226,6 +228,16 @@ enum Finish {
     Failed,
 }
 
+/// What a WebAuthn finish stores (contract rev 15/16): the sealed §2.4 envelope, an empty
+/// `204` for a step-up, or the committed failure.
+fn finish_entry(o: &Finish, kid: &cs_crypto::sig::KeyId) -> Result<Entry, DbError> {
+    match o {
+        Finish::Ok(nt, rr) => crate::idem::session_entry(nt, kid, *rr),
+        Finish::SteppedUp => Ok(Entry::plain(wire::no_content(false))),
+        Finish::Failed => Ok(Entry::unauthenticated()),
+    }
+}
+
 impl AuthService {
     fn rp(&self) -> AuthResult<Arc<Webauthn>> {
         self.webauthn
@@ -262,11 +274,21 @@ impl AuthService {
         &self,
         claims: &AccessClaims,
         source: &str,
-    ) -> AuthResult<CeremonyStart> {
-        self.require_step_up(claims).await?;
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<CeremonyStart>> {
         let (tenant, user, session) = Self::subject(claims)?;
-        let rp = self.rp()?;
         let keys = self.keys().await?;
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::user_principal(user),
+            &keys,
+        )?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
+        self.require_step_up(claims).await?;
+        let rp = self.rp()?;
         self.sweep();
         let (login, display): (String, Option<String>) = self
             .pool
@@ -315,7 +337,8 @@ impl AuthService {
             generation: claims.sgen,
             reg,
         })?);
-        let txn = ceremony::insert(
+        let pk2 = pk.clone();
+        let ran = ceremony::insert(
             &self.pool,
             keys,
             tenant,
@@ -324,9 +347,19 @@ impl AuthService {
             Some(user),
             Some(session),
             state,
+            idem.clone(),
+            move |txn| {
+                wire::ceremony_start(
+                    CeremonyField::Registration,
+                    &CeremonyStart {
+                        txn: txn.clone(),
+                        public_key: pk2.clone(),
+                    },
+                )
+            },
         )
         .await?;
-        Ok(CeremonyStart {
+        self.ran_plain(idem.as_ref(), ran, |txn| CeremonyStart {
             txn,
             public_key: pk,
         })
@@ -340,7 +373,8 @@ impl AuthService {
         credential: &Value,
         label: &str,
         source: &str,
-    ) -> AuthResult<PasskeyItem> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<PasskeyItem>> {
         let (tenant, user, session) = Self::subject(claims)?;
         let label = label.trim().to_owned();
         if label.is_empty() || label.chars().count() > 100 {
@@ -374,10 +408,20 @@ impl AuthService {
             .unwrap_or_default();
         let rp = self.rp()?;
         let keys = self.keys().await?;
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::user_principal(user),
+            &keys,
+        )?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
         let (hash, source, sgen) = (parsed.hash, source.to_owned(), claims.sgen);
-        let out: Option<PasskeyItem> = self
-            .pool
-            .transaction(move |tx| {
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 let (keys, rp, cred, source, label, transports) = (
                     keys.clone(),
                     rp.clone(),
@@ -470,9 +514,18 @@ impl AuthService {
                         prf,
                     }))
                 })
-            })
-            .await?;
-        out.ok_or_else(webauthn_failed)
+            },
+            |o: &Option<PasskeyItem>| match o {
+                Some(p) => Ok(Entry::plain(Reply::json(200, p)?)),
+                None => Ok(Entry::unauthenticated()),
+            },
+        )
+        .await?;
+        match self.ran_plain(idem.as_ref(), ran, |o| o)? {
+            Out::Value(Some(p)) => Ok(Out::Value(p)),
+            Out::Value(None) => Err(webauthn_failed()),
+            Out::Reply(r) => Ok(Out::Reply(r)),
+        }
     }
 
     /// `webauthn/login/start {tenant}` → discoverable request options (empty
@@ -481,18 +534,31 @@ impl AuthService {
         &self,
         tenant: &str,
         source: &str,
-    ) -> AuthResult<CeremonyStart> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<CeremonyStart>> {
         let tenant_id = parse_tenant(tenant)?;
         self.limit("webauthn_login", source, Some(tenant), None)
             .await?;
         let rp = self.rp()?;
         let keys = self.keys().await?;
+        // rev 16 P3: principal H(route ‖ tenant).
+        let idem = self.bind_idem(
+            idem,
+            tenant_id,
+            || crate::idem::start_principal(crate::idem::ROUTE_WEBAUTHN_LOGIN_START, tenant_id, ""),
+            &keys,
+        )?;
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
         self.sweep();
         let (rcr, st) = rp
             .start_discoverable_authentication()
             .map_err(Error::internal)?;
         let state = zeroize::Zeroizing::new(json_bytes(&st)?);
-        let txn = ceremony::insert(
+        let public_key = serde_json::to_value(&rcr.public_key).map_err(Error::internal)?;
+        let pk2 = public_key.clone();
+        let ran = ceremony::insert(
             &self.pool,
             keys,
             tenant_id,
@@ -501,10 +567,19 @@ impl AuthService {
             None,
             None,
             state,
+            idem.clone(),
+            move |txn| {
+                wire::ceremony_start(
+                    CeremonyField::Login,
+                    &CeremonyStart {
+                        txn: txn.clone(),
+                        public_key: pk2.clone(),
+                    },
+                )
+            },
         )
         .await?;
-        let public_key = serde_json::to_value(&rcr.public_key).map_err(Error::internal)?;
-        Ok(CeremonyStart { txn, public_key })
+        self.ran_plain(idem.as_ref(), ran, |txn| CeremonyStart { txn, public_key })
     }
 
     /// `webauthn/login/finish {login_txn, credential}` → §2.4 (DPoP as for OPAQUE).
@@ -515,7 +590,8 @@ impl AuthService {
         source: &str,
         user_agent: Option<&str>,
         ctx: &RequestCtx<'_>,
-    ) -> AuthResult<Authenticated> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<Authenticated>> {
         let parsed = token::parse(login_txn).map_err(|_| unauthenticated())?;
         let tenant = parsed.tenant_id;
         self.limit(
@@ -533,11 +609,23 @@ impl AuthService {
             .map_err(|_| invalid("/credential", "malformed credential"))?;
         let rp = self.rp()?;
         let keys = self.keys().await?;
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::token_principal(&parsed.hash),
+            &keys,
+        )?;
+        if let Some(r) = self.early_replay(idem.as_ref(), |a| a).await? {
+            return Ok(r);
+        }
+        let kid = self.signing_kid().await?;
+        let kid_enc = kid.clone();
         let (hash, source, policy) = (parsed.hash, source.to_owned(), self.policy);
         let ua = user_agent.map(str::to_owned);
-        let out = self
-            .pool
-            .transaction(move |tx| {
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 let (keys, rp, cred, source, ua) = (
                     keys.clone(),
                     rp.clone(),
@@ -596,10 +684,18 @@ impl AuthService {
                     .await?;
                     Ok(Finish::Ok(Box::new(nt), false))
                 })
-            })
-            .await?;
+            },
+            move |o| finish_entry(o, &kid_enc),
+        )
+        .await?;
+        let out = match ran {
+            Ran::Fresh(o) => o,
+            Ran::Replay(r) => return self.open_replay(idem.as_ref(), r, |a| a).await,
+        };
         match out {
-            Finish::Ok(nt, _) => self.finish_tokens(*nt).await,
+            Finish::Ok(nt, _) => Ok(Out::Value(
+                self.finish_tokens_with(&kid, *nt, false).await?,
+            )),
             _ => Err(self.mfa_or(login_txn, webauthn_failed()).await),
         }
     }
@@ -611,10 +707,31 @@ impl AuthService {
         auth_txn: Option<&str>,
         claims: Option<&AccessClaims>,
         source: &str,
-    ) -> AuthResult<CeremonyStart> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<CeremonyStart>> {
         let rp = self.rp()?;
         let keys = self.keys().await?;
         self.sweep();
+        // rev 16 P3: MFA keyed by the auth_txn, step-up by the user.
+        let idem = match (auth_txn, claims) {
+            (Some(t), None) => {
+                let p = token::parse(t).map_err(|_| unauthenticated())?;
+                self.bind_idem(
+                    idem,
+                    p.tenant_id,
+                    || crate::idem::token_principal(&p.hash),
+                    &keys,
+                )?
+            }
+            (None, Some(c)) => {
+                let (tenant, user, _) = Self::subject(c)?;
+                self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?
+            }
+            _ => None,
+        };
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
         let (tenant, user, session, mode) = match (auth_txn, claims) {
             (Some(t), None) => {
                 let p = token::parse(t).map_err(|_| unauthenticated())?;
@@ -661,7 +778,9 @@ impl AuthService {
             .start_passkey_authentication(&passkeys)
             .map_err(Error::internal)?;
         let state = zeroize::Zeroizing::new(json_bytes(&AssertState { mode, ast })?);
-        let txn = ceremony::insert(
+        let public_key = serde_json::to_value(&rcr.public_key).map_err(Error::internal)?;
+        let pk2 = public_key.clone();
+        let ran = ceremony::insert(
             &self.pool,
             keys,
             tenant,
@@ -670,10 +789,19 @@ impl AuthService {
             Some(user),
             session,
             state,
+            idem.clone(),
+            move |txn| {
+                wire::ceremony_start(
+                    CeremonyField::Assert,
+                    &CeremonyStart {
+                        txn: txn.clone(),
+                        public_key: pk2.clone(),
+                    },
+                )
+            },
         )
         .await?;
-        let public_key = serde_json::to_value(&rcr.public_key).map_err(Error::internal)?;
-        Ok(CeremonyStart { txn, public_key })
+        self.ran_plain(idem.as_ref(), ran, |txn| CeremonyStart { txn, public_key })
     }
 
     /// `webauthn/assert/finish {assert_txn, credential}`: §2.4 for MFA (DPoP as for OPAQUE),
@@ -686,7 +814,8 @@ impl AuthService {
         source: &str,
         user_agent: Option<&str>,
         ctx: &RequestCtx<'_>,
-    ) -> AuthResult<AssertOutcome> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<AssertOutcome>> {
         let parsed = token::parse(assert_txn).map_err(|_| unauthenticated())?;
         let tenant = parsed.tenant_id;
         let subject = claims.map(Self::subject).transpose()?;
@@ -708,11 +837,26 @@ impl AuthService {
             .map_err(|_| invalid("/credential", "malformed credential"))?;
         let rp = self.rp()?;
         let keys = self.keys().await?;
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::token_principal(&parsed.hash),
+            &keys,
+        )?;
+        if let Some(r) = self
+            .early_replay(idem.as_ref(), AssertOutcome::Authenticated)
+            .await?
+        {
+            return Ok(r);
+        }
+        let kid = self.signing_kid().await?;
+        let kid_enc = kid.clone();
         let (hash, source, policy) = (parsed.hash, source.to_owned(), self.policy);
         let ua = user_agent.map(str::to_owned);
-        let out = self
-            .pool
-            .transaction(move |tx| {
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 let (keys, rp, cred, source, ua) = (
                     keys.clone(),
                     rp.clone(),
@@ -814,15 +958,23 @@ impl AuthService {
                         }
                     }
                 })
-            })
-            .await?;
-        match out {
-            Finish::Ok(nt, reregister) => {
-                let mut a = self.finish_tokens(*nt).await?;
-                a.reregister = reregister;
-                Ok(AssertOutcome::Authenticated(a))
+            },
+            move |o| finish_entry(o, &kid_enc),
+        )
+        .await?;
+        let out = match ran {
+            Ran::Fresh(o) => o,
+            Ran::Replay(r) => {
+                return self
+                    .open_replay(idem.as_ref(), r, AssertOutcome::Authenticated)
+                    .await;
             }
-            Finish::SteppedUp => Ok(AssertOutcome::SteppedUp),
+        };
+        match out {
+            Finish::Ok(nt, reregister) => Ok(Out::Value(AssertOutcome::Authenticated(
+                self.finish_tokens_with(&kid, *nt, reregister).await?,
+            ))),
+            Finish::SteppedUp => Ok(Out::Value(AssertOutcome::SteppedUp)),
             Finish::Failed => Err(self.mfa_or(assert_txn, webauthn_failed()).await),
         }
     }
@@ -862,18 +1014,34 @@ impl AuthService {
     }
 
     /// `DELETE /api/v2/me/passkeys/{id}` (step-up). 404 unless it is the caller's passkey.
-    pub async fn passkey_delete(&self, claims: &AccessClaims, id: &str) -> AuthResult<()> {
-        self.require_step_up(claims).await?;
+    pub async fn passkey_delete(
+        &self,
+        claims: &AccessClaims,
+        id: &str,
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<()>> {
         let (tenant, user, _) = Self::subject(claims)?;
+        let idem = match idem {
+            Some(_) => {
+                let keys = self.keys().await?;
+                self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?
+            }
+            None => None,
+        };
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
+        }
+        self.require_step_up(claims).await?;
         let not_found = || -> crate::admin::AdminError {
             Error::new(ErrorCode::NotFound)
                 .with_detail("No such passkey.")
                 .into()
         };
         let cred_id = URL_SAFE_NO_PAD.decode(id).map_err(|_| not_found())?;
-        let n = self
-            .pool
-            .transaction(move |tx| {
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 let cred_id = cred_id.clone();
                 Box::pin(async move {
                     let n = sqlx::query(
@@ -906,8 +1074,23 @@ impl AuthService {
                     }
                     Ok(n)
                 })
-            })
-            .await?;
-        if n == 1 { Ok(()) } else { Err(not_found()) }
+            },
+            |n| {
+                Ok(if *n == 1 {
+                    Entry::plain(wire::no_content(false))
+                } else {
+                    Entry::Failed {
+                        status: 404,
+                        code: ErrorCode::NotFound,
+                    }
+                })
+            },
+        )
+        .await?;
+        match self.ran_plain(idem.as_ref(), ran, |n| n)? {
+            Out::Value(1) => Ok(Out::Value(())),
+            Out::Value(_) => Err(not_found()),
+            Out::Reply(r) => Ok(Out::Reply(r)),
+        }
     }
 }

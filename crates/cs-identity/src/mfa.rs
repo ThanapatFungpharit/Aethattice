@@ -20,6 +20,7 @@ use crate::auth::{
     AuthService, Authenticated, RequestCtx, dpop_proof_required, mfa_required_error,
     unauthenticated,
 };
+use crate::idem::{Entry, IdemRequest, Out, Ran};
 use crate::ceremony::{self, Kind};
 use crate::recovery;
 use crate::session::{self, NewSession};
@@ -139,7 +140,8 @@ impl AuthService {
         source: &str,
         user_agent: Option<&str>,
         ctx: &RequestCtx<'_>,
-    ) -> AuthResult<Authenticated> {
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<Authenticated>> {
         let parsed = token::parse(auth_txn).map_err(|_| unauthenticated())?;
         let tenant = parsed.tenant_id;
         let jkt = self.proof_without_token(tenant, ctx).await?.map(|p| p.jkt);
@@ -147,6 +149,18 @@ impl AuthService {
             return Err(dpop_proof_required());
         }
         let keys = self.keys().await?;
+        // rev 16 P3: keyed by the auth_txn; checked before the (consumed) txn and code.
+        let idem = self.bind_idem(
+            idem,
+            tenant,
+            || crate::idem::token_principal(&parsed.hash),
+            &keys,
+        )?;
+        if let Some(r) = self.early_replay(idem.as_ref(), |a| a).await? {
+            return Ok(r);
+        }
+        let kid = self.signing_kid().await?;
+        let kid_enc = kid.clone();
         // Who is signing in (not consumed yet).
         let (hash, k2) = (parsed.hash, keys.clone());
         let c = self
@@ -173,9 +187,10 @@ impl AuthService {
             source.to_owned(),
             user_agent.map(str::to_owned),
         );
-        let out = self
-            .pool
-            .transaction(move |tx| {
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 let (keys, source, ua, code_id) =
                     (keys.clone(), source.clone(), ua.clone(), code_id.clone());
                 Box::pin(async move {
@@ -206,14 +221,21 @@ impl AuthService {
                     .await?;
                     Ok(Outcome::Ok(Box::new(nt), mfa_state_reregister(&c.state)))
                 })
-            })
-            .await?;
+            },
+            move |o| match o {
+                Outcome::Ok(nt, rr) => crate::idem::session_entry(nt, &kid_enc, *rr),
+                Outcome::Failed => Ok(Entry::unauthenticated()),
+            },
+        )
+        .await?;
+        let out = match ran {
+            Ran::Fresh(o) => o,
+            Ran::Replay(r) => return self.open_replay(idem.as_ref(), r, |a| a).await,
+        };
         match out {
-            Outcome::Ok(nt, reregister) => {
-                let mut a = self.finish_tokens(*nt).await?;
-                a.reregister = reregister;
-                Ok(a)
-            }
+            Outcome::Ok(nt, reregister) => Ok(Out::Value(
+                self.finish_tokens_with(&kid, *nt, reregister).await?,
+            )),
             Outcome::Failed => Err(unauthenticated()),
         }
     }

@@ -164,6 +164,51 @@ impl Idem {
         }
     }
 
+    /// Read-only look-up before the request's preconditions are checked (a retry must replay
+    /// even when the original consumed its txn or grant). The claim in [`run`] stays
+    /// authoritative for concurrent requests.
+    pub async fn peek(&self, pool: &DomainPool) -> AuthResult<Option<Replayed>> {
+        let s = self.0.scope.clone();
+        type R = (Vec<u8>, String, Option<Vec<u8>>, i64);
+        let row: Option<R> = pool
+            .read_snapshot(move |tx| {
+                let s = s.clone();
+                Box::pin(async move {
+                    Ok(sqlx::query_as(
+                        "SELECT request_digest, state, response, \
+                           floor(extract(epoch FROM now()))::bigint \
+                         FROM idempotency_records \
+                         WHERE tenant_id = $1 AND principal_id = $2 AND key = $3 \
+                           AND expires_at > now()",
+                    )
+                    .bind(s.tenant_id.as_uuid())
+                    .bind(s.principal_id.as_uuid())
+                    .bind(s.key.as_str())
+                    .fetch_optional(tx.conn())
+                    .await?)
+                })
+            })
+            .await?;
+        let Some((digest, state, response, db_now)) = row else {
+            return Ok(None);
+        };
+        if digest.as_slice() != self.0.req.digest.as_slice() {
+            return Err(Error::new(ErrorCode::IdempotencyMismatch)
+                .with_detail("This Idempotency-Key was already used with a different request.")
+                .into());
+        }
+        match (state.as_str(), response) {
+            ("completed", Some(resp)) => {
+                let stored: StoredResponse =
+                    cs_crypto::cbor::from_canonical(&resp, MAX_SEALED_BYTES)
+                        .map_err(|e| Error::internal(DbError::Invalid(e.to_string())))?;
+                Ok(Some(Replayed { stored, db_now }))
+            }
+            // In progress: the claim in `run` decides (waits or answers outcome_unknown).
+            _ => Ok(None),
+        }
+    }
+
     async fn complete(&self, tx: &mut DomainTx, entry: Entry) -> Result<(), DbError> {
         let (status, env, secret_until) = match entry {
             Entry::Plain {
@@ -303,7 +348,7 @@ impl Reply {
 }
 
 /// What to record for a fresh result.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Entry {
     Plain {
         status: u16,
@@ -395,7 +440,7 @@ struct SealedPayload {
 }
 
 /// Sealed content.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum Content {
     Reply {
         #[serde(with = "cs_crypto::cbor::bstr")]
@@ -406,7 +451,7 @@ pub enum Content {
 }
 
 /// The inputs of a §2.4 result (rev 16 P1). Never logged (`Debug` is redacted).
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionSeal {
     /// JSON of the access-token claims before `iss`/`aud` are set by the signer.
     #[serde(with = "cs_crypto::cbor::bstr")]
@@ -527,6 +572,19 @@ pub async fn sweep_expired_secrets(pool: &DomainPool, batch_rows: i64, max_batch
     total
 }
 
+fn plain<T>(o: Opened) -> AuthResult<Out<T>> {
+    match o {
+        Opened::Reply(r) => Ok(Out::Reply(r)),
+        Opened::Session(_) => Err(Error::new(ErrorCode::Internal)
+            .with_detail("unexpected stored session result")
+            .into()),
+    }
+}
+
+pub const ROUTE_LOGIN_START: &str = "/api/v2/auth/opaque/login/start";
+pub const ROUTE_WEBAUTHN_LOGIN_START: &str = "/api/v2/auth/webauthn/login/start";
+pub const ROUTE_RECOVERY_START: &str = "/api/v2/auth/recovery/start";
+
 /// A service result: the typed value (fresh, or a re-signed §2.4 replay) or a stored reply.
 #[derive(Debug)]
 pub enum Out<T> {
@@ -553,6 +611,44 @@ impl crate::auth::AuthService {
             ))
         })
         .transpose()
+    }
+
+    /// [`Self::early_replay`] for a route without a §2.4 result.
+    pub(crate) async fn early<T>(&self, idem: Option<&Idem>) -> AuthResult<Option<Out<T>>> {
+        let Some(i) = idem else { return Ok(None) };
+        match i.peek(&self.pool).await? {
+            Some(r) => Ok(Some(plain(i.open(r)?)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The outcome of [`run`] for a route without a §2.4 result: `value` when fresh.
+    pub(crate) fn ran_plain<T, U>(
+        &self,
+        idem: Option<&Idem>,
+        ran: Ran<U>,
+        value: impl FnOnce(U) -> T,
+    ) -> AuthResult<Out<T>> {
+        match ran {
+            Ran::Fresh(u) => Ok(Out::Value(value(u))),
+            Ran::Replay(r) => {
+                let i = idem.ok_or_else(|| Error::new(ErrorCode::Internal))?;
+                plain(i.open(r)?)
+            }
+        }
+    }
+
+    /// [`Idem::peek`] then decode: `Some` when the request is a replay.
+    pub(crate) async fn early_replay<T>(
+        &self,
+        idem: Option<&Idem>,
+        session: impl FnOnce(crate::auth::Authenticated) -> T,
+    ) -> AuthResult<Option<Out<T>>> {
+        let Some(i) = idem else { return Ok(None) };
+        match i.peek(&self.pool).await? {
+            Some(r) => Ok(Some(self.open_replay(Some(i), r, session).await?)),
+            None => Ok(None),
+        }
     }
 
     /// The signing key for a §2.4 result, fetched before the effect transaction (rev 16 P1).
