@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 15)
+# M1 Contracts: Identity (FROZEN rev 16)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -228,6 +228,20 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
     - Sealed secret-bearing results are kept for the shorter of the idempotency retention (C13) and the secret's own lifetime: 10 min for access tokens, 15 min for grants, and 24 h for recovery-code sets.
     - Once a sealed result has expired, a retry returns `unauthenticated`, and the client restarts the ceremony.
   - Pre-authentication ceremonies (`login/*`, `register/*` with a grant, `webauthn/login/*`, `recovery/*`) are keyed by the txn or ceremony ID as principal, because there is no authenticated principal yet.
+- (rev 16) **How rev 15 is implemented** (backend proposals P1–P3, accepted):
+  - **P1, §2.4 results:**
+    - The access token is signed after commit, because the KMS may be remote and no network call may run inside a DB transaction.
+    - The effect transaction therefore stores a sealed envelope: refresh token, cookie max-age, claims, signing `kid` (fetched before the transaction), `expires_in`, `session_id` and `reregister`.
+    - A replay re-signs the same claims with the same `kid`. Ed25519 is deterministic (RFC 8032), so the token and body are byte-identical, and the same `Set-Cookie` is returned. If that `kid` can no longer sign, the replay returns `unauthenticated`.
+  - **P2, retention:**
+    - The record is kept for the C13 idempotency retention, and the sealed envelope carries the secret's `not_after`; after it, a replay returns `unauthenticated`.
+    - Migration 0104 (expand-only) adds `idempotency_records.secret_expires_at` and a partial index.
+    - The identity sweeper overwrites expired sealed payloads with a tombstone in bounded batches, so ciphertext never outlives the secret.
+    - The seal key is derived (BLAKE3 `derive_key`, context `identity idempotency v1`) from the per-version seal key in `opaque_server_keys`.
+  - **P3, pre-authentication starts:**
+    - `login/start` and `recovery/start` use as principal a deterministic UUID derived from `H(route ‖ tenant ‖ normalized login)`; `webauthn/login/start` uses `H(route ‖ tenant)`.
+    - Routes that carry a grant, txn or ceremony token are keyed by that token's hash.
+    - Responses that carry ceremony txn bearers are also sealed, with retention equal to the txn TTL.
 - (rev 15) **Client rule:** a 2xx response whose body fails to decode is never retried and never triggers a refresh, because the write succeeded. The SDK surfaces a non-retryable client error carrying `request_id`.
 - (rev 14) **Every authenticated route checks the session, not only the JWT.**
   - One shared extractor verifies the access token, then that its session is `active` at the token's `sgen`, then scope (`scp`) and DPoP binding.
@@ -346,3 +360,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-26 rev 14 addendum (TL, e2e finding): `GET /me` `display_name` is nullable.
 - 2026-11-26 rev 15 (TL, e2e finding): Idempotency-Key replay on all identity writes per D.3, with secret-bearing results AEAD-sealed and retention capped at the secret's lifetime; client rule for 2xx bodies that fail to decode.
 - 2026-11-26 rev 15 addendum (TL, e2e decoder audit): `me/sessions` `last_seen_at` and `user_agent` are nullable.
+- 2026-11-26 rev 16 (TL, backend proposals): how rev 15 replay is implemented (re-signing sealed claims, tombstoning expired payloads, principals for pre-authentication starts).
