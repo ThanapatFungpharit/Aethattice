@@ -96,7 +96,7 @@ echo "== e2e: migrate, tenant, setup link"
 suffix=$(node -e 'console.log(require("crypto").randomBytes(4).toString("hex"))')
 TENANT=$("$CS" admin --config "$cfg" tenant create --name "e2e-$suffix" | sed -n 's/^tenant_id=//p')
 LOGIN="e2e-$suffix@example.test"
-USER=$("$CS" admin --config "$cfg" user create --tenant "$TENANT" --login "$LOGIN" --display-name "E2E User" | sed -n 's/^user_id=//p')
+USER=$("$CS" admin --config "$cfg" user create --tenant "$TENANT" --login "$LOGIN" | sed -n 's/^user_id=//p')
 LINK=$("$CS" admin --config "$cfg" setup-link --tenant "$TENANT" --user "$USER" | sed -n 's/^[a-z_]*token=//p')
 [[ -n "$TENANT" && -n "$USER" && -n "$LINK" ]] || { echo "e2e: cs admin output not understood" >&2; exit 1; }
 

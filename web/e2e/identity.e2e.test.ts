@@ -9,6 +9,7 @@ import {
   isMfaRequired,
   listPasskeys,
   ME_PATH,
+  meDisplayName,
   reauthenticate,
   RecoveryFlow,
   register,
@@ -74,6 +75,9 @@ describe("sign-in (WEB.M1-6: rev 5 §2.1, §2.4)", () => {
     expect(me.tenant_id).toBe(E2E.tenant);
     expect(me.login).toBe(E2E.login);
     expect(me.sid).toBe(tabA.session.state.sessionId);
+    // Created without a display name: null on the wire, the login for display (rev 14 addendum).
+    expect(me.display_name).toBeNull();
+    expect(meDisplayName(me)).toBe(E2E.login);
     const [call] = browser.requests(ME_PATH, from);
     expect(call).toMatchObject({ status: 200, authScheme: "DPoP", dpop: true });
     // The token is bound (cnf.jkt): presented as a bearer token, without a proof, it is refused.
