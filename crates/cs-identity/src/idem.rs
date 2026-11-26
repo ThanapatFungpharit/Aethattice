@@ -29,7 +29,7 @@ use crate::jws::AccessClaims;
 use crate::keys::OpaqueKeys;
 use crate::session::NewTokens;
 use crate::token::TokenHash;
-use cs_common::error::{Code, Error, ErrorCode};
+use cs_common::error::{Error, ErrorCode};
 use cs_common::id::{PrincipalId, TenantId, UserId};
 use cs_common::idempotency::IdempotencyKey;
 use cs_common::secret::Secret;
@@ -681,12 +681,8 @@ impl crate::auth::AuthService {
         let claims: AccessClaims =
             serde_json::from_slice(&s.claims).map_err(|_| unauthenticated())?;
         let kid = KeyId::from_str(&s.kid).map_err(|_| unauthenticated())?;
-        let token = match self.access_tokens().sign_with(&kid, claims).await {
-            Ok(t) => t,
-            Err(e) if matches!(e.code(), Code::Core(ErrorCode::Unavailable)) => return Err(e),
-            // rev 16 P1: a kid that can no longer sign → unauthenticated.
-            Err(_) => return Err(unauthenticated()),
-        };
+        // rev 16 P1: a kid that can no longer sign → unauthenticated (KMS outage: unavailable).
+        let token = self.access_tokens().resign(&kid, claims).await?;
         let session_id = uuid::Uuid::parse_str(&s.session_id)
             .ok()
             .and_then(|u| cs_common::id::SessionId::from_uuid(u).ok())
