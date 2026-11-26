@@ -1,4 +1,4 @@
-# M1 Contracts: Identity (FROZEN rev 14)
+# M1 Contracts: Identity (FROZEN rev 15)
 
 - Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
 - Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
@@ -218,6 +218,17 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
     - `rate_limit_account_per_min` 10 (3–100);
     - `rate_limit_tenant_per_min` 600 (60–100000), all over fixed 60 s windows.
     The rate-limit fallback is local buckets at limit/N per §5, using `[cluster] node_count` (≥ 1, checked by `check-config`).
+- (rev 15) **Idempotency-Key replay on identity writes (spec D.3; e2e finding).**
+  - Every identity write except `token/refresh`, which keeps its [R1] mechanism, records its result in the identity domain's idempotency store, using the M0 `cs-db` idempotency API in the same transaction as the effect.
+    - A retry with the same key and digest returns the original status and body within the retention period.
+    - A different digest returns `idempotency_mismatch`.
+    - Without a key, the behaviour is unchanged.
+  - **Responses containing bearer secrets** are stored **AEAD-sealed** under a key from the identity KMS hierarchy, with associated data `tenant ‖ principal ‖ key ‖ route`. This covers the §2.4 results with an access token (plus the refresh cookie, replayed as the same `Set-Cookie`), recovery grants and generated recovery codes. They are never stored in plaintext.
+  - **Retention:**
+    - Sealed secret-bearing results are kept for the shorter of the idempotency retention (C13) and the secret's own lifetime: 10 min for access tokens, 15 min for grants, and 24 h for recovery-code sets.
+    - Once a sealed result has expired, a retry returns `unauthenticated`, and the client restarts the ceremony.
+  - Pre-authentication ceremonies (`login/*`, `register/*` with a grant, `webauthn/login/*`, `recovery/*`) are keyed by the txn or ceremony ID as principal, because there is no authenticated principal yet.
+- (rev 15) **Client rule:** a 2xx response whose body fails to decode is never retried and never triggers a refresh, because the write succeeded. The SDK surfaces a non-retryable client error carrying `request_id`.
 - (rev 14) **Every authenticated route checks the session, not only the JWT.**
   - One shared extractor verifies the access token, then that its session is `active` at the token's `sgen`, then scope (`scp`) and DPoP binding.
   - A revoked or rotated-generation session gets `unauthenticated` on every route, `/me/*` included, even while the token has not expired. This is QA gate finding F-3.
@@ -333,3 +344,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-26 rev 13 (TL, backend question): recovery email delivery is best effort through a bounded in-memory queue (no bearer secret in the outbox, no durability claim; durable delivery in M4); notifier config.
 - 2026-11-26 rev 14 (TL, QA gate findings F-1, F-3): the DPoP replay record is authoritative only in `dpop_jti` (Valkey off the replay path); every authenticated route checks the session at `sgen` through one shared extractor.
 - 2026-11-26 rev 14 addendum (TL, e2e finding): `GET /me` `display_name` is nullable.
+- 2026-11-26 rev 15 (TL, e2e finding): Idempotency-Key replay on all identity writes per D.3, with secret-bearing results AEAD-sealed and retention capped at the secret's lifetime; client rule for 2xx bodies that fail to decode.
