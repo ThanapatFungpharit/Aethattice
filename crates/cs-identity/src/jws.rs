@@ -132,10 +132,38 @@ impl AccessTokens {
     }
 
     /// Sign `claims` (`iss` / `aud` are overwritten with this issuer's values).
-    pub async fn sign(&self, mut claims: AccessClaims) -> AuthResult<String> {
+    pub async fn sign(&self, claims: AccessClaims) -> AuthResult<String> {
+        let kid = self.current_key().await?;
+        self.sign_with(&kid, claims).await
+    }
+
+    /// Sign `claims` with the given key version (contract rev 16 P1: a replay re-signs the
+    /// stored claims with the stored `kid`; Ed25519 is deterministic, so the token is
+    /// byte-identical).
+    pub async fn sign_with(&self, kid: &KeyId, claims: AccessClaims) -> AuthResult<String> {
+        self.sign_kid(kid, claims).await?.map_err(kms_err)
+    }
+
+    /// Re-sign stored claims for a replay (rev 16 P1): a `kid` that can no longer sign
+    /// (unknown, not a signing key) is `unauthenticated`; any other KMS failure is
+    /// `unavailable`.
+    pub async fn resign(&self, kid: &KeyId, claims: AccessClaims) -> AuthResult<String> {
+        match self.sign_kid(kid, claims).await? {
+            Ok(t) => Ok(t),
+            Err(
+                KmsError::UnknownKey(_) | KmsError::WrongPurpose { .. } | KmsError::InvalidKeyId,
+            ) => Err(unauthenticated()),
+            Err(e) => Err(kms_err(e)),
+        }
+    }
+
+    async fn sign_kid(
+        &self,
+        kid: &KeyId,
+        mut claims: AccessClaims,
+    ) -> AuthResult<Result<String, KmsError>> {
         claims.iss = self.iss.clone();
         claims.aud = self.aud.clone();
-        let kid = self.current_key().await?;
         let header = Header {
             alg: "EdDSA".to_owned(),
             typ: "at+jwt".to_owned(),
@@ -148,15 +176,11 @@ impl AccessTokens {
             URL_SAFE_NO_PAD.encode(h),
             URL_SAFE_NO_PAD.encode(c)
         );
-        let sig = self
+        Ok(self
             .kms
-            .sign(&kid, signing_input.as_bytes())
+            .sign(kid, signing_input.as_bytes())
             .await
-            .map_err(kms_err)?;
-        Ok(format!(
-            "{signing_input}.{}",
-            URL_SAFE_NO_PAD.encode(sig.to_bytes())
-        ))
+            .map(|sig| format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))))
     }
 
     /// Verify a token at `now` (unix seconds). Every failure is `unauthenticated`, except an

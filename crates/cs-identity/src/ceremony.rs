@@ -113,26 +113,39 @@ pub async fn insert(
     user: Option<UserId>,
     session: Option<SessionId>,
     state: Zeroizing<Vec<u8>>,
-) -> Result<Secret<String>, DbError> {
+    idem: Option<crate::idem::Idem>,
+    render: impl Fn(&Secret<String>) -> Result<crate::idem::Reply, DbError> + Send + Sync + 'static,
+) -> Result<crate::idem::Ran<Secret<String>>, DbError> {
     let source = source.to_owned();
-    pool.transaction(move |tx| {
-        let (keys, source, state) = (keys.clone(), source.clone(), state.clone());
-        Box::pin(async move {
-            insert_in_tx(
-                tx,
-                &keys,
-                New {
-                    tenant,
-                    kind,
-                    source: &source,
-                    user,
-                    session,
-                    state: &state,
-                },
-            )
-            .await
-        })
-    })
+    // With `idem`: the reply (it carries the ceremony bearer) is stored sealed for the
+    // ceremony's lifetime (contract rev 16 P3).
+    let ttl = match kind {
+        Kind::Mfa => MFA_TTL_SECS,
+        _ => WEBAUTHN_TTL_SECS,
+    };
+    crate::idem::run(
+        pool,
+        idem,
+        move |tx| {
+            let (keys, source, state) = (keys.clone(), source.clone(), state.clone());
+            Box::pin(async move {
+                insert_in_tx(
+                    tx,
+                    &keys,
+                    New {
+                        tenant,
+                        kind,
+                        source: &source,
+                        user,
+                        session,
+                        state: &state,
+                    },
+                )
+                .await
+            })
+        },
+        move |txn| Ok(crate::idem::Entry::secret(render(txn)?, ttl)),
+    )
     .await
 }
 

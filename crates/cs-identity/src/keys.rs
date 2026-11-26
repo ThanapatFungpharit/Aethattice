@@ -28,6 +28,8 @@ use zeroize::Zeroizing;
 pub const KEK_NAME: &str = "identity-opaque";
 /// Purpose bound into the associated data of the sealed material.
 const PURPOSE: &[u8] = b"opaque-server-keys";
+/// BLAKE3 `derive_key` context of the idempotency replay sealing key (contract rev 16 P2).
+const IDEMPOTENCY_KEY_CONTEXT: &str = "identity idempotency v1";
 /// `opaque_registrations.server_key_version` prefix.
 pub const KEY_VERSION_PREFIX: &str = "opaque-server/v";
 
@@ -73,6 +75,33 @@ impl ServerKeyVersion {
         }
         let (nonce, ct) = sealed.split_at(24);
         aead_open(&self.seal_key, nonce, ct, ad)
+    }
+
+    /// (rev 16 P2) Seal an idempotency replay payload under the purpose key derived from this
+    /// version's seal key (BLAKE3 `derive_key`, context `identity idempotency v1`):
+    /// `nonce(24) ‖ ciphertext`.
+    pub fn seal_idempotency(&self, plaintext: &[u8], ad: &[u8]) -> AuthResult<Vec<u8>> {
+        let k = self.idempotency_key();
+        let (nonce, ct) = aead_seal(&k, plaintext, ad)?;
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    /// Open a payload sealed by [`Self::seal_idempotency`]; `None` on any failure.
+    pub fn open_idempotency(&self, sealed: &[u8], ad: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+        if sealed.len() < 24 {
+            return None;
+        }
+        let (nonce, ct) = sealed.split_at(24);
+        aead_open(&self.idempotency_key(), nonce, ct, ad)
+    }
+
+    fn idempotency_key(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(blake3::derive_key(
+            IDEMPOTENCY_KEY_CONTEXT,
+            self.seal_key.as_slice(),
+        ))
     }
 
     fn generate(version: i32) -> AuthResult<(Self, Zeroizing<Vec<u8>>)> {

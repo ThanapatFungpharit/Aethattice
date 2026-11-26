@@ -9,6 +9,7 @@
 
 use crate::admin::AdminResult as AuthResult;
 use crate::auth::AuthService;
+use crate::idem::{Entry, IdemRequest, Out};
 use crate::jws::AccessClaims;
 use crate::recovery::RFC3339;
 use crate::session;
@@ -79,7 +80,15 @@ impl AuthService {
     }
 
     /// `DELETE /api/v2/me/sessions/{sid}`.
-    pub async fn session_revoke(&self, claims: &AccessClaims, sid: &str) -> AuthResult<Revoked> {
+    ///
+    /// With an `Idempotency-Key`, the current session is a logout (its record stores the
+    /// cookie clear); another session stores `204` or the committed `404`.
+    pub async fn session_revoke(
+        &self,
+        claims: &AccessClaims,
+        sid: &str,
+        idem: Option<IdemRequest>,
+    ) -> AuthResult<Out<Revoked>> {
         let (tenant, user, current) = Self::subject(claims)?;
         let not_found = || -> crate::admin::AdminError {
             Error::new(ErrorCode::NotFound)
@@ -91,13 +100,26 @@ impl AuthService {
             .and_then(|u| SessionId::from_uuid(u).ok())
             .ok_or_else(not_found)?;
         if target == current {
-            self.logout(claims).await?;
-            return Ok(Revoked::Current);
+            return Ok(match self.logout(claims, idem).await? {
+                Out::Value(()) => Out::Value(Revoked::Current),
+                Out::Reply(r) => Out::Reply(r),
+            });
+        }
+        let idem = match idem {
+            Some(_) => {
+                let keys = self.keys().await?;
+                self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?
+            }
+            None => None,
+        };
+        if let Some(r) = self.early(idem.as_ref()).await? {
+            return Ok(r);
         }
         self.require_step_up(claims).await?;
-        let ok = self
-            .pool
-            .transaction(move |tx| {
+        let ran = crate::idem::run(
+            &self.pool,
+            idem.clone(),
+            move |tx| {
                 Box::pin(async move {
                     let mine: Option<bool> = sqlx::query_scalar(
                         "SELECT state = 'active' FROM sessions \
@@ -113,12 +135,23 @@ impl AuthService {
                     }
                     session::revoke_session(tx, tenant, target, "user_revoked").await
                 })
-            })
-            .await?;
-        if ok {
-            Ok(Revoked::Other)
-        } else {
-            Err(not_found())
+            },
+            |ok| {
+                Ok(if *ok {
+                    Entry::plain(crate::wire::no_content(false))
+                } else {
+                    Entry::Failed {
+                        status: 404,
+                        code: ErrorCode::NotFound,
+                    }
+                })
+            },
+        )
+        .await?;
+        match self.ran_plain(idem.as_ref(), ran, |ok| ok)? {
+            Out::Value(true) => Ok(Out::Value(Revoked::Other)),
+            Out::Value(false) => Err(not_found()),
+            Out::Reply(r) => Ok(Out::Reply(r)),
         }
     }
 }

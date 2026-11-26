@@ -35,6 +35,7 @@ pub mod auth;
 pub mod ceremony;
 pub mod dpop;
 pub mod http;
+pub mod idem;
 pub mod jws;
 pub mod keys;
 pub mod me;
@@ -46,6 +47,7 @@ pub use cs_identity_wire::login;
 pub mod session;
 pub mod token;
 pub mod webauthn;
+pub mod wire;
 
 use cs_db::migrate::{MigrationError, MigrationSet};
 
@@ -68,6 +70,10 @@ pub fn migrations() -> Result<MigrationSet, MigrationError> {
         (
             "0103_mfa_recovery_webauthn.expand.sql",
             include_str!("../migrations/identity/0103_mfa_recovery_webauthn.expand.sql"),
+        ),
+        (
+            "0104_idempotency_secret_expiry.expand.sql",
+            include_str!("../migrations/identity/0104_idempotency_secret_expiry.expand.sql"),
         ),
     ])
 }

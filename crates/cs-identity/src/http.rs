@@ -16,33 +16,41 @@
 //!
 //! OPAQUE messages are base64url without padding (rev 5). Token responses carry
 //! `Cache-Control: no-store`. Nothing here logs a token, txn id, grant or OPAQUE message.
+//!
+//! Rev 15/16: every write except `token/refresh` takes an optional `Idempotency-Key`; the
+//! digest covers the method, the route template, the path parameters and the JCS body, and
+//! the services record the result in the same transaction as the effect ([`crate::idem`]).
+//! Fresh and replayed responses are rendered by [`crate::wire`], so they are byte-identical.
 
-use crate::auth::{AuthService, Authenticated, LoginResult, RequestCtx, source_of};
+use crate::auth::{AuthService, LoginResult, RequestCtx, source_of};
+use crate::idem::{IdemRequest, Out, Reply};
 use crate::jws::AccessClaims;
 use crate::me::Revoked;
-use crate::recovery::{RecoveryStart, StatusBy};
+use crate::recovery::StatusBy;
 use crate::webauthn::AssertOutcome;
-use axum::extract::Path;
-use axum::extract::{ConnectInfo, Extension, FromRequestParts, OriginalUri};
+use crate::wire::{self, CeremonyField};
+use axum::extract::{
+    ConnectInfo, Extension, FromRequest, FromRequestParts, MatchedPath, OriginalUri, Path,
+    RawPathParams, Request,
+};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use cs_api::{ApiError, ApiState, IdempotencyKeyHeader, JsonBody};
-use cs_common::error::{Error, ErrorCode};
-use cs_identity_wire::{KSF_ALGORITHM, KsfParams};
+use cs_api::{ApiError, ApiState, IdempotencyKeyHeader, body_bytes};
+use cs_common::error::{Code, Error, ErrorCode};
+use cs_db::DbError;
+use cs_db::idempotency::{RequestBody, request_digest};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// Refresh cookie name (contract §2.4).
-pub const REFRESH_COOKIE: &str = "__Secure-cs_rt";
-/// Refresh cookie path (contract §2.4).
-pub const REFRESH_COOKIE_PATH: &str = "/api/v2/auth/token";
+pub use crate::wire::{REFRESH_COOKIE, REFRESH_COOKIE_PATH, clear_refresh_cookie, refresh_cookie};
 
-/// The identity routes, to merge into the public route table before the M0 middleware.
 pub fn routes(auth: Arc<AuthService>) -> axum::Router<ApiState> {
     Router::new()
         .route("/api/v2/auth/opaque/login/start", post(login_start))
@@ -109,23 +117,137 @@ impl<S: Send + Sync> FromRequestParts<S> for Source {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct KsfWire {
-    algorithm: &'static str,
-    m_kib: u32,
-    t: u32,
-    p: u32,
+// ----- rev 15: Idempotency-Key on identity writes -----
+
+/// A write's JSON body plus, with an `Idempotency-Key`, its digest over
+/// `[method, route template, path params, JCS(body)]` (M0 §5.3). Rejections as [`JsonBody`].
+#[derive(Debug)]
+pub struct IdemJson<T>(pub T, pub Option<IdemRequest>);
+
+impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for IdemJson<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, ApiError> {
+        let (mut parts, body) = req.into_parts();
+        let IdemParts(idem) = IdemParts::from_request_parts(&mut parts, state).await?;
+        let req = Request::from_parts(parts, body);
+        let is_json = req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"));
+        if !is_json {
+            return Err(ApiError::new(Error::new(ErrorCode::UnsupportedMediaType)));
+        }
+        let bytes = body_bytes(req, state).await?;
+        let v: T = serde_json::from_slice(&bytes).map_err(|_| {
+            ApiError::new(
+                Error::new(ErrorCode::InvalidRequest)
+                    .with_detail("The request body is not valid JSON for this operation."),
+            )
+        })?;
+        let idem = match idem {
+            Some(p) => Some(p.digest(RequestBody::Json(&bytes))?),
+            None => None,
+        };
+        Ok(IdemJson(v, idem))
+    }
 }
 
-impl From<KsfParams> for KsfWire {
-    fn from(k: KsfParams) -> Self {
-        Self {
-            algorithm: KSF_ALGORITHM,
-            m_kib: k.m_kib,
-            t: k.t,
-            p: k.p,
-        }
+/// The idempotency parts of a request (key, method, route template, path params); a
+/// body-less write digests the empty body.
+#[derive(Debug)]
+pub struct IdemParts(Option<Pending>);
+
+#[derive(Debug)]
+pub struct Pending {
+    key: cs_common::idempotency::IdempotencyKey,
+    method: String,
+    route: String,
+    params: BTreeMap<String, String>,
+}
+
+impl Pending {
+    fn digest(self, body: RequestBody<'_>) -> Result<IdemRequest, ApiError> {
+        let digest = request_digest(&self.method, &self.route, &self.params, body)
+            .map_err(|e| ApiError::new(Error::internal(e)))?;
+        Ok(IdemRequest {
+            key: self.key,
+            digest,
+            route: self.route,
+        })
     }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for IdemParts {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        let IdempotencyKeyHeader(key) =
+            IdempotencyKeyHeader::from_request_parts(parts, state).await?;
+        let Some(key) = key else {
+            return Ok(IdemParts(None));
+        };
+        let route = parts
+            .extensions
+            .get::<MatchedPath>()
+            .map(|m| m.as_str().to_owned())
+            .ok_or_else(|| ApiError::new(Error::new(ErrorCode::Internal)))?;
+        let params = match RawPathParams::from_request_parts(parts, state).await {
+            Ok(p) => p
+                .iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+            Err(_) => BTreeMap::new(),
+        };
+        Ok(IdemParts(Some(Pending {
+            key,
+            method: parts.method.as_str().to_owned(),
+            route,
+            params,
+        })))
+    }
+}
+
+impl IdemParts {
+    fn absent_body(self) -> Result<Option<IdemRequest>, ApiError> {
+        self.0.map(|p| p.digest(RequestBody::Absent)).transpose()
+    }
+}
+
+/// The response of a [`Reply`]: status, JSON body, `Set-Cookie`, `Cache-Control: no-store`.
+fn respond(r: Reply) -> Result<Response, ApiError> {
+    let status = StatusCode::from_u16(r.status).map_err(Error::internal)?;
+    let mut resp = if r.body.is_empty() {
+        status.into_response()
+    } else {
+        let mut x = (status, r.body).into_response();
+        x.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        x
+    };
+    if let Some(c) = &r.cookie {
+        resp.headers_mut().insert(
+            header::SET_COOKIE,
+            HeaderValue::from_str(c).map_err(Error::internal)?,
+        );
+    }
+    Ok(no_store(resp))
+}
+
+/// Render a fresh value with the same function the idempotency store used, or the stored
+/// reply: the bytes are identical either way.
+fn out<T>(
+    o: Out<T>,
+    render: impl FnOnce(T) -> Result<Reply, DbError>,
+) -> Result<Response, ApiError> {
+    let r = match o {
+        Out::Value(v) => render(v).map_err(Error::internal)?,
+        Out::Reply(r) => r,
+    };
+    respond(r)
 }
 
 fn b64(field: &str, s: &str) -> Result<Vec<u8>, ApiError> {
@@ -151,30 +273,16 @@ struct LoginStartReq {
     credential_request: String,
 }
 
-#[derive(Debug, Serialize)]
-struct LoginStartResp {
-    login_txn: String,
-    credential_response: String,
-    ksf_params: KsfWire,
-}
-
 async fn login_start(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
-    JsonBody(req): JsonBody<LoginStartReq>,
+    IdemJson(req, idem): IdemJson<LoginStartReq>,
 ) -> Result<Response, ApiError> {
     let cr = b64("credential_request", &req.credential_request)?;
-    let r = auth
-        .login_start(&req.tenant, &req.login, &cr, &source)
+    let o = auth
+        .login_start(&req.tenant, &req.login, &cr, &source, idem)
         .await?;
-    Ok(no_store(
-        Json(LoginStartResp {
-            login_txn: r.login_txn.expose_secret().clone(),
-            credential_response: URL_SAFE_NO_PAD.encode(&r.credential_response),
-            ksf_params: r.ksf_params.into(),
-        })
-        .into_response(),
-    ))
+    out(o, |v| wire::login_start(&v))
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,17 +290,6 @@ async fn login_start(
 struct LoginFinishReq {
     login_txn: String,
     credential_finalization: String,
-}
-
-#[derive(Debug, Serialize)]
-struct AuthResult {
-    state: &'static str,
-    access_token: String,
-    expires_in: i64,
-    session_id: String,
-    /// rev 9: present (and `true`) only when the client should re-register (`ksf_upgrade`).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    reregister: bool,
 }
 
 fn unauthenticated(detail: &str) -> ApiError {
@@ -226,37 +323,11 @@ fn ctx<'a>(
     })
 }
 
-/// `Set-Cookie` for a refresh token (contract §2.4).
-pub fn refresh_cookie(token: &str, max_age: i64) -> String {
-    format!(
-        "{REFRESH_COOKIE}={token}; Path={REFRESH_COOKIE_PATH}; Max-Age={}; Secure; HttpOnly; SameSite=Strict",
-        max_age.max(0)
-    )
-}
-
-/// `Set-Cookie` clearing the refresh cookie (contract §3 `[R10]`; `Secure` is required by
-/// browsers for a `__Secure-` cookie to be accepted, so the attributes are repeated).
-pub fn clear_refresh_cookie() -> String {
-    format!(
-        "{REFRESH_COOKIE}=; Path={REFRESH_COOKIE_PATH}; Max-Age=0; Secure; HttpOnly; SameSite=Strict"
-    )
-}
-
-fn authenticated(a: Authenticated) -> Result<Response, ApiError> {
-    let cookie = refresh_cookie(a.refresh_token.expose_secret(), a.refresh_max_age);
-    let mut r = Json(AuthResult {
-        state: "authenticated",
-        access_token: a.access_token.expose_secret().clone(),
-        expires_in: a.expires_in,
-        session_id: a.session_id.as_uuid().to_string(),
-        reregister: a.reregister,
-    })
-    .into_response();
-    r.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&cookie).map_err(Error::internal)?,
-    );
-    Ok(no_store(r))
+fn login_result(r: LoginResult) -> Result<Reply, DbError> {
+    match r {
+        LoginResult::Authenticated(a) => wire::authenticated(&a),
+        LoginResult::MfaRequired(m) => wire::mfa_required(&m.auth_txn, &m.methods),
+    }
 }
 
 async fn login_finish(
@@ -265,33 +336,15 @@ async fn login_finish(
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<LoginFinishReq>,
+    IdemJson(req, idem): IdemJson<LoginFinishReq>,
 ) -> Result<Response, ApiError> {
     let fin = b64("credential_finalization", &req.credential_finalization)?;
     let c = ctx(&method, &uri, &headers)?;
     let ua = user_agent(&headers);
-    match auth
-        .login_finish(&req.login_txn, &fin, &source, ua.as_deref(), &c)
-        .await?
-    {
-        LoginResult::Authenticated(a) => authenticated(a),
-        LoginResult::MfaRequired(m) => Ok(no_store(
-            Json(MfaRequiredResp {
-                state: "mfa_required",
-                auth_txn: m.auth_txn.expose_secret().clone(),
-                methods: m.methods,
-            })
-            .into_response(),
-        )),
-    }
-}
-
-/// `200 {state: "mfa_required", auth_txn, methods}` (rev 11).
-#[derive(Debug, Serialize)]
-struct MfaRequiredResp {
-    state: &'static str,
-    auth_txn: String,
-    methods: Vec<&'static str>,
+    let o = auth
+        .login_finish(&req.login_txn, &fin, &source, ua.as_deref(), &c, idem)
+        .await?;
+    out(o, login_result)
 }
 
 /// The request's `User-Agent`, if it is valid text.
@@ -328,26 +381,19 @@ fn field_invalid(pointer: &str, detail: &str) -> ApiError {
     )
 }
 
-#[derive(Debug, Serialize)]
-struct RegisterStartResp {
-    registration_txn: String,
-    registration_response: String,
-    ksf_params: KsfWire,
-}
-
 async fn register_start(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<RegisterStartReq>,
+    IdemJson(req, idem): IdemJson<RegisterStartReq>,
 ) -> Result<Response, ApiError> {
     let rr = b64("registration_request", &req.registration_request)?;
-    let r = match (req.purpose, req.grant, req.login) {
+    let o = match (req.purpose, req.grant, req.login) {
         (Some(purpose), None, None) => {
             let claims = claims_of(&auth, &method, &uri, &headers).await?;
-            auth.register_start_session(&claims, &purpose, &rr, &source)
+            auth.register_start_session(&claims, &purpose, &rr, &source, idem)
                 .await?
         }
         (Some(_), _, Some(_)) => {
@@ -363,21 +409,15 @@ async fn register_start(
             ));
         }
         (None, Some(grant), Some(login)) => {
-            auth.register_start(&grant, &login, &rr, &source).await?
+            auth.register_start(&grant, &login, &rr, &source, idem)
+                .await?
         }
         (None, None, _) => {
             return Err(field_invalid("/grant", "grant or purpose is required"));
         }
         (None, Some(_), None) => return Err(field_invalid("/login", "login is required")),
     };
-    Ok(no_store(
-        Json(RegisterStartResp {
-            registration_txn: r.registration_txn.expose_secret().clone(),
-            registration_response: URL_SAFE_NO_PAD.encode(&r.registration_response),
-            ksf_params: r.ksf_params.into(),
-        })
-        .into_response(),
-    ))
+    out(o, |v| wire::register_start(&v))
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,22 +432,21 @@ struct RegisterFinishReq {
 async fn register_finish(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
-    IdempotencyKeyHeader(key): IdempotencyKeyHeader,
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<RegisterFinishReq>,
-) -> Result<StatusCode, ApiError> {
+    IdemJson(req, idem): IdemJson<RegisterFinishReq>,
+) -> Result<Response, ApiError> {
     let up = b64("registration_upload", &req.registration_upload)?;
-    if headers.contains_key(header::AUTHORIZATION) {
+    let o = if headers.contains_key(header::AUTHORIZATION) {
         let claims = claims_of(&auth, &method, &uri, &headers).await?;
-        auth.register_finish_session(&claims, &req.registration_txn, &up, &source)
-            .await?;
+        auth.register_finish_session(&claims, &req.registration_txn, &up, &source, idem)
+            .await?
     } else {
-        auth.register_finish(&req.registration_txn, &up, &source, key.as_ref())
-            .await?;
-    }
-    Ok(StatusCode::NO_CONTENT)
+        auth.register_finish(&req.registration_txn, &up, &source, idem)
+            .await?
+    };
+    out(o, |()| Ok(wire::no_content(false)))
 }
 
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -429,6 +468,7 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     found
 }
 
+/// `token/refresh` keeps its own `[R1]` mechanism (rev 15).
 async fn refresh(
     Extension(auth): Extension<Arc<AuthService>>,
     IdempotencyKeyHeader(key): IdempotencyKeyHeader,
@@ -447,7 +487,30 @@ async fn refresh(
     })?;
     let c = ctx(&method, &uri, &headers)?;
     let a = auth.refresh(&token, key.as_str(), &c).await?;
-    authenticated(a)
+    respond(wire::authenticated(&a).map_err(Error::internal)?)
+}
+
+/// Rev 16 P4: when the session check fails with `unauthenticated` and the request carries an
+/// `Idempotency-Key`, a stored logout reply may still be replayed.
+async fn logout_or_replay(
+    auth: &AuthService,
+    e: ApiError,
+    idem: Option<IdemRequest>,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    own_sid: Option<&str>,
+) -> Result<Response, ApiError> {
+    let Some(idem) = idem else { return Err(e) };
+    if !matches!(e.0.code(), Code::Core(ErrorCode::Unauthenticated)) {
+        return Err(e);
+    }
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let c = ctx(method, uri, headers)?;
+    let r = auth.logout_replay(authorization, &c, idem, own_sid).await?;
+    respond(r)
 }
 
 async fn logout(
@@ -455,15 +518,15 @@ async fn logout(
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
+    idem: IdemParts,
 ) -> Result<Response, ApiError> {
-    let claims = claims_of(&auth, &method, &uri, &headers).await?;
-    auth.logout(&claims).await?;
-    let mut r = StatusCode::NO_CONTENT.into_response();
-    r.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&clear_refresh_cookie()).map_err(Error::internal)?,
-    );
-    Ok(no_store(r))
+    let idem = idem.absent_body()?;
+    let claims = match claims_of(&auth, &method, &uri, &headers).await {
+        Ok(c) => c,
+        Err(e) => return logout_or_replay(&auth, e, idem, &method, &uri, &headers, None).await,
+    };
+    let o = auth.logout(&claims, idem).await?;
+    out(o, |()| Ok(wire::no_content(true)))
 }
 
 async fn jwks(Extension(auth): Extension<Arc<AuthService>>) -> Result<Response, ApiError> {
@@ -495,32 +558,18 @@ struct ReauthStartReq {
     credential_request: String,
 }
 
-#[derive(Debug, Serialize)]
-struct ReauthStartResp {
-    reauth_txn: String,
-    credential_response: String,
-    ksf_params: KsfWire,
-}
-
 async fn reauth_start(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<ReauthStartReq>,
+    IdemJson(req, idem): IdemJson<ReauthStartReq>,
 ) -> Result<Response, ApiError> {
     let claims = claims_of(&auth, &method, &uri, &headers).await?;
     let cr = b64("credential_request", &req.credential_request)?;
-    let r = auth.reauth_start(&claims, &cr, &source).await?;
-    Ok(no_store(
-        Json(ReauthStartResp {
-            reauth_txn: r.login_txn.expose_secret().clone(),
-            credential_response: URL_SAFE_NO_PAD.encode(&r.credential_response),
-            ksf_params: r.ksf_params.into(),
-        })
-        .into_response(),
-    ))
+    let o = auth.reauth_start(&claims, &cr, &source, idem).await?;
+    out(o, |v| wire::reauth_start(&v))
 }
 
 #[derive(Debug, Deserialize)]
@@ -536,13 +585,14 @@ async fn reauth_finish(
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<ReauthFinishReq>,
-) -> Result<StatusCode, ApiError> {
+    IdemJson(req, idem): IdemJson<ReauthFinishReq>,
+) -> Result<Response, ApiError> {
     let claims = claims_of(&auth, &method, &uri, &headers).await?;
     let fin = b64("credential_finalization", &req.credential_finalization)?;
-    auth.reauth_finish(&claims, &req.reauth_txn, &fin, &source)
+    let o = auth
+        .reauth_finish(&claims, &req.reauth_txn, &fin, &source, idem)
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    out(o, |()| Ok(wire::no_content(false)))
 }
 
 async fn me(
@@ -572,12 +622,6 @@ async fn optional_claims(
     }
 }
 
-#[derive(Debug, Serialize)]
-struct RegistrationStartResp {
-    registration_txn: String,
-    public_key: serde_json::Value,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
@@ -588,17 +632,11 @@ async fn wa_register_start(
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(_): JsonBody<Empty>,
+    IdemJson(_, idem): IdemJson<Empty>,
 ) -> Result<Response, ApiError> {
     let claims = claims_of(&auth, &method, &uri, &headers).await?;
-    let s = auth.webauthn_register_start(&claims, &source).await?;
-    Ok(no_store(
-        Json(RegistrationStartResp {
-            registration_txn: s.txn.expose_secret().clone(),
-            public_key: s.public_key,
-        })
-        .into_response(),
-    ))
+    let o = auth.webauthn_register_start(&claims, &source, idem).await?;
+    out(o, |s| wire::ceremony_start(CeremonyField::Registration, &s))
 }
 
 #[derive(Debug, Deserialize)]
@@ -618,19 +656,20 @@ async fn wa_register_finish(
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<WaRegisterFinishReq>,
+    IdemJson(req, idem): IdemJson<WaRegisterFinishReq>,
 ) -> Result<Response, ApiError> {
     let claims = claims_of(&auth, &method, &uri, &headers).await?;
-    let p = auth
+    let o = auth
         .webauthn_register_finish(
             &claims,
             &req.registration_txn,
             &req.credential,
             req.label.as_deref().unwrap_or_default(),
             &source,
+            idem,
         )
         .await?;
-    Ok(no_store(Json(p).into_response()))
+    out(o, |p| Reply::json(200, &p))
 }
 
 #[derive(Debug, Deserialize)]
@@ -639,25 +678,15 @@ struct WaLoginStartReq {
     tenant: String,
 }
 
-#[derive(Debug, Serialize)]
-struct WaLoginStartResp {
-    login_txn: String,
-    public_key: serde_json::Value,
-}
-
 async fn wa_login_start(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
-    JsonBody(req): JsonBody<WaLoginStartReq>,
+    IdemJson(req, idem): IdemJson<WaLoginStartReq>,
 ) -> Result<Response, ApiError> {
-    let s = auth.webauthn_login_start(&req.tenant, &source).await?;
-    Ok(no_store(
-        Json(WaLoginStartResp {
-            login_txn: s.txn.expose_secret().clone(),
-            public_key: s.public_key,
-        })
-        .into_response(),
-    ))
+    let o = auth
+        .webauthn_login_start(&req.tenant, &source, idem)
+        .await?;
+    out(o, |s| wire::ceremony_start(CeremonyField::Login, &s))
 }
 
 #[derive(Debug, Deserialize)]
@@ -673,14 +702,21 @@ async fn wa_login_finish(
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<WaLoginFinishReq>,
+    IdemJson(req, idem): IdemJson<WaLoginFinishReq>,
 ) -> Result<Response, ApiError> {
     let c = ctx(&method, &uri, &headers)?;
     let ua = user_agent(&headers);
-    let a = auth
-        .webauthn_login_finish(&req.login_txn, &req.credential, &source, ua.as_deref(), &c)
+    let o = auth
+        .webauthn_login_finish(
+            &req.login_txn,
+            &req.credential,
+            &source,
+            ua.as_deref(),
+            &c,
+            idem,
+        )
         .await?;
-    authenticated(a)
+    out(o, |a| wire::authenticated(&a))
 }
 
 #[derive(Debug, Deserialize)]
@@ -690,31 +726,19 @@ struct WaAssertStartReq {
     auth_txn: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct WaAssertStartResp {
-    assert_txn: String,
-    public_key: serde_json::Value,
-}
-
 async fn wa_assert_start(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<WaAssertStartReq>,
+    IdemJson(req, idem): IdemJson<WaAssertStartReq>,
 ) -> Result<Response, ApiError> {
     let claims = optional_claims(&auth, &method, &uri, &headers).await?;
-    let s = auth
-        .webauthn_assert_start(req.auth_txn.as_deref(), claims.as_ref(), &source)
+    let o = auth
+        .webauthn_assert_start(req.auth_txn.as_deref(), claims.as_ref(), &source, idem)
         .await?;
-    Ok(no_store(
-        Json(WaAssertStartResp {
-            assert_txn: s.txn.expose_secret().clone(),
-            public_key: s.public_key,
-        })
-        .into_response(),
-    ))
+    out(o, |s| wire::ceremony_start(CeremonyField::Assert, &s))
 }
 
 #[derive(Debug, Deserialize)]
@@ -730,12 +754,12 @@ async fn wa_assert_finish(
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<WaAssertFinishReq>,
+    IdemJson(req, idem): IdemJson<WaAssertFinishReq>,
 ) -> Result<Response, ApiError> {
     let claims = optional_claims(&auth, &method, &uri, &headers).await?;
     let c = ctx(&method, &uri, &headers)?;
     let ua = user_agent(&headers);
-    match auth
+    let o = auth
         .webauthn_assert_finish(
             &req.assert_txn,
             &req.credential,
@@ -743,12 +767,13 @@ async fn wa_assert_finish(
             &source,
             ua.as_deref(),
             &c,
+            idem,
         )
-        .await?
-    {
-        AssertOutcome::Authenticated(a) => authenticated(a),
-        AssertOutcome::SteppedUp => Ok(no_store(StatusCode::NO_CONTENT.into_response())),
-    }
+        .await?;
+    out(o, |a| match a {
+        AssertOutcome::Authenticated(a) => wire::authenticated(&a),
+        AssertOutcome::SteppedUp => Ok(wire::no_content(false)),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -764,14 +789,14 @@ async fn mfa_recovery_code(
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<MfaRecoveryCodeReq>,
+    IdemJson(req, idem): IdemJson<MfaRecoveryCodeReq>,
 ) -> Result<Response, ApiError> {
     let c = ctx(&method, &uri, &headers)?;
     let ua = user_agent(&headers);
-    let a = auth
-        .mfa_recovery_code(&req.auth_txn, &req.code, &source, ua.as_deref(), &c)
+    let o = auth
+        .mfa_recovery_code(&req.auth_txn, &req.code, &source, ua.as_deref(), &c, idem)
         .await?;
-    authenticated(a)
+    out(o, |a| wire::authenticated(&a))
 }
 
 #[derive(Debug, Deserialize)]
@@ -784,27 +809,14 @@ struct RecoveryStartReq {
     code: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct RecoveryResp {
-    state: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    recovery_txn: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    available_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    grant: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    grant_expires_in: Option<i64>,
-}
-
 async fn recovery_start(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
     headers: HeaderMap,
-    JsonBody(req): JsonBody<RecoveryStartReq>,
+    IdemJson(req, idem): IdemJson<RecoveryStartReq>,
 ) -> Result<Response, ApiError> {
     let ua = user_agent(&headers);
-    let r = auth
+    let o = auth
         .recovery_start(
             &req.tenant,
             &req.login,
@@ -812,34 +824,10 @@ async fn recovery_start(
             req.code.as_deref(),
             &source,
             ua.as_deref(),
+            idem,
         )
         .await?;
-    let (status, body) = match r {
-        RecoveryStart::Granted {
-            grant,
-            grant_expires_in,
-        } => (
-            StatusCode::OK,
-            RecoveryResp {
-                state: "granted",
-                recovery_txn: None,
-                available_at: None,
-                grant: Some(grant.expose_secret().clone()),
-                grant_expires_in: Some(grant_expires_in),
-            },
-        ),
-        RecoveryStart::Pending { recovery_txn } => (
-            StatusCode::ACCEPTED,
-            RecoveryResp {
-                state: "pending",
-                recovery_txn: recovery_txn.map(|t| t.expose_secret().clone()),
-                available_at: None,
-                grant: None,
-                grant_expires_in: None,
-            },
-        ),
-    };
-    Ok(no_store((status, Json(body)).into_response()))
+    out(o, |r| wire::recovery_start(&r))
 }
 
 #[derive(Debug, Deserialize)]
@@ -856,7 +844,7 @@ struct RecoveryStatusReq {
 async fn recovery_status(
     Extension(auth): Extension<Arc<AuthService>>,
     Source(source): Source,
-    JsonBody(req): JsonBody<RecoveryStatusReq>,
+    IdemJson(req, idem): IdemJson<RecoveryStatusReq>,
 ) -> Result<Response, ApiError> {
     let by = match (&req.token, &req.recovery_txn, &req.code) {
         (Some(t), None, c) => StatusBy::Link {
@@ -877,17 +865,8 @@ async fn recovery_status(
             ));
         }
     };
-    let s = auth.recovery_status(by, &source).await?;
-    Ok(no_store(
-        Json(RecoveryResp {
-            state: s.state,
-            recovery_txn: None,
-            available_at: s.available_at,
-            grant: s.grant.map(|g| g.expose_secret().clone()),
-            grant_expires_in: s.grant_expires_in,
-        })
-        .into_response(),
-    ))
+    let o = auth.recovery_status(by, &source, idem).await?;
+    out(o, |s| wire::recovery_status(&s))
 }
 
 #[derive(Debug, Serialize)]
@@ -912,16 +891,18 @@ async fn me_session_delete(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path(sid): Path<String>,
+    idem: IdemParts,
 ) -> Result<Response, ApiError> {
-    let claims = claims_of(&auth, &method, &uri, &headers).await?;
-    let mut r = StatusCode::NO_CONTENT.into_response();
-    if auth.session_revoke(&claims, &sid).await? == Revoked::Current {
-        r.headers_mut().insert(
-            header::SET_COOKIE,
-            HeaderValue::from_str(&clear_refresh_cookie()).map_err(Error::internal)?,
-        );
-    }
-    Ok(no_store(r))
+    let idem = idem.absent_body()?;
+    let claims = match claims_of(&auth, &method, &uri, &headers).await {
+        Ok(c) => c,
+        // rev 16 P4: only the caller's own session is replayable after revocation.
+        Err(e) => {
+            return logout_or_replay(&auth, e, idem, &method, &uri, &headers, Some(&sid)).await;
+        }
+    };
+    let o = auth.session_revoke(&claims, &sid, idem).await?;
+    out(o, |r| Ok(wire::no_content(r == Revoked::Current)))
 }
 
 async fn me_passkeys(
@@ -941,20 +922,17 @@ async fn me_passkey_delete(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+    idem: IdemParts,
+) -> Result<Response, ApiError> {
+    let idem = idem.absent_body()?;
     let claims = claims_of(&auth, &method, &uri, &headers).await?;
-    auth.passkey_delete(&claims, &id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let o = auth.passkey_delete(&claims, &id, idem).await?;
+    out(o, |()| Ok(wire::no_content(false)))
 }
 
 #[derive(Debug, Serialize)]
 struct Remaining {
     remaining: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct Codes {
-    codes: Vec<String>,
 }
 
 async fn me_recovery_codes(
@@ -973,15 +951,12 @@ async fn me_recovery_codes_new(
     method: Method,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
+    idem: IdemParts,
 ) -> Result<Response, ApiError> {
+    let idem = idem.absent_body()?;
     let claims = claims_of(&auth, &method, &uri, &headers).await?;
-    let codes = auth.recovery_codes_generate(&claims).await?;
-    Ok(no_store(
-        Json(Codes {
-            codes: codes.iter().map(|c| c.expose_secret().clone()).collect(),
-        })
-        .into_response(),
-    ))
+    let o = auth.recovery_codes_generate(&claims, idem).await?;
+    out(o, |c| wire::codes(&c))
 }
 
 async fn me_recovery_requests(
@@ -1007,10 +982,14 @@ async fn me_recovery_request_cancel(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+    idem: IdemParts,
+) -> Result<Response, ApiError> {
+    let idem = idem.absent_body()?;
     let claims = claims_of(&auth, &method, &uri, &headers).await?;
-    auth.recovery_cancel(&claims, request_id(&id)?).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let o = auth
+        .recovery_cancel(&claims, request_id(&id)?, idem)
+        .await?;
+    out(o, |()| Ok(wire::no_content(false)))
 }
 
 async fn me_recovery_request_approve(
@@ -1019,8 +998,12 @@ async fn me_recovery_request_approve(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+    idem: IdemParts,
+) -> Result<Response, ApiError> {
+    let idem = idem.absent_body()?;
     let claims = claims_of(&auth, &method, &uri, &headers).await?;
-    auth.recovery_approve(&claims, request_id(&id)?).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let o = auth
+        .recovery_approve(&claims, request_id(&id)?, idem)
+        .await?;
+    out(o, |()| Ok(wire::no_content(false)))
 }
