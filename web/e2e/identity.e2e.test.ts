@@ -9,6 +9,11 @@ import {
   isMfaRequired,
   listPasskeys,
   ME_PATH,
+  creationOptionsFromJson,
+  registrationToJson,
+  WEBAUTHN_REGISTER_FINISH_PATH,
+  WEBAUTHN_REGISTER_START_PATH,
+  listSessions,
   meDisplayName,
   reauthenticate,
   RecoveryFlow,
@@ -83,6 +88,9 @@ describe("sign-in (WEB.M1-6: rev 5 §2.1, §2.4)", () => {
     // The token is bound (cnf.jkt): presented as a bearer token, without a proof, it is refused.
     const auth = await tabA.session.authorization();
     const token = auth?.split(" ")[1] ?? "";
+    // Session list: this session is current; last_seen_at is null until its first refresh (nullable).
+    const sessions = await listSessions(tabA.authed);
+    expect(sessions.find((x) => x.current)?.sid).toBe(me.sid);
     const bare = await browser.fetch(`${browser.origin}${ME_PATH}`, { headers: { Authorization: `Bearer ${token}` } });
     expect(bare.status).toBe(401);
   });
@@ -245,8 +253,12 @@ describe("passkey with a software authenticator (rev 10/11)", () => {
   it("registers a passkey on a stepped-up session", async () => {
     const t = session.tab;
     if (!t) throw new Error("no session");
+    const from = t.browser.log.length;
     const pk = await registerPasskey(t.authed, authn, "e2e key");
     expect(pk.label).toBe("e2e key");
+    expect(pk.last_used_at).toBeNull();
+    // Exactly one finish, answered 2xx (no retry of a write that succeeded).
+    expect(t.browser.requests(WEBAUTHN_REGISTER_FINISH_PATH, from).map((r) => r.status)).toEqual([200]);
     expect(await listPasskeys(t.authed)).toHaveLength(1);
   });
 
@@ -266,6 +278,24 @@ describe("passkey with a software authenticator (rev 10/11)", () => {
     await completeMfaWithPasskey(m.deps, authn, mfa as MfaRequired);
     expect((await getMe(m.authed)).login).toBe(E2E.login);
     session.tab = m;
+  });
+});
+
+describe("Idempotency-Key replay of identity writes (contract rev 15)", () => {
+  // A lost register/finish response retried with the same Idempotency-Key must replay the first 2xx instead of
+  // answering 401 for the consumed txn. Server-side replay is the backend's rev 15 work (TL, 2026-11-26).
+  it.skip("register/finish retried with the same Idempotency-Key replays the 2xx (pending backend, contract rev 15)", async () => {
+    const t = session.tab;
+    if (!t) throw new Error("no session");
+    await reauthenticate(t.deps, t.authed, E2E.tenant, E2E.login, password);
+    const start = await t.authed.post<{ registration_txn: string; public_key: unknown }>(WEBAUTHN_REGISTER_START_PATH, { body: {} });
+    const credential = await new SoftAuthenticator(`https://${E2E.domain}`).create({ publicKey: creationOptionsFromJson(start.data.public_key) });
+    if (!credential) throw new Error("no credential");
+    const body = { registration_txn: start.data.registration_txn, credential: registrationToJson(credential), label: "replayed" };
+    const first = await t.authed.post(WEBAUTHN_REGISTER_FINISH_PATH, { body, idempotencyKey: "e2e-replay-1", retry: false });
+    const again = await t.authed.post(WEBAUTHN_REGISTER_FINISH_PATH, { body, idempotencyKey: "e2e-replay-1", retry: false });
+    expect(again.status).toBe(first.status);
+    expect(again.data).toEqual(first.data);
   });
 });
 

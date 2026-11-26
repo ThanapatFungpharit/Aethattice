@@ -147,7 +147,7 @@ export class BrowserLike {
 
   /** A new tab of this profile: its own AuthSession, DPoP manager and clients, sharing cookies, keys, lock, channel. */
   tab(opts: { lock?: "web-locks" | "lease"; clock?: Clock } = {}): Tab {
-    return new Tab(this, opts.lock === "lease" ? localStorageLeaseLock(this.storage, { key: `lease-${this.channelName}` }) : webLocksRefreshLock(this.locks), opts.clock ?? systemClock, broadcastAuthChannel(new BroadcastChannel(this.channelName) as unknown as Parameters<typeof broadcastAuthChannel>[0]));
+    return new Tab(this, opts.lock === "lease" ? localStorageLeaseLock(this.storage, { key: `lease-${this.channelName}` }) : webLocksRefreshLock(this.locks), opts.clock ?? systemClock, broadcastAuthChannel(new BroadcastChannel(this.channelName)));
   }
 
   private cookieHeader(path: string): string {

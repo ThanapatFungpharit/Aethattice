@@ -245,7 +245,9 @@ export interface Passkey {
 
 export function decodePasskey(v: unknown): Passkey {
   if (!isRecord(v)) throw new TypeError("passkey: not an object");
-  const { last_used_at, prf, label } = v;
+  const { prf, label } = v;
+  // register/finish answers {id, label, created_at, prf} without last_used_at (contract rev 10 §2.2): absent = null.
+  const last_used_at = v.last_used_at === undefined ? null : v.last_used_at;
   if (typeof prf !== "boolean") throw new TypeError("prf must be a boolean");
   if (typeof label !== "string") throw new TypeError("label missing");
   if (last_used_at !== null && (typeof last_used_at !== "string" || Number.isNaN(Date.parse(last_used_at)))) {

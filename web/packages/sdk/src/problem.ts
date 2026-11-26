@@ -202,6 +202,24 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * A 2xx response whose body the client could not decode (not JSON, or not the contract shape). The request
+ * succeeded on the server, so it is never retried and never triggers a refresh: its problem is `internal` with
+ * `retryable: false`, and `requestId` names the server request for support. TL ruling 2026-11-26 (M1 e2e).
+ */
+export class ResponseDecodeError extends ApiError {
+  readonly requestId: string | undefined;
+  constructor(httpStatus: number, attempts: number, opts: { requestId?: string | undefined; instance?: string | undefined }) {
+    super({ ...synthesizeProblem("internal", opts), retryable: false }, { httpStatus, synthesized: true, attempts });
+    this.name = "ResponseDecodeError";
+    this.requestId = opts.requestId;
+  }
+}
+
+export function isResponseDecodeError(e: unknown): e is ResponseDecodeError {
+  return e instanceof ResponseDecodeError;
+}
+
 export function isApiError(e: unknown): e is ApiError {
   return e instanceof ApiError;
 }

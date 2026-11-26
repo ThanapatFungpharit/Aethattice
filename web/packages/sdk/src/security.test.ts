@@ -341,7 +341,8 @@ describe("WebAuthn (rev 10 wire shapes, L3 JSON, base64url)", () => {
             extensions: { prf: {} },
           },
         }),
-      [WEBAUTHN_REGISTER_FINISH_PATH]: () => json(passkey),
+      // Contract rev 10 §2.2: register/finish → {id, label, created_at, prf}, no last_used_at (decoded as null).
+      [WEBAUTHN_REGISTER_FINISH_PATH]: () => json({ id: passkey.id, label: passkey.label, created_at: passkey.created_at, prf: passkey.prf }),
     });
     await signIn(s.deps, TENANT, "alice", "pw");
     const creds = new FakeCredentials();
@@ -468,6 +469,11 @@ describe("sessions, recovery codes and recovery requests (rev 10)", () => {
     expect(list.map((x) => [x.sid, x.current, x.user_agent])).toEqual([["a", true, "Firefox"], ["b", false, null]]);
     await revokeSession(s.deps.client, "b");
     expect(s.requests[1]!.method).toBe("DELETE");
+  });
+
+  it("accepts last_seen_at null for a session never refreshed (nullable on the server)", async () => {
+    const s = setup({ "GET /api/v2/me/sessions": () => json({ items: [{ ...sess("a", true), last_seen_at: null }] }) });
+    expect((await listSessions(s.deps.client))[0]?.last_seen_at).toBeNull();
   });
 
   it("refuses a session list with a non-RFC 3339 timestamp", async () => {
