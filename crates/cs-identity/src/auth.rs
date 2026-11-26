@@ -712,7 +712,13 @@ impl AuthService {
                 crate::dpop::sweep_expired_jti(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES).await;
             let ceremonies =
                 crate::ceremony::sweep_expired(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES).await;
-            tracing::debug!(deleted, jti, ceremonies, "expiry sweep finished");
+            let replays = crate::idem::sweep_expired_secrets(
+                &pool,
+                SWEEP_BATCH_ROWS,
+                SWEEP_MAX_BATCHES,
+            )
+            .await;
+            tracing::debug!(deleted, jti, ceremonies, replays, "expiry sweep finished");
         });
     }
 

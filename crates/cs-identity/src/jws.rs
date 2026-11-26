@@ -132,10 +132,17 @@ impl AccessTokens {
     }
 
     /// Sign `claims` (`iss` / `aud` are overwritten with this issuer's values).
-    pub async fn sign(&self, mut claims: AccessClaims) -> AuthResult<String> {
+    pub async fn sign(&self, claims: AccessClaims) -> AuthResult<String> {
+        let kid = self.current_key().await?;
+        self.sign_with(&kid, claims).await
+    }
+
+    /// Sign `claims` with the given key version (contract rev 16 P1: a replay re-signs the
+    /// stored claims with the stored `kid`; Ed25519 is deterministic, so the token is
+    /// byte-identical).
+    pub async fn sign_with(&self, kid: &KeyId, mut claims: AccessClaims) -> AuthResult<String> {
         claims.iss = self.iss.clone();
         claims.aud = self.aud.clone();
-        let kid = self.current_key().await?;
         let header = Header {
             alg: "EdDSA".to_owned(),
             typ: "at+jwt".to_owned(),

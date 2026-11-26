@@ -37,6 +37,7 @@ pub mod dpop;
 pub mod http;
 pub mod jws;
 pub mod keys;
+pub mod idem;
 pub mod me;
 pub mod mfa;
 pub mod notify;
@@ -68,6 +69,10 @@ pub fn migrations() -> Result<MigrationSet, MigrationError> {
         (
             "0103_mfa_recovery_webauthn.expand.sql",
             include_str!("../migrations/identity/0103_mfa_recovery_webauthn.expand.sql"),
+        ),
+        (
+            "0104_idempotency_secret_expiry.expand.sql",
+            include_str!("../migrations/identity/0104_idempotency_secret_expiry.expand.sql"),
         ),
     ])
 }
