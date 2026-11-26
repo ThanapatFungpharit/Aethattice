@@ -27,7 +27,11 @@ use crate::admin::AdminResult as AuthResult;
 use crate::auth::{EXPIRY_BUCKETS, unauthenticated};
 use crate::keys::OpaqueKeys;
 use crate::token::TokenHash;
-use cs_common::error::{Error, ErrorCode};
+use crate::jws::AccessClaims;
+use crate::session::NewTokens;
+use cs_common::error::{Code, Error, ErrorCode};
+use cs_common::secret::Secret;
+use cs_crypto::sig::KeyId;
 use cs_common::id::{PrincipalId, TenantId, UserId};
 use cs_common::idempotency::IdempotencyKey;
 use cs_db::idempotency::{
@@ -521,4 +525,118 @@ pub async fn sweep_expired_secrets(pool: &DomainPool, batch_rows: i64, max_batch
         }
     }
     total
+}
+
+/// A service result: the typed value (fresh, or a re-signed §2.4 replay) or a stored reply.
+#[derive(Debug)]
+pub enum Out<T> {
+    Value(T),
+    Reply(Reply),
+}
+
+impl crate::auth::AuthService {
+    /// Bind an extracted request to its scope (`None` without an `Idempotency-Key`).
+    pub(crate) fn bind_idem(
+        &self,
+        req: Option<IdemRequest>,
+        tenant: TenantId,
+        principal: impl FnOnce() -> AuthResult<PrincipalId>,
+        keys: &Arc<OpaqueKeys>,
+    ) -> AuthResult<Option<Idem>> {
+        req.map(|r| {
+            Ok(Idem::new(
+                r,
+                tenant,
+                principal()?,
+                keys.clone(),
+                self.policy.idempotency_retention_hours,
+            ))
+        })
+        .transpose()
+    }
+
+    /// The signing key for a §2.4 result, fetched before the effect transaction (rev 16 P1).
+    pub(crate) async fn signing_kid(&self) -> AuthResult<KeyId> {
+        self.access_tokens().current_key().await
+    }
+
+    /// Decode a replay; a §2.4 envelope is re-signed with its stored `kid`.
+    pub(crate) async fn open_replay<T>(
+        &self,
+        idem: Option<&Idem>,
+        r: Replayed,
+        session: impl FnOnce(crate::auth::Authenticated) -> T,
+    ) -> AuthResult<Out<T>> {
+        let idem = idem.ok_or_else(|| Error::new(ErrorCode::Internal))?;
+        match idem.open(r)? {
+            Opened::Reply(r) => Ok(Out::Reply(r)),
+            Opened::Session(s) => Ok(Out::Value(session(self.resign(s).await?))),
+        }
+    }
+
+    async fn resign(&self, s: SessionSeal) -> AuthResult<crate::auth::Authenticated> {
+        let claims: AccessClaims =
+            serde_json::from_slice(&s.claims).map_err(|_| unauthenticated())?;
+        let kid = KeyId::from_str(&s.kid).map_err(|_| unauthenticated())?;
+        let token = match self.access_tokens().sign_with(&kid, claims).await {
+            Ok(t) => t,
+            Err(e) if matches!(e.code(), Code::Core(ErrorCode::Unavailable)) => return Err(e),
+            // rev 16 P1: a kid that can no longer sign → unauthenticated.
+            Err(_) => return Err(unauthenticated()),
+        };
+        let session_id = uuid::Uuid::parse_str(&s.session_id)
+            .ok()
+            .and_then(|u| cs_common::id::SessionId::from_uuid(u).ok())
+            .ok_or_else(unauthenticated)?;
+        Ok(crate::auth::Authenticated {
+            access_token: Secret::new(token),
+            expires_in: s.expires_in,
+            session_id,
+            refresh_token: Secret::new(s.refresh_token),
+            refresh_max_age: s.refresh_max_age,
+            reregister: s.reregister,
+        })
+    }
+
+    /// Sign a fresh §2.4 result with the `kid` stored in its envelope.
+    pub(crate) async fn finish_tokens_with(
+        &self,
+        kid: &KeyId,
+        nt: NewTokens,
+        reregister: bool,
+    ) -> AuthResult<crate::auth::Authenticated> {
+        let expires_in = nt.claims.exp - nt.claims.iat;
+        let at = self.access_tokens().sign_with(kid, nt.claims).await?;
+        Ok(crate::auth::Authenticated {
+            access_token: Secret::new(at),
+            expires_in,
+            session_id: nt.session_id,
+            refresh_token: nt.refresh.token,
+            refresh_max_age: nt.refresh_max_age,
+            reregister,
+        })
+    }
+}
+
+/// The sealed §2.4 envelope of a fresh session (rev 16 P1), kept for the access token's
+/// lifetime.
+pub(crate) fn session_entry(
+    nt: &NewTokens,
+    kid: &KeyId,
+    reregister: bool,
+) -> Result<Entry, DbError> {
+    let claims = serde_json::to_vec(&nt.claims).map_err(|e| DbError::Invalid(e.to_string()))?;
+    Ok(Entry::Secret {
+        status: 200,
+        ttl_secs: nt.claims.exp - nt.claims.iat,
+        content: Content::Session(SessionSeal {
+            claims,
+            kid: kid.to_string(),
+            refresh_token: nt.refresh.token.expose_secret().clone(),
+            refresh_max_age: nt.refresh_max_age,
+            expires_in: nt.claims.exp - nt.claims.iat,
+            session_id: nt.session_id.as_uuid().to_string(),
+            reregister,
+        }),
+    })
 }

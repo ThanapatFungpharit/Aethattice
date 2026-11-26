@@ -47,6 +47,7 @@ pub use cs_identity_wire::login;
 pub mod session;
 pub mod token;
 pub mod webauthn;
+pub mod wire;
 
 use cs_db::migrate::{MigrationError, MigrationSet};
 
