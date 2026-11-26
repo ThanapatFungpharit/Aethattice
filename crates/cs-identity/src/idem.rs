@@ -25,15 +25,15 @@
 
 use crate::admin::AdminResult as AuthResult;
 use crate::auth::{EXPIRY_BUCKETS, unauthenticated};
-use crate::keys::OpaqueKeys;
-use crate::token::TokenHash;
 use crate::jws::AccessClaims;
+use crate::keys::OpaqueKeys;
 use crate::session::NewTokens;
+use crate::token::TokenHash;
 use cs_common::error::{Code, Error, ErrorCode};
-use cs_common::secret::Secret;
-use cs_crypto::sig::KeyId;
 use cs_common::id::{PrincipalId, TenantId, UserId};
 use cs_common::idempotency::IdempotencyKey;
+use cs_common::secret::Secret;
+use cs_crypto::sig::KeyId;
 use cs_db::idempotency::{
     Begin, IdempotencyRecords, IdempotencyScope, RequestDigest, StoredResponse,
 };
@@ -104,7 +104,11 @@ pub fn token_principal(hash: &TokenHash) -> AuthResult<PrincipalId> {
 /// depend on whether the account exists.
 pub fn start_principal(route: &str, tenant: TenantId, login: &str) -> AuthResult<PrincipalId> {
     let mut h = blake3::Hasher::new_derive_key("identity idempotency start principal v1");
-    for part in [route.as_bytes(), tenant.as_uuid().as_bytes(), login.as_bytes()] {
+    for part in [
+        route.as_bytes(),
+        tenant.as_uuid().as_bytes(),
+        login.as_bytes(),
+    ] {
         h.update(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
         h.update(part);
     }
@@ -248,7 +252,8 @@ impl Idem {
                 )
             }
         };
-        let body = cs_crypto::cbor::to_canonical(&env).map_err(|e| DbError::Invalid(e.to_string()))?;
+        let body =
+            cs_crypto::cbor::to_canonical(&env).map_err(|e| DbError::Invalid(e.to_string()))?;
         IdempotencyRecords::complete(tx, &self.0.scope, &StoredResponse { status, body }).await?;
         // Always written: a record re-claimed after expiry must not keep a stale deadline.
         let s = &self.0.scope;
@@ -288,7 +293,9 @@ impl Idem {
             Envelope::Expired => Err(unauthenticated()),
             Envelope::Sealed { key_version, ct } => {
                 let k = self.0.keys.get(key_version).ok_or_else(unauthenticated)?;
-                let pt = k.open_idempotency(&ct, &self.ad()).ok_or_else(unauthenticated)?;
+                let pt = k
+                    .open_idempotency(&ct, &self.ad())
+                    .ok_or_else(unauthenticated)?;
                 let p: SealedPayload = cs_crypto::cbor::from_canonical(&pt, MAX_SEALED_BYTES)
                     .map_err(|_| unauthenticated())?;
                 if r.db_now >= p.not_after {

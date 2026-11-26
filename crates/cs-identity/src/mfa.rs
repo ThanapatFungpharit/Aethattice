@@ -20,8 +20,8 @@ use crate::auth::{
     AuthService, Authenticated, RequestCtx, dpop_proof_required, mfa_required_error,
     unauthenticated,
 };
-use crate::idem::{Entry, IdemRequest, Out, Ran};
 use crate::ceremony::{self, Kind};
+use crate::idem::{Entry, IdemRequest, Out, Ran};
 use crate::recovery;
 use crate::session::{self, NewSession};
 use crate::token;

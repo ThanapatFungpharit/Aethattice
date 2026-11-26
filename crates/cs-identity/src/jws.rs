@@ -157,7 +157,7 @@ impl AccessTokens {
         );
         let sig = self
             .kms
-            .sign(&kid, signing_input.as_bytes())
+            .sign(kid, signing_input.as_bytes())
             .await
             .map_err(kms_err)?;
         Ok(format!(

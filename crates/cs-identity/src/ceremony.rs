@@ -123,24 +123,29 @@ pub async fn insert(
         Kind::Mfa => MFA_TTL_SECS,
         _ => WEBAUTHN_TTL_SECS,
     };
-    crate::idem::run(pool, idem, move |tx| {
-        let (keys, source, state) = (keys.clone(), source.clone(), state.clone());
-        Box::pin(async move {
-            insert_in_tx(
-                tx,
-                &keys,
-                New {
-                    tenant,
-                    kind,
-                    source: &source,
-                    user,
-                    session,
-                    state: &state,
-                },
-            )
-            .await
-        })
-    }, move |txn| Ok(crate::idem::Entry::secret(render(txn)?, ttl)))
+    crate::idem::run(
+        pool,
+        idem,
+        move |tx| {
+            let (keys, source, state) = (keys.clone(), source.clone(), state.clone());
+            Box::pin(async move {
+                insert_in_tx(
+                    tx,
+                    &keys,
+                    New {
+                        tenant,
+                        kind,
+                        source: &source,
+                        user,
+                        session,
+                        state: &state,
+                    },
+                )
+                .await
+            })
+        },
+        move |txn| Ok(crate::idem::Entry::secret(render(txn)?, ttl)),
+    )
     .await
 }
 

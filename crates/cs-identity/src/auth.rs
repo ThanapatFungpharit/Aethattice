@@ -725,12 +725,9 @@ impl AuthService {
                 crate::dpop::sweep_expired_jti(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES).await;
             let ceremonies =
                 crate::ceremony::sweep_expired(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES).await;
-            let replays = crate::idem::sweep_expired_secrets(
-                &pool,
-                SWEEP_BATCH_ROWS,
-                SWEEP_MAX_BATCHES,
-            )
-            .await;
+            let replays =
+                crate::idem::sweep_expired_secrets(&pool, SWEEP_BATCH_ROWS, SWEEP_MAX_BATCHES)
+                    .await;
             tracing::debug!(deleted, jti, ceremonies, replays, "expiry sweep finished");
         });
     }
@@ -760,7 +757,7 @@ impl AuthService {
         let idem = self.bind_idem(
             idem,
             tenant,
-            || crate::idem::start_principal(ROUTE_LOGIN_START, tenant, &login),
+            || crate::idem::start_principal(crate::idem::ROUTE_LOGIN_START, tenant, &login),
             &keys,
         )?;
         if let Some(r) = self.early(idem.as_ref()).await? {
@@ -907,12 +904,7 @@ impl AuthService {
         )?;
         let keys = self.keys().await?;
         let (tenant, hash) = (parsed.tenant_id, parsed.hash);
-        let idem = self.bind_idem(
-            idem,
-            tenant,
-            || crate::idem::token_principal(&hash),
-            &keys,
-        )?;
+        let idem = self.bind_idem(idem, tenant, || crate::idem::token_principal(&hash), &keys)?;
         if let Some(r) = self
             .early_replay(idem.as_ref(), LoginResult::Authenticated)
             .await?
@@ -1093,12 +1085,7 @@ impl AuthService {
         let keys = self.keys().await?;
         self.sweep();
         let (tenant, ghash) = (g.tenant_id, g.hash);
-        let idem = self.bind_idem(
-            idem,
-            tenant,
-            || crate::idem::token_principal(&ghash),
-            &keys,
-        )?;
+        let idem = self.bind_idem(idem, tenant, || crate::idem::token_principal(&ghash), &keys)?;
         if let Some(r) = self.early(idem.as_ref()).await? {
             return Ok(r);
         }
@@ -1207,12 +1194,7 @@ impl AuthService {
         let source = source.to_owned();
         // Idempotency scope: the registration txn (rev 16 P3), so a retry after the txn was
         // consumed finds the record.
-        let idem = self.bind_idem(
-            idem,
-            tenant,
-            || crate::idem::token_principal(&hash),
-            &keys,
-        )?;
+        let idem = self.bind_idem(idem, tenant, || crate::idem::token_principal(&hash), &keys)?;
         if let Some(r) = self.early(idem.as_ref()).await? {
             return Ok(r);
         }
@@ -1260,12 +1242,7 @@ impl AuthService {
         let request = RegistrationRequest::<Suite>::deserialize(registration_request)
             .map_err(|_| invalid("/registration_request", "malformed registration_request"))?;
         let keys = self.keys().await?;
-        let idem = self.bind_idem(
-            idem,
-            tenant,
-            || crate::idem::user_principal(user),
-            &keys,
-        )?;
+        let idem = self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?;
         if let Some(r) = self.early(idem.as_ref()).await? {
             return Ok(r);
         }
@@ -1349,12 +1326,7 @@ impl AuthService {
             .serialize()
             .to_vec();
         let keys = self.keys().await?;
-        let idem = self.bind_idem(
-            idem,
-            tenant,
-            || crate::idem::user_principal(user),
-            &keys,
-        )?;
+        let idem = self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?;
         if let Some(r) = self.early(idem.as_ref()).await? {
             return Ok(r);
         }
@@ -1574,6 +1546,7 @@ impl AuthService {
         authorization: Option<&str>,
         ctx: &RequestCtx<'_>,
         idem: IdemRequest,
+        own_sid: Option<&str>,
     ) -> AuthResult<Reply> {
         let (scheme, token) = authorization
             .and_then(|v| v.split_once(' '))
@@ -1581,7 +1554,11 @@ impl AuthService {
             .ok_or_else(unauthenticated)?;
         let claims = self.tokens.verify(token, unix_now()).await?;
         self.require_binding(scheme, token, &claims, ctx).await?;
-        let (tenant, user, _) = Self::subject(&claims)?;
+        let (tenant, user, session) = Self::subject(&claims)?;
+        // `DELETE /me/sessions/{sid}`: only the caller's own session (rev 16 P4).
+        if own_sid.is_some_and(|s| Uuid::parse_str(s).ok() != Some(session.into_uuid())) {
+            return Err(unauthenticated());
+        }
         let keys = self.keys().await?;
         let idem = self
             .bind_idem(
@@ -1626,12 +1603,7 @@ impl AuthService {
         let request = CredentialRequest::<Suite>::deserialize(credential_request)
             .map_err(|_| invalid("/credential_request", "malformed credential_request"))?;
         let keys = self.keys().await?;
-        let idem = self.bind_idem(
-            idem,
-            tenant,
-            || crate::idem::user_principal(user),
-            &keys,
-        )?;
+        let idem = self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?;
         if let Some(r) = self.early(idem.as_ref()).await? {
             return Ok(r);
         }
@@ -1739,12 +1711,7 @@ impl AuthService {
             },
         )?;
         let keys = self.keys().await?;
-        let idem = self.bind_idem(
-            idem,
-            tenant,
-            || crate::idem::user_principal(user),
-            &keys,
-        )?;
+        let idem = self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?;
         if let Some(r) = self.early(idem.as_ref()).await? {
             return Ok(r);
         }

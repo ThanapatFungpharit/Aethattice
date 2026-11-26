@@ -29,11 +29,11 @@ use crate::auth::{
 };
 use crate::ceremony::{self, Kind};
 use crate::idem::{Entry, IdemRequest, Out, Ran, Reply};
-use crate::wire::{self, CeremonyField};
 use crate::jws::AccessClaims;
 use crate::recovery::RFC3339;
 use crate::session::{self, NewSession};
 use crate::token::{self, TokenHash};
+use crate::wire::{self, CeremonyField};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use cs_common::error::{Error, ErrorCode};
@@ -278,12 +278,7 @@ impl AuthService {
     ) -> AuthResult<Out<CeremonyStart>> {
         let (tenant, user, session) = Self::subject(claims)?;
         let keys = self.keys().await?;
-        let idem = self.bind_idem(
-            idem,
-            tenant,
-            || crate::idem::user_principal(user),
-            &keys,
-        )?;
+        let idem = self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?;
         if let Some(r) = self.early(idem.as_ref()).await? {
             return Ok(r);
         }
@@ -408,12 +403,7 @@ impl AuthService {
             .unwrap_or_default();
         let rp = self.rp()?;
         let keys = self.keys().await?;
-        let idem = self.bind_idem(
-            idem,
-            tenant,
-            || crate::idem::user_principal(user),
-            &keys,
-        )?;
+        let idem = self.bind_idem(idem, tenant, || crate::idem::user_principal(user), &keys)?;
         if let Some(r) = self.early(idem.as_ref()).await? {
             return Ok(r);
         }
@@ -693,9 +683,7 @@ impl AuthService {
             Ran::Replay(r) => return self.open_replay(idem.as_ref(), r, |a| a).await,
         };
         match out {
-            Finish::Ok(nt, _) => Ok(Out::Value(
-                self.finish_tokens_with(&kid, *nt, false).await?,
-            )),
+            Finish::Ok(nt, _) => Ok(Out::Value(self.finish_tokens_with(&kid, *nt, false).await?)),
             _ => Err(self.mfa_or(login_txn, webauthn_failed()).await),
         }
     }
@@ -806,6 +794,7 @@ impl AuthService {
 
     /// `webauthn/assert/finish {assert_txn, credential}`: §2.4 for MFA (DPoP as for OPAQUE),
     /// `204` for step-up (access token required, same session and generation).
+    #[allow(clippy::too_many_arguments)]
     pub async fn webauthn_assert_finish(
         &self,
         assert_txn: &str,

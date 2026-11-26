@@ -34,9 +34,9 @@ use crate::auth::{AuthService, invalid, mfa_required_error, parse_tenant, unauth
 use crate::idem::{Entry, Idem, IdemRequest, Out, Ran};
 use crate::jws::AccessClaims;
 use crate::login::normalize_login;
-use crate::wire;
 use crate::ratelimit::{Dimension, Key};
 use crate::token::{self, TokenHash};
+use crate::wire;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 use cs_common::error::{Error, ErrorCode};
@@ -495,6 +495,7 @@ impl AuthService {
     }
 
     /// `POST /api/v2/auth/recovery/start {tenant, login, method, code?}` (rev 10).
+    #[allow(clippy::too_many_arguments)]
     pub async fn recovery_start(
         &self,
         tenant: &str,
