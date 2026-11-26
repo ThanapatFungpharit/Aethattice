@@ -261,7 +261,7 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
   - MFA after OPAQUE: `webauthn/assert/start {auth_txn}` → `{assert_txn, public_key}`; `webauthn/assert/finish {assert_txn, credential}` → §2.4 result. With a recovery code instead: `POST /api/v2/auth/mfa/recovery-code {auth_txn, code}` → §2.4 result.
   - Step-up: `webauthn/assert/start {}` with the access token → `{assert_txn, public_key}`; `webauthn/assert/finish` → `204` and sets `last_strong_auth_at`.
   - Passkeys: `GET /api/v2/me/passkeys` → `{items: [{id, label, created_at, last_used_at, prf}]}`; `DELETE /api/v2/me/passkeys/{id}` (step-up) → `204`.
-  - Sessions: `GET /api/v2/me/sessions` → `{items: [{sid, created_at, last_seen_at, amr, user_agent, current}]}`, bounded per user and not paginated.
+  - Sessions: `GET /api/v2/me/sessions` → `{items: [{sid, created_at, last_seen_at, amr, user_agent, current}]}`, bounded per user and not paginated. (rev 15 addendum) `last_seen_at` is null until the session's first refresh, and `user_agent` may be null.
   - `DELETE /api/v2/me/sessions/{sid}` → `204`. Revoking another session requires step-up; revoking the current session acts as logout.
   - Recovery codes: `POST /api/v2/me/recovery-codes` (step-up) → `{codes}`, which replaces the previous set; `GET` → `{remaining}`.
 - Email delivery uses a configured outbound SMTP relay through a `Notifier` trait. The notification service proper is M4; M1 ships the trait plus an SMTP relay implementation and a dev log sink.
@@ -345,3 +345,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-26 rev 14 (TL, QA gate findings F-1, F-3): the DPoP replay record is authoritative only in `dpop_jti` (Valkey off the replay path); every authenticated route checks the session at `sgen` through one shared extractor.
 - 2026-11-26 rev 14 addendum (TL, e2e finding): `GET /me` `display_name` is nullable.
 - 2026-11-26 rev 15 (TL, e2e finding): Idempotency-Key replay on all identity writes per D.3, with secret-bearing results AEAD-sealed and retention capped at the secret's lifetime; client rule for 2xx bodies that fail to decode.
+- 2026-11-26 rev 15 addendum (TL, e2e decoder audit): `me/sessions` `last_seen_at` and `user_agent` are nullable.
