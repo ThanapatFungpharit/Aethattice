@@ -1,1 +1,1 @@
-{ "files": [], "references": [{ "path": "packages/sdk" }, { "path": "packages/components" }, { "path": "apps/shell" }] }
+{ "files": [], "references": [{ "path": "packages/sdk" }, { "path": "packages/components" }, { "path": "apps/shell" }, { "path": "e2e" }] }
