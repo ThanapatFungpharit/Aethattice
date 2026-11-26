@@ -49,6 +49,11 @@ pub fn route_req(m: &str, p: &str, id: &str) -> Req {
             "/api/v2/auth/opaque/register/finish" => {
                 json!({"registration_txn": txn, "registration_upload": msg})
             }
+            // A well-formed body, so the route reaches authentication (malformed bodies are a 400
+            // by D.2 before any handler runs, on every JSON route).
+            "/api/v2/auth/webauthn/register/finish" => {
+                json!({"registration_txn": txn, "credential": {"id": msg, "rawId": msg, "type": "public-key", "response": {"attestationObject": msg, "clientDataJSON": msg}, "clientExtensionResults": {}}, "label": "qa"})
+            }
             "/api/v2/auth/webauthn/assert/finish" => {
                 json!({"assert_txn": txn, "credential": {"id": msg, "rawId": msg, "type": "public-key", "response": {"authenticatorData": msg, "clientDataJSON": msg, "signature": msg}, "clientExtensionResults": {}}})
             }

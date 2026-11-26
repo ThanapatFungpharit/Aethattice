@@ -211,7 +211,16 @@ async fn email_waiting_period_cancel_and_mfa_factor() {
             .json(json!({"tenant": u.t(), "login": "eve", "method": "email"}))
     };
     e.call(start()).await.expect(202);
-    let link = e.outbox.links.lock().unwrap().last().unwrap().1.clone();
+    // Rev 13: delivery is asynchronous (the 202 never waits for the Notifier), so wait for it.
+    let mut link = None;
+    for _ in 0..100 {
+        if let Some(l) = e.outbox.links.lock().unwrap().last() {
+            link = Some(l.1.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let link = link.expect("recovery link delivered within 5 s");
     let st = e
         .call(Req::post("/api/v2/auth/recovery/status").json(json!({"token": link})))
         .await;
@@ -258,8 +267,22 @@ async fn email_waiting_period_cancel_and_mfa_factor() {
     let mut a = Authenticator::new();
     let _ = e.add_passkey(&s, &mut a).await;
     let codes = e.recovery_codes(&s).await;
+    let before = e.outbox.links.lock().unwrap().len();
     e.call(start()).await.expect(202);
-    let link2 = e.outbox.links.lock().unwrap().last().unwrap().1.clone();
+    let mut link2 = None;
+    for _ in 0..100 {
+        {
+            let links = e.outbox.links.lock().unwrap();
+            if links.len() > before {
+                link2 = links.last().map(|l| l.1.clone());
+            }
+        }
+        if link2.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let link2 = link2.expect("second recovery link delivered within 5 s");
     assert_ne!(link2, link);
     e.exec("UPDATE recovery_requests SET not_before = now() - interval '1 second' WHERE state = 'pending'").await;
     let no_code = e

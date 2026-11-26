@@ -1765,7 +1765,7 @@ async fn dpop_fallback_part(tenant: TenantId) {
     assert_eq!(other.check(t2, &p).await.unwrap(), ReplayVerdict::Fresh);
     exec(
         e.pool(),
-        "DELETE FROM dpop_jti WHERE tenant_id <> (SELECT min(tenant_id) FROM dpop_jti)",
+        "DELETE FROM dpop_jti WHERE tenant_id <> (SELECT min(tenant_id::text)::uuid FROM dpop_jti)",
     )
     .await;
     // Rows carry their expiry bucket and are purged by the bounded sweep once expired.
