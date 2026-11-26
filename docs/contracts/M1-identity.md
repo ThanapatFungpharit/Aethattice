@@ -85,7 +85,7 @@ Outbox events: `identity.user.created|updated|disabled`, `identity.group.members
   - Both calls require the current access token (DPoP-bound when the session is). The txn is bound to that session's `sid`.
   - On success, the server sets `last_strong_auth_at` on the *existing* session. It issues no new session or refresh token.
   - Failure returns `unauthenticated`, as for login.
-- (rev 7) **`GET /api/v2/me`** (access token) → `{user_id, tenant_id, login, display_name, state, amr, auth_time, sid}`, for the account page.
+- (rev 7) **`GET /api/v2/me`** (access token) → `{user_id, tenant_id, login, display_name, state, amr, auth_time, sid}`, for the account page. (rev 14 addendum) `display_name` is `string | null`: it is null when no display name was set. Clients show the login instead.
 - (rev 6) Access-token claims: `iss = "https://<deployment domain>"`, `aud = "https://<deployment domain>/api/v2"`.
 - (rev 5) **Wire format, binding for client and server:**
   - Crate `opaque-ke` 4.0.1 (RFC 9807 final) with `argon2` 0.5. The cipher suite type is defined once, in a small dependency-free crate `cs-identity-wire`, which server and `web/packages/opaque-wasm` both use. That crate also holds login normalization, so client and server normalize identically.
@@ -332,3 +332,4 @@ These ranges were not in the spec. The owner approved them on 2026-11-24 togethe
 - 2026-11-26 rev 12 (TL): implementation notes from backend slice 4 (`auth_ceremonies` table, CLI recovery token, recovery-request listing, grant rotation on polling).
 - 2026-11-26 rev 13 (TL, backend question): recovery email delivery is best effort through a bounded in-memory queue (no bearer secret in the outbox, no durability claim; durable delivery in M4); notifier config.
 - 2026-11-26 rev 14 (TL, QA gate findings F-1, F-3): the DPoP replay record is authoritative only in `dpop_jti` (Valkey off the replay path); every authenticated route checks the session at `sgen` through one shared extractor.
+- 2026-11-26 rev 14 addendum (TL, e2e finding): `GET /me` `display_name` is nullable.
