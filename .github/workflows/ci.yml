@@ -51,3 +51,5 @@ jobs:
         env:
           # In GitHub Actions a missing wasm-bindgen is a failure, not a skip.
           CS_REQUIRE_WASM_BINDGEN: "1"
+          # scripts/e2e.sh creates its database through ysqlsh in this job's YugabyteDB container.
+          CS_E2E_YB_CONTAINER: yb

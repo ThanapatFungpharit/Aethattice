@@ -270,6 +270,16 @@ describe("account page", () => {
     expect(q(account, ".auth-time time").getAttribute("datetime")).toBe(new Date(1_700_000_000_000).toISOString());
   });
 
+  it("shows the login as the name when display_name is null (rev 14 addendum)", async () => {
+    const me = { user_id: "u-1", tenant_id: TENANT, login: "alice", display_name: null, state: "active", amr: ["pwd"], auth_time: 1_700_000_000, sid: "s1" };
+    const { shell } = await signedInShell(noCrossTabLock, { "/api/v2/me": () => json(me) });
+    const account = q<CsAccountPage>(shell, "cs-account-page");
+    await account.load();
+    await account.updateComplete;
+    expect(q(account, ".display-name").textContent).toBe("alice");
+    expect(q(account, ".login").textContent).toBe("alice");
+  });
+
   it("shows the problem when /me fails and keeps what sign-in knew", async () => {
     const { shell } = await signedInShell(noCrossTabLock, { "/api/v2/me": () => problem(503, "unavailable") });
     const account = q<CsAccountPage>(shell, "cs-account-page");

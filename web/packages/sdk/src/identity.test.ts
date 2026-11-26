@@ -14,6 +14,7 @@ import {
   OPAQUE_REAUTH_START_PATH,
   ME_PATH,
   getMe,
+  meDisplayName,
   isCanonicalTenantId,
   reauthenticate,
   register,
@@ -373,8 +374,17 @@ describe("getMe (rev 7 GET /api/v2/me)", () => {
     expect(await getMe(dpopDeps(fetchFn).authed)).toEqual(ME);
   });
 
+  it("accepts display_name null (rev 14 addendum) and falls back to the login for display", async () => {
+    const { fetchFn } = fakeServer({ [ME_PATH]: () => json({ ...ME, display_name: null }) });
+    const me = await getMe(dpopDeps(fetchFn).authed);
+    expect(me.display_name).toBeNull();
+    expect(meDisplayName(me)).toBe("alice");
+    expect(meDisplayName({ ...me, display_name: "" })).toBe("alice");
+    expect(meDisplayName({ ...me, display_name: "Alice Example" })).toBe("Alice Example");
+  });
+
   it("rejects malformed bodies as internal", async () => {
-    for (const bad of [{ ...ME, amr: "pwd" }, { ...ME, auth_time: "x" }, { ...ME, sid: "" }, []]) {
+    for (const bad of [{ ...ME, amr: "pwd" }, { ...ME, auth_time: "x" }, { ...ME, sid: "" }, { ...ME, display_name: 1 }, { ...ME, display_name: undefined }, []]) {
       const { fetchFn } = fakeServer({ [ME_PATH]: () => json(bad) });
       await expect(getMe(dpopDeps(fetchFn).authed)).rejects.toMatchObject({ problem: { code: "internal" } });
     }

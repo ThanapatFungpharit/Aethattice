@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ApiClient, type AuthHook } from "./client";
-import { ApiError, StepUpRequired, isStepUpRequired } from "./problem";
+import { ApiError, ResponseDecodeError, StepUpRequired, isResponseDecodeError, isStepUpRequired } from "./problem";
 import { RetryPolicy, type Clock } from "./retry";
 
 interface Call {
@@ -138,6 +138,33 @@ describe("ApiClient success", () => {
     const { fetch } = fakeFetch(() => new Response("{nope", { status: 200, headers: { "Content-Type": "application/json" } }));
     const e = await rejection(client(fetch).c.get("/x", { retry: false }));
     expect(e.problem.code).toBe("internal");
+  });
+
+  describe("undecodable 2xx (TL ruling 2026-11-26: the request succeeded, never retried or refreshed)", () => {
+    const refresh = vi.fn(() => Promise.resolve(true));
+    const auth = { authorization: () => "Bearer t", refresh };
+
+    it("a write whose 2xx body does not decode is sent exactly once and surfaces ResponseDecodeError", async () => {
+      const { fetch, calls } = fakeFetch(() => ok({ n: "no" }));
+      const e = await rejection(client(fetch, { auth }).c.post("/x", { body: {}, decode: () => { throw new Error("bad shape"); } }));
+      expect(calls).toHaveLength(1);
+      expect(refresh).not.toHaveBeenCalled();
+      expect(e).toBeInstanceOf(ResponseDecodeError);
+      expect(isResponseDecodeError(e)).toBe(true);
+      expect(e.problem).toMatchObject({ code: "internal", retryable: false, request_id: "req-ok" });
+      if (isResponseDecodeError(e)) expect(e.requestId).toBe("req-ok");
+      expect(e.httpStatus).toBe(200);
+      expect(e.attempts).toBe(1);
+    });
+
+    it("a read whose 2xx body is not JSON is sent exactly once and surfaces ResponseDecodeError", async () => {
+      const { fetch, calls } = fakeFetch(() => new Response("{nope", { status: 200, headers: { "Content-Type": "application/json", "X-Request-Id": "r2" } }));
+      const e = await rejection(client(fetch, { auth }).c.get("/x"));
+      expect(calls).toHaveLength(1);
+      expect(refresh).not.toHaveBeenCalled();
+      expect(e).toBeInstanceOf(ResponseDecodeError);
+      expect(e.problem).toMatchObject({ code: "internal", retryable: false, request_id: "r2" });
+    });
   });
 
   it("sends Authorization from the auth hook", async () => {

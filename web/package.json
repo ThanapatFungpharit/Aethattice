@@ -10,6 +10,7 @@
   "scripts": {
     "typecheck": "tsc -b",
     "test": "vitest run",
+    "test:e2e": "vitest run --config e2e/vitest.config.ts",
     "lint": "node tools/lint/run.mjs",
     "build": "npm run build -w @cs/shell",
     "dev": "npm run dev -w @cs/shell"

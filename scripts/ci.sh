@@ -23,6 +23,9 @@ if [[ "${1:-}" == "--with-db" ]]; then
     docker exec "$yb" bin/yb-admin --master_addresses "$(docker exec "$yb" hostname):7100" \
       --timeout_ms 600000 compact_sys_catalog >/dev/null 2>&1 || echo "warning: sys catalog compaction failed (non-fatal)"
   fi
+  echo "== e2e: web SDK against cs serve --dev (scripts/e2e.sh)"
+  (cd web && npm ci --no-audit --no-fund >/dev/null)
+  scripts/e2e.sh
 fi
 echo "== opaque-wasm pkg freshness"
 # The committed wasm-bindgen output must match the crate (M1 rev 5 §2.1). Needs wasm-bindgen-cli 0.2.130.

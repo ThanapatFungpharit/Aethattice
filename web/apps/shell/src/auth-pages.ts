@@ -8,6 +8,7 @@ import {
   completeMfaWithPasskey,
   completeMfaWithRecoveryCode,
   getMe,
+  meDisplayName,
   isApiError,
   isCanonicalTenantId,
   isIdentityInputError,
@@ -462,7 +463,7 @@ export class CsAccountPage extends LitElement {
       <section class="card" aria-labelledby="who" aria-busy=${this.loading !== undefined && me === undefined ? "true" : "false"}>
         <h2 id="who">${t("auth.signed_in_as")}</h2>
         <dl>
-          ${me && me.display_name.length > 0 ? html`<dt>${t("auth.display_name")}</dt><dd class="display-name">${me.display_name}</dd>` : nothing}
+          ${me ? html`<dt>${t("auth.display_name")}</dt><dd class="display-name">${meDisplayName(me)}</dd>` : nothing}
           <dt>${t("auth.login")}</dt>
           <dd class="login">${me?.login ?? u?.login ?? ""}</dd>
           <dt>${t("auth.tenant")}</dt>

@@ -82,7 +82,8 @@ export interface Me {
   readonly user_id: string;
   readonly tenant_id: string;
   readonly login: string;
-  readonly display_name: string;
+  /** `null` when the user has none (rev 14 addendum); display {@link meDisplayName} instead. */
+  readonly display_name: string | null;
   readonly state: string;
   readonly amr: readonly string[];
   /** Unix seconds. */
@@ -95,7 +96,7 @@ export function decodeMe(body: unknown): Me {
   const { amr, auth_time, display_name } = body;
   if (!Array.isArray(amr) || !amr.every((m): m is string => typeof m === "string")) throw new TypeError("amr must be strings");
   if (typeof auth_time !== "number" || !Number.isInteger(auth_time) || auth_time < 0) throw new TypeError("auth_time must be unix seconds");
-  if (typeof display_name !== "string") throw new TypeError("display_name missing");
+  if (typeof display_name !== "string" && display_name !== null) throw new TypeError("display_name must be a string or null");
   return {
     user_id: str(body, "user_id"),
     tenant_id: str(body, "tenant_id"),
@@ -106,6 +107,11 @@ export function decodeMe(body: unknown): Me {
     auth_time,
     sid: str(body, "sid"),
   };
+}
+
+/** The name to show for the user: the display name, or the login when there is none (rev 14 addendum). */
+export function meDisplayName(me: Pick<Me, "display_name" | "login">): string {
+  return me.display_name !== null && me.display_name.length > 0 ? me.display_name : me.login;
 }
 
 /** `{state: "mfa_required", auth_txn, methods}` (§2.3). */

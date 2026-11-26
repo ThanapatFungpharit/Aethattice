@@ -55,7 +55,8 @@ function opt(signal: AbortSignal | undefined): { signal?: AbortSignal } {
 export interface SessionInfo {
   readonly sid: string;
   readonly created_at: string;
-  readonly last_seen_at: string;
+  /** RFC 3339, or null before the session's first refresh (server: nullable column, rev 11). */
+  readonly last_seen_at: string | null;
   readonly amr: readonly string[];
   readonly user_agent: string | null;
   readonly current: boolean;
@@ -66,7 +67,7 @@ export function decodeSessionInfo(v: unknown): SessionInfo {
   const { amr, current } = v;
   if (!Array.isArray(amr) || !amr.every((m): m is string => typeof m === "string")) throw new TypeError("amr must be strings");
   if (typeof current !== "boolean") throw new TypeError("current must be a boolean");
-  return { sid: str(v, "sid"), created_at: time(v, "created_at"), last_seen_at: time(v, "last_seen_at"), amr, user_agent: strOrNull(v, "user_agent"), current };
+  return { sid: str(v, "sid"), created_at: time(v, "created_at"), last_seen_at: timeOrNull(v, "last_seen_at"), amr, user_agent: strOrNull(v, "user_agent"), current };
 }
 
 /** `GET /api/v2/me/sessions` (rev 10): bounded per user, not paginated. */

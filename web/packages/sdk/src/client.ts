@@ -6,6 +6,7 @@ import {
   isProblemContentType,
   isStepUpProblem,
   parseProblem,
+  ResponseDecodeError,
   StepUpRequired,
   synthesizeProblem,
   type Problem,
@@ -174,6 +175,9 @@ export class ApiClient {
         continue;
       }
 
+      // A 2xx whose body does not decode succeeded on the server: never retried, never refreshed for.
+      if (result.error instanceof ResponseDecodeError) throw result.error;
+
       // Step-up (M1 §2.3 [R2]): a refresh cannot satisfy it, so it is surfaced at once as StepUpRequired.
       if (result.error instanceof StepUpRequired) throw result.error;
 
@@ -316,7 +320,7 @@ export class ApiClient {
           try {
             decoded = JSON.parse(text);
           } catch {
-            return synth(synthesizeProblem("internal", { requestId, instance: path }), res.status);
+            return { kind: "error", error: new ResponseDecodeError(res.status, attempt, { requestId, instance: path }) };
           }
         } else {
           decoded = text;
@@ -326,7 +330,7 @@ export class ApiClient {
       try {
         data = opts.decode ? opts.decode(decoded) : (decoded as T);
       } catch {
-        return synth(synthesizeProblem("internal", { requestId, instance: path }), res.status);
+        return { kind: "error", error: new ResponseDecodeError(res.status, attempt, { requestId, instance: path }) };
       }
       return { kind: "ok", response: { status: res.status, data, requestId, headers: res.headers, attempts: attempt } };
     } finally {
