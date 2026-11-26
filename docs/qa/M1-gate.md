@@ -172,3 +172,8 @@ The fixes and reruns after QA's report were done on `milestone/m1-identity`. The
 - Durability: this is a single-node dev host with one NVMe, so there is one failure domain. Nothing in M1 claims more. Nothing is `production-ready`.
 
 **Gate decision:** `PASS` (Team Leader, 2026-11-26), subject to GitHub Actions passing on the final commit. QA's own re-verification of the fixes ran as the QA suite above; QA may re-review when available.
+
+**Post-merge correction (2026-11-26).**
+- GitHub Actions on `main` (5c34fea and 591384f) failed in the e2e test "web-locks: concurrent near-expiry calls in two tabs cause exactly one refresh". On the slower runner, tab B could take `cs-refresh` before tab A's BroadcastChannel token arrived, so B refreshed a second time. Cookies still rotated correctly, so no token was reused.
+- Fix (dbc06ef): the lock holder writes a non-secret generation marker to localStorage before releasing the lock. A waiter that sees the marker advance waits up to 1 s for the shared token before refreshing itself. The token stays in memory only.
+- Verified by 4 deterministic race tests (Web Locks and lease modes) and 6 consecutive local e2e runs of 16/16. The gate stands once GitHub Actions passes on the fix.

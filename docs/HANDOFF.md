@@ -66,6 +66,8 @@ Read this first in a new session, then `CLAUDE.md`, `docs/IMPLEMENTATION_PLAN.md
 
 ## Open follow-ups carried out of M1 (not blockers)
 
+- **e2e in a fresh worktree:** `scripts/e2e.sh` creates a new KMS root key, then tries to reset the shared `cs_e2e_identity` database. That fails while an idle session is connected. The workaround is to copy `target/e2e/kms/root.key*` from the main checkout. The proper fix is for the reset to use `DROP DATABASE … WITH (FORCE)`, or to reset the schema instead.
+
 - **M4:**
   - Durable recovery-email delivery. The outbox would carry only `request_id`, and the sender would mint the token at send time.
   - Device notifications.
