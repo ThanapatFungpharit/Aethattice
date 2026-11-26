@@ -6,6 +6,45 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+argon2 = { workspace = true, features = ["password-hash", "std"] }
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+cs-api.workspace = true
+cs-common.workspace = true
+cs-crypto.workspace = true
+cs-db.workspace = true
+cs-identity-wire.workspace = true
+cs-kms.workspace = true
+lettre.workspace = true
+metrics.workspace = true
+ed25519-dalek.workspace = true
+opaque-ke.workspace = true
+p256.workspace = true
+redis.workspace = true
+rand_core_06.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+webauthn-rs.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+ciborium.workspace = true
+cs-db = { workspace = true, features = ["testing"] }
+futures.workspace = true
+http-body-util.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

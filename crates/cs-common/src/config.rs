@@ -147,6 +147,110 @@ pub const POLICY_TABLE: &[PolicySpec] = &[
         unit: "milliseconds",
         source: "(design) §18.4 reconcilers run continuously",
     },
+    PolicySpec {
+        key: "group_max_depth",
+        default: 32,
+        min: 4,
+        max: 64,
+        unit: "levels",
+        source: "erratum C13 / M1 contract §1 rev 4 (design; owner 2026-11-24)",
+    },
+    PolicySpec {
+        key: "group_max_closure",
+        default: 10_000,
+        min: 1_000,
+        max: 100_000,
+        unit: "principals",
+        source: "erratum C13 / M1 contract §1 rev 4 (design; owner 2026-11-24)",
+    },
+    PolicySpec {
+        key: "setup_link_lifetime_secs",
+        default: 86_400,
+        min: 900,
+        max: 604_800,
+        unit: "seconds",
+        source: "erratum C13 / M1 contract rev 4 (design; owner 2026-11-24): 24 h, 15 min–7 d",
+    },
+    PolicySpec {
+        key: "access_token_lifetime_secs",
+        default: 600,
+        min: 60,
+        max: 3_600,
+        unit: "seconds",
+        source: "spec §5.5 / erratum C13 / M1 contract §8: 600 s, 60–3600 s",
+    },
+    PolicySpec {
+        key: "session_idle_lifetime_secs",
+        default: 1_209_600,
+        min: 3_600,
+        max: 7_776_000,
+        unit: "seconds",
+        source: "spec §5.5 / erratum C13 / M1 contract §8: 14 d, 1 h–90 d",
+    },
+    PolicySpec {
+        key: "session_absolute_lifetime_secs",
+        default: 7_776_000,
+        min: 86_400,
+        max: 31_536_000,
+        unit: "seconds",
+        source: "spec §5.5 / erratum C13 / M1 contract §8: 90 d, 1–365 d",
+    },
+    PolicySpec {
+        key: "step_up_window_secs",
+        default: 300,
+        min: 60,
+        max: 3_600,
+        unit: "seconds",
+        source: "spec §5.5 / erratum C13 / M1 contract §2.3, §8: 5 min, 1–60 min",
+    },
+    PolicySpec {
+        key: "recovery_waiting_period_secs",
+        default: 86_400,
+        min: 3_600,
+        max: 1_209_600,
+        unit: "seconds",
+        source: "spec §5.6 / erratum C13 / M1 contract §8: 24 h, 1 h–14 d",
+    },
+    PolicySpec {
+        key: "mfa_required",
+        default: 0,
+        min: 0,
+        max: 1,
+        unit: "flag",
+        source: "M1 contract rev 11 (provisional range, owner to record in C13); tenant-overridable",
+    },
+    PolicySpec {
+        key: "dpop_first_party_required",
+        default: 0,
+        min: 0,
+        max: 1,
+        unit: "flag",
+        source: "M1 contract rev 11 (`dpop_first_party` optional|required; provisional range, C13 pending)",
+    },
+    PolicySpec {
+        key: "rate_limit_source_per_min",
+        default: 30,
+        min: 5,
+        max: 1_000,
+        unit: "requests/60 s",
+        source: "M1 contract §5, rev 11 (provisional range, owner to record in C13)",
+    },
+    PolicySpec {
+        key: "rate_limit_account_per_min",
+        default: 10,
+        min: 3,
+        max: 100,
+        unit: "requests/60 s",
+        source: "M1 contract §5, rev 11 (provisional range, owner to record in C13)",
+    },
+    PolicySpec {
+        key: "rate_limit_tenant_per_min",
+        default: 600,
+        min: 60,
+        max: 100_000,
+        unit: "requests/60 s",
+        source: "M1 contract §5, rev 11 (provisional range, owner to record in C13)",
+    },
 ];
 
 /// Typed handle on a policy key.
@@ -159,6 +263,19 @@ pub enum PolicyKey {
     RevocationStalenessMs,
     DbMigrationRetryMaxAttempts,
     DbMigrationRetryMaxElapsedMs,
+    GroupMaxDepth,
+    GroupMaxClosure,
+    SetupLinkLifetimeSecs,
+    AccessTokenLifetimeSecs,
+    SessionIdleLifetimeSecs,
+    SessionAbsoluteLifetimeSecs,
+    StepUpWindowSecs,
+    RecoveryWaitingPeriodSecs,
+    MfaRequired,
+    DpopFirstPartyRequired,
+    RateLimitSourcePerMin,
+    RateLimitAccountPerMin,
+    RateLimitTenantPerMin,
 }
 
 impl PolicyKey {
@@ -171,6 +288,19 @@ impl PolicyKey {
             PolicyKey::RevocationStalenessMs => "revocation_staleness_ms",
             PolicyKey::DbMigrationRetryMaxAttempts => "db_migration_retry_max_attempts",
             PolicyKey::DbMigrationRetryMaxElapsedMs => "db_migration_retry_max_elapsed_ms",
+            PolicyKey::GroupMaxDepth => "group_max_depth",
+            PolicyKey::GroupMaxClosure => "group_max_closure",
+            PolicyKey::SetupLinkLifetimeSecs => "setup_link_lifetime_secs",
+            PolicyKey::AccessTokenLifetimeSecs => "access_token_lifetime_secs",
+            PolicyKey::SessionIdleLifetimeSecs => "session_idle_lifetime_secs",
+            PolicyKey::SessionAbsoluteLifetimeSecs => "session_absolute_lifetime_secs",
+            PolicyKey::StepUpWindowSecs => "step_up_window_secs",
+            PolicyKey::RecoveryWaitingPeriodSecs => "recovery_waiting_period_secs",
+            PolicyKey::MfaRequired => "mfa_required",
+            PolicyKey::DpopFirstPartyRequired => "dpop_first_party_required",
+            PolicyKey::RateLimitSourcePerMin => "rate_limit_source_per_min",
+            PolicyKey::RateLimitAccountPerMin => "rate_limit_account_per_min",
+            PolicyKey::RateLimitTenantPerMin => "rate_limit_tenant_per_min",
         }
     }
 }
@@ -201,6 +331,24 @@ impl Policy {
                     .map(|p| p.default)
             })
             .unwrap_or(0)
+    }
+
+    /// Set one value, enforcing the same safe range as `check-config`.
+    pub fn with_value(mut self, key: PolicyKey, value: i64) -> Result<Self, ConfigError> {
+        let spec = POLICY_TABLE
+            .iter()
+            .find(|s| s.key == key.as_str())
+            .ok_or_else(|| {
+                ConfigError::Invalid(vec![format!("policy.{}: unknown", key.as_str())])
+            })?;
+        if value < spec.min || value > spec.max {
+            return Err(ConfigError::Invalid(vec![format!(
+                "policy.{}: {value} is outside the safe range {}..={} {}",
+                spec.key, spec.min, spec.max, spec.unit
+            )]));
+        }
+        self.values.insert(spec.key, value);
+        Ok(self)
     }
 
     fn from_raw(raw: BTreeMap<String, toml::Value>, errs: &mut Vec<String>) -> Self {
@@ -296,6 +444,139 @@ pub struct KmsConfig {
     pub keystore_path: Option<PathBuf>,
 }
 
+/// Valkey connection (M1 contract §5: rate-limit counters; rev 14 took it off the DPoP replay
+/// path, which is `dpop_jti` only). Optional: without it rate limits use local buckets.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValkeyConfig {
+    /// `redis://` or `rediss://` (TLS) URL; may carry credentials, so it is a secret.
+    pub url: Secret<String>,
+}
+
+/// Which recovery-link notifier `cs serve` uses (M1 contract §4, rev 13). There is no default:
+/// without a `[notifier]` section nothing is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifierKind {
+    /// Outbound SMTP relay (`[notifier.smtp]`).
+    Smtp,
+    /// `[R7]` Development sink that writes bearer secrets; needs `--dev`.
+    DevLog,
+}
+
+/// Transport security of the SMTP relay connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmtpTls {
+    /// Implicit TLS (SMTPS).
+    Tls,
+    /// Plaintext connect, then mandatory STARTTLS (no plaintext fallback).
+    Starttls,
+    /// Plaintext; only accepted for loopback hosts.
+    None,
+}
+
+/// `[notifier.smtp]` (M1 contract §4, rev 13).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    pub tls: SmtpTls,
+    #[serde(default)]
+    pub username: Option<Secret<String>>,
+    #[serde(default)]
+    pub password: Option<Secret<String>>,
+    /// Sender mailbox, e.g. `Cloud System <no-reply@example.com>`.
+    pub from: String,
+}
+
+/// `[notifier]` (M1 contract §4, rev 13).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifierConfig {
+    pub kind: NotifierKind,
+    #[serde(default)]
+    pub smtp: Option<SmtpConfig>,
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn validate_notifier(n: &NotifierConfig, has_api: bool, errs: &mut Vec<String>) {
+    match (n.kind, &n.smtp) {
+        (NotifierKind::Smtp, None) => {
+            errs.push("notifier.smtp: section required when notifier.kind = \"smtp\"".to_owned())
+        }
+        (NotifierKind::DevLog, Some(_)) => {
+            errs.push("notifier.smtp: not allowed when notifier.kind = \"dev_log\"".to_owned())
+        }
+        _ => {}
+    }
+    if !has_api {
+        errs.push("notifier: needs the [api] section (links use api.deployment_domain)".to_owned());
+    }
+    let Some(s) = &n.smtp else { return };
+    let host_ok = !s.host.is_empty()
+        && s.host.len() <= 253
+        && s.host
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b':' | b'[' | b']'));
+    if !host_ok {
+        errs.push("notifier.smtp.host: must be a host name or IP address".to_owned());
+    }
+    if s.port == 0 {
+        errs.push("notifier.smtp.port: must be 1..=65535".to_owned());
+    }
+    if s.tls == SmtpTls::None && !is_loopback_host(&s.host) {
+        errs.push(
+            "notifier.smtp.tls: \"none\" is only allowed for loopback hosts (recovery links are bearer secrets)"
+                .to_owned(),
+        );
+    }
+    match (&s.username, &s.password) {
+        (Some(u), Some(_)) if u.expose_secret().is_empty() => {
+            errs.push("notifier.smtp.username: must not be empty".to_owned())
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            errs.push("notifier.smtp: username and password must be given together".to_owned())
+        }
+        _ => {}
+    }
+    let f = &s.from;
+    if f.is_empty() || f.len() > 320 || !f.contains('@') || f.chars().any(char::is_control) {
+        errs.push(
+            "notifier.smtp.from: must be a mailbox such as `Name <user@example.com>`".to_owned(),
+        );
+    }
+}
+
+/// Cluster facts known from configuration until cluster membership arrives (M8).
+/// `node_count` (M1 contract §5, rev 11) divides the rate limits for the local-bucket fallback
+/// when Valkey is unavailable (limit/N per node); `check-config` rejects N < 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterConfig {
+    #[serde(default = "d_node_count")]
+    pub node_count: i64,
+}
+
+fn d_node_count() -> i64 {
+    1
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self { node_count: 1 }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
@@ -379,6 +660,12 @@ struct RawConfig {
     #[serde(default)]
     api: Option<ApiConfig>,
     #[serde(default)]
+    valkey: Option<ValkeyConfig>,
+    #[serde(default)]
+    notifier: Option<NotifierConfig>,
+    #[serde(default)]
+    cluster: ClusterConfig,
+    #[serde(default)]
     telemetry: TelemetryConfig,
     #[serde(default)]
     policy: BTreeMap<String, toml::Value>,
@@ -394,6 +681,10 @@ pub struct Config {
     pub domains: BTreeMap<DomainId, DomainConfig>,
     pub kms: Option<KmsConfig>,
     pub api: Option<ApiConfig>,
+    pub valkey: Option<ValkeyConfig>,
+    /// Recovery-link notifier; `None` means nothing is sent (M1 contract §4, rev 13).
+    pub notifier: Option<NotifierConfig>,
+    pub cluster: ClusterConfig,
     pub telemetry: TelemetryConfig,
     pub policy: Policy,
     pub locked_policy: BTreeSet<&'static str>,
@@ -534,6 +825,24 @@ impl Config {
             errs.push("kms.root_key_path: must not be empty".to_owned());
         }
 
+        if let Some(v) = &raw.valkey {
+            let u = v.url.expose_secret();
+            let rest = u
+                .strip_prefix("redis://")
+                .or_else(|| u.strip_prefix("rediss://"));
+            if rest.is_none_or(|r| r.is_empty() || r.starts_with('/')) {
+                errs.push("valkey.url: must be a redis:// or rediss:// URL with a host".to_owned());
+            }
+        }
+
+        if let Some(n) = &raw.notifier {
+            validate_notifier(n, raw.api.is_some(), &mut errs);
+        }
+
+        if raw.cluster.node_count < 1 {
+            errs.push("cluster.node_count: must be at least 1 (rate-limit fallback limit/N, M1 contract §5)".to_owned());
+        }
+
         if tracing_subscriber::EnvFilter::try_new(&raw.telemetry.log_level).is_err() {
             errs.push("telemetry.log_level: invalid filter directive".to_owned());
         }
@@ -559,11 +868,26 @@ impl Config {
                 domains,
                 kms: raw.kms,
                 api: raw.api,
+                valkey: raw.valkey,
+                notifier: raw.notifier,
+                cluster: raw.cluster,
                 telemetry: raw.telemetry,
                 policy,
                 locked_policy,
             }),
             _ => Err(ConfigError::Invalid(errs)),
+        }
+    }
+
+    /// Checks that depend on the run profile. `[R7]` the `dev_log` notifier writes bearer
+    /// secrets, so it is refused unless `cs serve` / `cs check-config` run with `--dev`.
+    pub fn check_profile(&self, dev: bool) -> Result<(), ConfigError> {
+        match &self.notifier {
+            Some(n) if n.kind == NotifierKind::DevLog && !dev => Err(ConfigError::Invalid(vec![
+                "notifier.kind: \"dev_log\" writes bearer secrets and is only allowed with --dev ([R7])"
+                    .to_owned(),
+            ])),
+            _ => Ok(()),
         }
     }
 
@@ -661,6 +985,95 @@ policy = ["idempotency_retention_hours"]
     }
 
     #[test]
+    fn m1_policy_ranges_enforced() {
+        // erratum C13 rows added by M1 (contract §8, rev 4): bounds inclusive, outside rejected.
+        for (key, lo, hi) in [
+            ("group_max_depth", 4, 64),
+            ("group_max_closure", 1_000, 100_000),
+            ("setup_link_lifetime_secs", 900, 604_800),
+            ("access_token_lifetime_secs", 60, 3_600),
+            ("session_idle_lifetime_secs", 3_600, 7_776_000),
+            ("session_absolute_lifetime_secs", 86_400, 31_536_000),
+            ("step_up_window_secs", 60, 3_600),
+            // rev 11
+            ("recovery_waiting_period_secs", 3_600, 1_209_600),
+            ("mfa_required", 0, 1),
+            ("dpop_first_party_required", 0, 1),
+            ("rate_limit_source_per_min", 5, 1_000),
+            ("rate_limit_account_per_min", 3, 100),
+            ("rate_limit_tenant_per_min", 60, 100_000),
+        ] {
+            let g = good();
+            for ok in [lo, hi] {
+                let doc = g.replace(
+                    "idempotency_retention_hours = 48",
+                    &format!("idempotency_retention_hours = 48\n{key} = {ok}"),
+                );
+                let c = Config::from_toml_str(&doc).unwrap();
+                assert!(c.policy.values.get(key) == Some(&ok), "{key}={ok}");
+            }
+            for bad in [lo - 1, hi + 1] {
+                let doc = g.replace(
+                    "idempotency_retention_hours = 48",
+                    &format!("idempotency_retention_hours = 48\n{key} = {bad}"),
+                );
+                assert!(
+                    invalid(&doc).contains("outside the safe range"),
+                    "{key}={bad}"
+                );
+            }
+        }
+        let d = Policy::default();
+        assert_eq!(d.get(PolicyKey::GroupMaxDepth), 32);
+        assert_eq!(d.get(PolicyKey::GroupMaxClosure), 10_000);
+        assert_eq!(d.get(PolicyKey::SetupLinkLifetimeSecs), 86_400);
+        assert_eq!(d.get(PolicyKey::AccessTokenLifetimeSecs), 600);
+        assert_eq!(d.get(PolicyKey::StepUpWindowSecs), 300);
+        assert_eq!(d.get(PolicyKey::RecoveryWaitingPeriodSecs), 86_400);
+        assert_eq!(d.get(PolicyKey::MfaRequired), 0);
+        assert_eq!(d.get(PolicyKey::DpopFirstPartyRequired), 0);
+        assert_eq!(d.get(PolicyKey::RateLimitSourcePerMin), 30);
+        assert_eq!(d.get(PolicyKey::RateLimitAccountPerMin), 10);
+        assert_eq!(d.get(PolicyKey::RateLimitTenantPerMin), 600);
+    }
+
+    /// `[valkey] url` (M1 contract §3 [R6]): optional, redis:// or rediss://, credentials
+    /// allowed and never printed; anything else is refused by check-config.
+    #[test]
+    fn cluster_node_count() {
+        let g = good();
+        assert_eq!(Config::from_toml_str(&g).unwrap().cluster.node_count, 1);
+        let c = Config::from_toml_str(&format!("{g}\n[cluster]\nnode_count = 3\n")).unwrap();
+        assert_eq!(c.cluster.node_count, 3);
+        for bad in ["0", "-1"] {
+            let e = invalid(&format!("{g}\n[cluster]\nnode_count = {bad}\n"));
+            assert!(e.contains("cluster.node_count"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn valkey_section() {
+        let g = good();
+        assert!(Config::from_toml_str(&g).unwrap().valkey.is_none());
+        for ok in [
+            "redis://localhost:6379",
+            "rediss://default:s3cr3t-pw@valkey.internal:6380/0",
+        ] {
+            let c = Config::from_toml_str(&format!("{g}\n[valkey]\nurl = \"{ok}\"\n")).unwrap();
+            assert_eq!(c.valkey.as_ref().unwrap().url.expose_secret(), ok);
+            assert!(!format!("{c:?}").contains("s3cr3t-pw"));
+        }
+        for bad in ["http://localhost:6379", "redis://", "localhost:6379", ""] {
+            let e = invalid(&format!("{g}\n[valkey]\nurl = \"{bad}\"\n"));
+            assert!(e.contains("valkey.url"), "{bad}: {e}");
+        }
+        assert!(
+            invalid(&format!("{g}\n[valkey]\nurl = \"redis://h\"\nx = 1\n"))
+                .contains("unknown field")
+        );
+    }
+
+    #[test]
     fn policy_ranges_enforced() {
         let g = good();
         assert!(invalid(&g.replace("= 48", "= 1")).contains("outside the safe range"));
@@ -725,5 +1138,51 @@ policy = ["idempotency_retention_hours"]
         );
         let e = invalid(&g);
         assert!(!e.contains("hunter2"), "{e}");
+    }
+
+    /// `[notifier]` (M1 contract §4, rev 13; [R7]).
+    #[test]
+    fn notifier_section() {
+        let g = good();
+        assert!(Config::from_toml_str(&g).unwrap().notifier.is_none());
+        let smtp = |extra: &str| {
+            format!(
+                "{g}\n[notifier]\nkind = \"smtp\"\n[notifier.smtp]\nhost = \"smtp.example.com\"\nport = 587\ntls = \"starttls\"\nfrom = \"Cloud System <no-reply@example.com>\"\n{extra}"
+            )
+        };
+        let c = Config::from_toml_str(&smtp("username = \"relay\"\npassword = \"pw-s3cr3t\"\n"))
+            .unwrap();
+        let s = c.notifier.as_ref().unwrap().smtp.as_ref().unwrap();
+        assert_eq!((s.port, s.tls), (587, SmtpTls::Starttls));
+        assert!(!format!("{c:?}").contains("pw-s3cr3t"));
+        assert!(c.check_profile(false).is_ok());
+        // both-or-neither credentials
+        assert!(invalid(&smtp("username = \"relay\"\n")).contains("together"));
+        assert!(invalid(&smtp("password = \"pw\"\n")).contains("together"));
+        // tls = none only for loopback hosts
+        let none = smtp("").replace("tls = \"starttls\"", "tls = \"none\"");
+        assert!(invalid(&none).contains("loopback"));
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let doc = none.replace("smtp.example.com", host);
+            assert!(Config::from_toml_str(&doc).is_ok(), "{host}");
+        }
+        assert!(invalid(&smtp("").replace("port = 587", "port = 0")).contains("port"));
+        assert!(
+            invalid(&smtp("").replace("Cloud System <no-reply@example.com>", "nobody"))
+                .contains("from")
+        );
+        assert!(invalid(&smtp("").replace("smtp.example.com", "bad host")).contains("host"));
+        assert!(invalid(&smtp("timeout = 1\n")).contains("unknown field"));
+        assert!(invalid(&format!("{g}\n[notifier]\nkind = \"smtp\"\n")).contains("notifier.smtp"));
+        assert!(
+            invalid(&format!("{g}\n[notifier]\nkind = \"carrier_pigeon\"\n"))
+                .contains("unknown variant")
+        );
+        // [R7] dev_log: accepted by the parser, refused by the profile check without --dev
+        let dev = Config::from_toml_str(&format!("{g}\n[notifier]\nkind = \"dev_log\"\n")).unwrap();
+        let e = dev.check_profile(false).unwrap_err().to_string();
+        assert!(e.contains("--dev"), "{e}");
+        assert!(dev.check_profile(true).is_ok());
+        assert!(invalid(&format!("{}\n[notifier]\nkind = \"dev_log\"\n[notifier.smtp]\nhost = \"h\"\nport = 25\ntls = \"tls\"\nfrom = \"a@b\"\n", g)).contains("not allowed"));
     }
 }

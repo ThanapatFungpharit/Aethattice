@@ -154,6 +154,10 @@ async fn retry_exhaustion_is_bounded_by_elapsed_time() {
     let Some(t) = TestDomains::create_with(&[D], policy).await else {
         return;
     };
+    // Contract rev 4: connection acquisition is outside the retry budget. Open the first
+    // connection before timing (a cold connection to a just-created YugabyteDB database can
+    // take seconds under parallel load); retries reuse it (backoff < pool idle timeout).
+    t.pool(&D).ping().await.unwrap();
     let started = std::time::Instant::now();
     let err = t
         .pool(&D)
@@ -1453,8 +1457,25 @@ async fn listed(admin: &str, names: &[String]) -> i64 {
     n
 }
 
+async fn user_tables(admin: &str, db: &str) -> i64 {
+    use sqlx::Connection as _;
+    let opts = sqlx::postgres::PgConnectOptions::from_str(admin)
+        .unwrap()
+        .database(db);
+    let mut c = sqlx::PgConnection::connect_with(&opts).await.unwrap();
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace",
+    )
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    let _ = c.close().await;
+    n
+}
+
+/// Pool databases are leased, reset (verified empty) at cleanup and never dropped.
 #[tokio::test]
-async fn harness_cleanup_verifies_databases_are_gone() {
+async fn harness_cleanup_resets_pool_databases() {
     let Some(t) = TestDomains::create(&[DomainId::Identity, DomainId::Audit]).await else {
         return;
     };
@@ -1463,11 +1484,44 @@ async fn harness_cleanup_verifies_databases_are_gone() {
         t.database_name(&DomainId::Identity).to_owned(),
         t.database_name(&DomainId::Audit).to_owned(),
     ];
+    assert!(
+        names
+            .iter()
+            .all(|n| n.starts_with(cs_db::testing::POOL_DB_PREFIX))
+    );
     assert_eq!(listed(&admin, &names).await, 2);
-    // open sessions must not prevent the drop
+    // leased databases start empty
+    assert_eq!(user_tables(&admin, &names[0]).await, 0);
+    exec(
+        t.pool(&DomainId::Identity),
+        "CREATE TABLE harness_probe (id int PRIMARY KEY)",
+    )
+    .await;
+    assert!(user_tables(&admin, &names[0]).await > 0);
+    // open sessions must not prevent the reset
     t.pool(&DomainId::Identity).ping().await.unwrap();
     t.cleanup().await;
-    assert_eq!(listed(&admin, &names).await, 0);
+    assert_eq!(
+        listed(&admin, &names).await,
+        2,
+        "pool databases are reused, not dropped"
+    );
+    assert_eq!(user_tables(&admin, &names[0]).await, 0);
+}
+
+/// Two concurrent holders never share a database (cross-session advisory-lock lease).
+#[tokio::test]
+async fn harness_leases_are_exclusive() {
+    let Some(a) = TestDomains::create(&[DomainId::Plugins]).await else {
+        return;
+    };
+    let b = TestDomains::create(&[DomainId::Plugins]).await.unwrap();
+    assert_ne!(
+        a.database_name(&DomainId::Plugins),
+        b.database_name(&DomainId::Plugins)
+    );
+    a.cleanup().await;
+    b.cleanup().await;
 }
 
 #[tokio::test]
@@ -1476,6 +1530,6 @@ async fn harness_forgotten_cleanup_fails_loudly() {
     let Some(t) = TestDomains::create(&[DomainId::Plugins]).await else {
         panic!("dropped without cleanup (skipped: no database)");
     };
-    // The databases are still dropped by the fallback before the panic.
+    // The databases are still reset by the fallback before the panic.
     drop(t);
 }

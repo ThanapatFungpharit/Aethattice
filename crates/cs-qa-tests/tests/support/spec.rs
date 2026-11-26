@@ -1,7 +1,7 @@
 //! Expected values transcribed by QA directly from the specification and the frozen M0
 //! contract. Never derive these from the implementation.
 
-/// Appendix D.2: (code, HTTP status, retryable). Exactly 19 codes.
+/// Appendix D.2: (code, HTTP status, retryable). Exactly 21 codes (19 + erratum C12).
 pub const D2: &[(&str, u16, bool)] = &[
     ("invalid_request", 400, false),
     ("unauthenticated", 401, false),
@@ -22,10 +22,13 @@ pub const D2: &[(&str, u16, bool)] = &[
     ("unavailable", 503, true),
     ("timeout", 504, true),
     ("outcome_unknown", 504, true),
+    // Erratum C12 (spec v2.4.2, owner-approved 2026-11-24).
+    ("cursor_expired", 410, false),
+    ("client_upgrade_required", 426, false),
 ];
 
 /// Number of codes in D.2.
-pub const D2_LEN: usize = 19;
+pub const D2_LEN: usize = 21;
 
 pub fn d2(code: &str) -> Option<(u16, bool)> {
     D2.iter()

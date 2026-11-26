@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "web/packages/opaque-wasm"]
 
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-license = "UNLICENSED"
+license = "MIT"
 rust-version = "1.94"
 
 [workspace.dependencies]
@@ -16,6 +16,7 @@ cs-kms = { path = "crates/cs-kms" }
 cs-db = { path = "crates/cs-db" }
 cs-ops = { path = "crates/cs-ops" }
 cs-api = { path = "crates/cs-api" }
+cs-identity = { path = "crates/cs-identity" }
 # external (pinned minor versions; Cargo.lock pins exact versions)
 async-trait = "0.1.89"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "query", "original-uri", "matched-path"] }
@@ -51,6 +52,27 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter", "fm
 uuid = { version = "1.29.2", default-features = false, features = ["std", "serde"] }
 zeroize = { version = "1.9.1", features = ["derive"] }
 serde_jcs = "0.2.0"
+sha2 = "0.11.1"
+cs-identity-wire = { path = "crates/cs-identity-wire" }
+# OPAQUE (M1 contract rev 5 §2.1): opaque-ke 4.0.1 (RFC 9807) with argon2 0.5. opaque-ke 4 is
+# built on the digest 0.10 ecosystem, so its SHA-512 comes from sha2 0.10.
+opaque-ke = { version = "=4.0.1", default-features = false, features = ["ristretto255", "argon2", "serde"] }
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
+sha2_010 = { package = "sha2", version = "0.10.9" }
+# CSPRNG adapter for opaque-ke 4 (rand_core 0.6 traits); OsRng reads the OS CSPRNG.
+rand_core_06 = { package = "rand_core", version = "0.6.4", features = ["getrandom"] }
+unicode-normalization = "0.1.26"
+# DPoP (M1 contract rev 8 §3): ES256 proofs (P-256 ECDSA, RustCrypto).
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std"] }
+# Valkey client for the shared DPoP replay store ([R6]); TLS via rustls, ConnectionManager.
+# WebAuthn (M1 contract §2.2, rev 10): kanidm webauthn-rs. State serialization lets ceremony
+# state live server-side in auth_txns (AEAD-sealed); conditional-ui enables discoverable login.
+webauthn-rs = { version = "=0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+url = "2.5.4"
+# Recovery-link SMTP relay (M1 contract §4, rev 13): async tokio transport, rustls with
+# webpki roots and ring; no native-tls, no connection pool, no hostname lookup.
+lettre = { version = "0.11.24", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
+redis = { version = "1.8.3", default-features = false, features = ["tokio-rustls-comp", "connection-manager"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -65,3 +87,10 @@ todo = "warn"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Argon2id with the contract parameters (64 MiB, t = 3) is impractically slow unoptimized; the
+# test-side OPAQUE client runs it on every registration and login.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

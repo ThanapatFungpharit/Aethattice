@@ -7,8 +7,19 @@ jobs:
     env:
       # Same toolchain as the dev host, so rustfmt/clippy output matches. Overrides rust-toolchain.toml.
       RUSTUP_TOOLCHAIN: "1.99.1"
+      # Smaller test binaries: line tables only (enough for panic locations). The runner disk was
+      # exhausted by target/ + rust-cache + the YugabyteDB image (YB then refuses writes).
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
     steps:
       - uses: actions/checkout@v4
+      - name: Free runner disk space (unused preinstalled SDKs)
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h /
+      - name: Start Valkey (same image as dev/docker-compose.yml; DPoP replay-store tests)
+        run: docker run -d --name valkey -p 6379:6379 valkey/valkey:9.2.0-alpine
       - name: Start YugabyteDB (same image as dev/docker-compose.yml)
         run: |
           docker run -d --name yb -p 5433:5433 yugabytedb/yugabyte:2026.1.2.0-b137 \
@@ -19,8 +30,26 @@ jobs:
           done
           docker logs yb | tail -50; exit 1
       - uses: dtolnay/rust-toolchain@master
-        with: { toolchain: "1.99.1", components: "rustfmt, clippy" }
+        with: { toolchain: "1.99.1", components: "rustfmt, clippy", targets: "wasm32-unknown-unknown" }
       - uses: Swatinem/rust-cache@v2
+      # wasm-bindgen-cli, pinned to the crate's wasm-bindgen version, so scripts/build-opaque-wasm.sh --check
+      # verifies the committed opaque-wasm pkg/ (M1 rev 5 §2.1) instead of skipping it.
+      - name: Cache wasm-bindgen-cli 0.2.130
+        id: wasm-bindgen-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cs-tools/wasm-bindgen-0.2.130
+          key: wasm-bindgen-cli-0.2.130-${{ runner.os }}-rust-1.99.1
+      - name: Install wasm-bindgen-cli 0.2.130
+        if: steps.wasm-bindgen-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.130 --locked --root ~/.cache/cs-tools/wasm-bindgen-0.2.130
+      - name: Put wasm-bindgen on PATH
+        run: echo "$HOME/.cache/cs-tools/wasm-bindgen-0.2.130/bin" >> "$GITHUB_PATH"
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - run: scripts/ci.sh --with-db
+        env:
+          # In GitHub Actions a missing wasm-bindgen is a failure, not a skip.
+          CS_REQUIRE_WASM_BINDGEN: "1"
+          # scripts/e2e.sh creates its database through ysqlsh in this job's YugabyteDB container.
+          CS_E2E_YB_CONTAINER: yb

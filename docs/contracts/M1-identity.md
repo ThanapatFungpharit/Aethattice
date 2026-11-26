@@ -1,15 +1,15 @@
-# M1 Contracts: Identity (DRAFT rev 2, frozen at M0 gate after review)
+# M1 Contracts: Identity (FROZEN rev 16)
 
-- Status: **draft**. It is frozen only once the M0 gate passes and the QA Engineer and project owner have reviewed it.
-- Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8.
-- Builds on `M0-foundations.md` (rev 4).
+- Status: **frozen for M1**, revision 3 (owner approval 2026-11-24, after the M0 gate passed and QA reviewed rev 1). Changes require Team Leader approval and a changelog entry at the bottom of this file.
+- Spec: §5 (all), §3.5, §6.8, §15.4, §21.3, App. A, D, E, J.4. Errata: C8, C11, C13 (spec v2.4.2).
+- Builds on `M0-foundations.md` (rev 6).
 - Rev 2 resolves QA review M1-R1 … M1-R14 (`docs/qa/M0-gate.md` §6.1). Each resolution is tagged `[R<n>]`.
 
-## 0. Ordering issue: admin authorization before M2 (owner decision needed)
+## 0. Ordering issue: admin authorization before M2 (owner-approved 2026-11-24)
 
 Spec §6.8 says administrative actions are authorized through the relationship model. That model, with its tuples on tenant resources in the resources domain and the decision service, arrives in M2. M1 has no compliant way to authorize tenant-admin HTTP APIs.
 
-**Proposal:**
+**Decision (owner-approved):**
 - M1 exposes **no HTTP admin API**. Tenant, user and group administration in M1 happens only through:
   - (a) the `cs admin` CLI. `[R4]` It is a standalone subcommand, not a server role: it does not start a listener and does not need the `control` role, which stays refused until M8. It connects only to the identity domain with the operator credential from `--config`, runs each action as one identity-domain transaction, and writes an outbox event for each action so M4 audit can consume it; and
   - (b) the one-time first-administrator setup link (J.4 step 4).
@@ -38,7 +38,7 @@ All tables follow App. E: tenant_id first, CAS version columns, DB-set timestamp
 
 Group cycles are rejected at write time by a closure check inside the membership transaction, under the configured depth and cardinality limits. Exceeding a limit returns a typed `invalid_request` with error `group_complexity_limit`. A partial result is never returned (§6.4). Group writes are CLI-only in M1 (§0); the code is listed in the error catalogue (§6.1) for the M2 HTTP API.
 
-Outbox events: `identity.user.created|updated|disabled`, `identity.group.membership_changed` (carries the new membership_version), `identity.session.revoked` (carries session generation), `identity.credentials.changed`. These are the revocation sources that M2's authz domain consumes (§6.6).
+Outbox events: `identity.user.created|updated|disabled`, `identity.group.membership_changed` (carries the new membership_version), `identity.session.revoked` (carries session generation), `identity.credentials.changed`. These are the revocation sources that M2's authz domain consumes (§6.6). (rev 4) Administrative actions without a revocation effect also emit `identity.tenant.created`, `identity.group.created` and `identity.setup_link.issued`, so every `cs admin` action writes an outbox event (§0).
 
 ## 2. Authentication protocols
 
@@ -58,6 +58,43 @@ Outbox events: `identity.user.created|updated|disabled`, `identity.group.members
   - `login/finish {login_txn, credential_finalization}` → an authentication result (§2.4)
   - `register/start` and `register/finish`: allowed only with a registration grant (setup link, invitation, completed recovery, or step-up session for a password change)
 - `login_txn` is a server-side record with a 60 s TTL, single use, bound to tenant, login and source.
+- (rev 6) **Storage for transactions and server keys:**
+  - `auth_txns ((tenant_id, txn_hash) HASH)` holds `login_txn` and `registration_txn`.
+    - The txn id uses the `rt1` format, and only its SHA-256 is stored.
+    - The ServerLogin state is AEAD-sealed under the txn-sealing key, with associated data `tenant_id ‖ txn_hash ‖ kind`.
+    - Each txn is consumed by a conditional delete or state transition in the finishing transaction, so it is single use even across nodes.
+    - Expired rows are reclaimed lazily.
+  - `opaque_server_keys (key_version)` is a deployment-wide table, so it has no `tenant_id`. Each row holds an envelope with the OPAQUE ServerSetup, the [R3] PRF key and the txn-sealing key.
+    - The envelope is encrypted under the KMS KEK `identity-opaque@vN`, with associated data `key_version ‖ purpose`.
+    - It is created once with `INSERT … ON CONFLICT DO NOTHING`, and every node then re-reads the stored row, never using its own candidate.
+    - Nodes unwrap it into memory only at startup. It is never logged.
+    - Rotation adds a new version, and each registration records its version.
+- (rev 9) **Re-registration by a step-up session** (password change and transparent KSF or key-version upgrade):
+  - `register/start` and `register/finish` take the session's access token instead of `grant`, using `Authorization: DPoP|Bearer` per rev 8 and a proof when the session is bound.
+    - `register/start {purpose, registration_request}`, where `purpose` is `password_change` or `ksf_upgrade`. The login is taken from the session's user; a `login` in the body is refused.
+    - The session must satisfy the step-up window, otherwise the response is `unauthenticated` with `step_up_required`. The `registration_txn` is bound to the session's `sid`, user and generation.
+  - `register/finish` replaces the user's OPAQUE registration with the current KSF parameters and key version. The user stays active, and no setup link is consumed.
+    - It emits `identity.credentials.changed` with reason = `purpose`.
+    - In the same identity transaction, it revokes **every other** session and refresh family of the user, keeping the current one.
+    - The server cannot tell whether the password changed (OPAQUE hides it), so `purpose` never weakens the revocation. A `ksf_upgrade` therefore also signs out other devices. The trade-off is accepted because upgrades are rare.
+  - `login/finish` returns `"reregister": true` (absent otherwise) when the stored KSF parameters are below the current defaults, or the registration's server key version is not current. The web client then runs `ksf_upgrade` immediately, with the same password, while still inside the step-up window.
+- (rev 7) **KSF parameter bounds.** Valid `ksf_params` satisfy `65536 ≤ m_kib ≤ 262144`, `3 ≤ t ≤ 10` and `1 ≤ p ≤ 4`.
+  - The client refuses anything outside these bounds before running Argon2id. A hostile or broken server cannot make it exhaust memory.
+  - The server never stores or offers parameters outside them.
+- (rev 7) **Password step-up without a new session.** `opaque/reauth/start {credential_request}` → `{reauth_txn, credential_response, ksf_params}`, then `opaque/reauth/finish {reauth_txn, credential_finalization}` → `204`.
+  - Both calls require the current access token (DPoP-bound when the session is). The txn is bound to that session's `sid`.
+  - On success, the server sets `last_strong_auth_at` on the *existing* session. It issues no new session or refresh token.
+  - Failure returns `unauthenticated`, as for login.
+- (rev 7) **`GET /api/v2/me`** (access token) → `{user_id, tenant_id, login, display_name, state, amr, auth_time, sid}`, for the account page. (rev 14 addendum) `display_name` is `string | null`: it is null when no display name was set. Clients show the login instead.
+- (rev 6) Access-token claims: `iss = "https://<deployment domain>"`, `aud = "https://<deployment domain>/api/v2"`.
+- (rev 5) **Wire format, binding for client and server:**
+  - Crate `opaque-ke` 4.0.1 (RFC 9807 final) with `argon2` 0.5. The cipher suite type is defined once, in a small dependency-free crate `cs-identity-wire`, which server and `web/packages/opaque-wasm` both use. That crate also holds login normalization, so client and server normalize identically.
+  - OPAQUE messages are base64url without padding in JSON (as in M0 text transports).
+  - `ksf_params = {"algorithm":"argon2id","m_kib":65536,"t":3,"p":1}`. The server rejects parameter sets below the defaults when registering.
+  - OPAQUE context is the ASCII string `cs-opaque/v1`. The client identifier is the UTF-8 string `<tenant UUID>/<normalized login>`. The server identifier is the default (the server public key; the registration records the key version).
+  - `tenant` is always the tenant UUID in canonical text form. Tenant names, slugs or domains are not resolved in M1.
+  - `register/start {grant, login, registration_request}` → `{registration_txn, registration_response, ksf_params}`. `grant` is the full `rt1.` token. The tenant comes from the grant, and `registration_txn` has a 60 s TTL and is single use.
+  - `register/finish {registration_txn, registration_upload}` → `204`, consuming the grant. The client then signs in normally, so sessions are issued only by `login/finish`.
 
 ### 2.2 WebAuthn (§5.3)
 
@@ -68,7 +105,7 @@ Outbox events: `identity.user.created|updated|disabled`, `identity.group.members
 ### 2.3 MFA and step-up
 
 - When tenant policy requires MFA, a successful OPAQUE login returns `{state: "mfa_required", auth_txn, methods}`, and only `webauthn/assert` or `recovery-code` completes it.
-- Step-up: sensitive operations (§5.5 list) require `last_strong_auth_at ≥ now() − 5 min` (policy, proposed range 1–60 min, §8). `[R2]` Otherwise they get `unauthenticated` (401) with an `errors[]` entry `{pointer: "", code: "step_up_required", detail}`. No new problem member is added, so the M0 problem fields stay frozen. The M0 SDK hook "unauthenticated → refresh once → retry once" is amended (M0 contract rev 5): it does **not** refresh when `errors[]` contains `step_up_required`, and the SDK surfaces a typed `StepUpRequired` error so the UI can run `webauthn/assert` or re-enter the password.
+- Step-up: sensitive operations (§5.5 list) require `last_strong_auth_at ≥ now() − 5 min` (policy, range 1–60 min, §8). `[R2]` Otherwise they get `unauthenticated` (401) with an `errors[]` entry `{pointer: "", code: "step_up_required", detail}`. No new problem member is added, so the M0 problem fields stay frozen. The M0 SDK hook "unauthenticated → refresh once → retry once" is amended (M0 contract rev 5): it does **not** refresh when `errors[]` contains `step_up_required`, and the SDK surfaces a typed `StepUpRequired` error so the UI can run `webauthn/assert` or re-enter the password.
 
 ### 2.4 Authentication result
 
@@ -81,11 +118,30 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
 ## 3. Tokens (§5.5, C8)
 
 - **Access token:** JWS compact, `alg: EdDSA`, `typ: at+jwt`, `kid` = KMS key ID with version.
-  - Claims: `iss`, `aud` (deployment API audience), `sub`, `tid`, `sid`, `sgen` (session `generation`), `amr`, `auth_time`, `iat`, `exp` (iat + 600 s, proposed policy range 60–3600 s, §8), `jti`, plus `cnf.jkt` when DPoP-bound.
+  - Claims: `iss`, `aud` (deployment API audience), `sub`, `tid`, `sid`, `sgen` (session `generation`), `amr`, `auth_time`, `iat`, `exp` (iat + 600 s, policy range 60–3600 s, §8), `jti`, plus `cnf.jkt` when DPoP-bound.
   - `[R9]` The claim name `av` is **reserved** for the authorization version (§5.5) that M2 defines over authz epochs and membership versions. M1 tokens omit it; M2 adds it as a new claim, which is not a breaking change. Verifiers ignore unknown claims.
   - Clock skew `[R12]`: `iat` may be at most 60 s in the future; `exp` is enforced with 0 s leeway on the server and 60 s on the client's proactive refresh.
   - Verifiers accept only EdDSA and only known `kid`s. `alg: none`, HS*, and `jwk`/`jku`/`x5u` headers are all rejected.
 - **DPoP (RFC 9449):** mandatory for third-party OAuth clients (M5) and optional for first-party clients (policy). Proofs are checked for `htm`, `htu`, `iat` within ±60 s, `jti` replay, `ath`, and key thumbprint against `cnf.jkt`.
+  - (rev 8) **Wire details:**
+    - **Proof algorithms:** the server accepts `ES256` (P-256) and `EdDSA` (Ed25519) and refuses every other `alg`. The web client uses `ES256`, because WebCrypto supports it everywhere. `typ` must be `dpop+jwt`. The `jwk` header carries only public members; a `jwk` with private members is refused.
+    - **No nonces in M1:** the server never sends `DPoP-Nonce` or `use_dpop_nonce`. A client that receives one retries once with the nonce.
+    - **The first-party web client always sends proofs:** on `login/finish`, `token/refresh`, `reauth/*`, and every request carrying an access token.
+      - When `login/finish` carries a valid proof, the session, its access tokens (`cnf.jkt`) and the whole refresh family are bound to that key's thumbprint.
+      - A bound refresh token must present a proof from the same key. A proof from a different key, or none, is treated like refresh-token theft: the refresh is refused with `unauthenticated` and the session is revoked, exactly as for reuse.
+      - A session started without a proof stays unbound (policy `dpop_first_party = optional`). Third-party clients must use DPoP (M5).
+    - **Authorization header:** a token carrying `cnf.jkt` must be sent as `Authorization: DPoP <token>` with a matching proof that includes `ath`. Presenting it as `Bearer` is refused.
+    - **`htu`:** the absolute request URI as the client sends it, without query or fragment. The server compares it with `https://<deployment domain>` plus the request path, so the web shell and the API share one origin.
+    - **Key lifetime:**
+      - One key pair per session, created before `login/finish` and stored as a non-extractable CryptoKey in IndexedDB, shared by all tabs.
+      - It is deleted on sign-out, and on any `unauthenticated` response that ends the session, such as revocation or reuse.
+      - The next sign-in generates a new key.
+  - (rev 14, supersedes the Valkey part of [R6]) **The DPoP replay record is authoritative only in the identity-domain table `dpop_jti`.**
+    - Every DPoP-checked request inserts `((tenant_id, jkt), jti)` with `INSERT … ON CONFLICT DO NOTHING` in one short identity transaction. A conflict means replay.
+    - Valkey is no longer on the replay path. The QA gate (F-1) showed why: recording the `jti` in Valkey *or* the table lets a node partitioned from Valkey accept a proof that another node recorded only in Valkey, or the reverse.
+    - Losing Valkey therefore never affects replay safety (§18.5). If the identity domain is unavailable, DPoP-bound requests fail closed with `unavailable` (503).
+    - The extra single-row write per DPoP request is a measured-cost item for M8. Correctness comes before performance (§1.2).
+    - Valkey stays in use for rate limiting (§5).
   - `[R6]` The replay check is shared across nodes. It uses Valkey (`SET NX` with TTL 120 s). If Valkey is unavailable it falls back to the identity-domain `dpop_jti` table, never to a per-node cache. Losing Valkey costs latency only (§18.5). If both are unavailable, DPoP-bound requests fail closed with `unavailable` (503, retryable).
 - **Refresh:** `POST /api/v2/auth/token/refresh` rotates the token on every use.
   - Format `[R8]`: `rt1.<tenant_id base64url>.<256-bit random base64url>`. The server stores SHA-256 of the whole string. The tenant segment only selects the partition for the lookup `(tenant_id, token_hash)`; it is not trusted, because a changed tenant segment changes the hash and finds nothing. The same format is used for setup links and recovery grants.
@@ -119,6 +175,115 @@ The refresh token is set as a cookie: `__Secure-cs_rt` (not `__Host-`: that pref
   - There is no state in which the new password exists and old sessions are still valid. Sessions are not revoked before then, so an abandoned recovery leaves the account usable.
   - The request is idempotent with `Idempotency-Key`. Presenting a used or expired grant returns `unauthenticated`. An expired grant returns the request to `expired`, and the user must start over.
   - All devices are notified after commit through the `Notifier` (outbox-driven, outside the transaction).
+- (rev 10) **Recovery endpoints.**
+  - **Recovery code:** no waiting period, because possessing the code is the proof.
+    - `POST /api/v2/auth/recovery/start {tenant, login, method: "recovery_code", code}` returns `{state: "granted", grant, grant_expires_in}` for a valid unused code.
+    - Unknown tenant, unknown account, wrong code and used code all return the same `unauthenticated` problem, with the same timing path. Rate limits per §5 apply.
+  - **Verified email:**
+    - `start {tenant, login, method: "email"}` always returns `202 {state: "pending"}`, with an identical shape for unknown accounts.
+    - When the account exists, a request is created, and the `Notifier` sends an `rt1` recovery link to the verified address. It is never returned in the API.
+    - `POST /api/v2/auth/recovery/status {token}` (the token from the link) returns `{state, available_at}`. Possessing the link verifies the email.
+    - Once `not_before` has passed, the state is `granted` and the response carries `grant` (15 min, single use).
+    - Users with MFA must also send `code` (a recovery code) in that `status` call, per §4 "a second factor or the recovery code". A user who still has a passkey signs in passwordless instead and changes the password by step-up.
+  - **Approval from a signed-in device:**
+    - `start {tenant, login, method: "device_approval"}` returns `202 {state: "pending", recovery_txn}`, also for unknown accounts. `recovery_txn` uses the `rt1` format.
+    - The user's session sees the request in `GET /api/v2/me/recovery-requests` and approves it with `POST …/{id}/approve` (step-up required). The requester then polls `status {recovery_txn}` and gets `granted` plus `grant`.
+    - Approval counts as the second factor and skips the waiting period.
+  - **Administrator-assisted:** `cs admin recovery start` creates an email-method request with the waiting period.
+  - **Cancel:** any session of the user can list pending requests (`GET /api/v2/me/recovery-requests`) and cancel one with `DELETE …/{id}`, which sets the state to `cancelled`.
+  - **Completion:** unchanged ([R5]). `register/start {grant, login, registration_request}` → `register/finish` → normal sign-in.
+- (rev 11) **Schema and policy additions (migration 0103, expand only):**
+  - **Recovery codes:**
+    - Table `recovery_code_entries ((tenant_id, user_id) HASH, code_id ASC)`, holding an Argon2id PHC hash, `used_at` and `set_version`. Each set has 10 codes.
+    - Wire format `<code_id: 8 base32 chars>-<secret: 20 base32 chars>`. The lookup is by `code_id`, and exactly one Argon2id verification runs, with a dummy hash for unknown IDs so timing is the same.
+    - The old `recovery_codes` table is unused, and a later contract migration drops it.
+  - **Email:** `users.email` and `users.email_verified_at`, set in M1 only by `cs admin user set-email --verified`. An email-method recovery for a user with no verified address behaves like an unknown account.
+  - **Sessions and passkeys:**
+    - `sessions.last_seen_at` is updated on refresh. `sessions.user_agent` is taken at `login/finish` and truncated to 200 characters.
+    - `webauthn_credentials` gains `label` (1–100 characters), `last_used_at` and the serialized `passkey_state`. On the wire, the passkey `id` is the base64url credential ID.
+  - **MFA:**
+    - A user "has MFA" when policy `mfa_required` = 1 (deployment default, overridable by the tenant through `tenants.policy`) or the user has at least one passkey.
+    - `login/finish` then returns `200 {state: "mfa_required", auth_txn, methods}`. `auth_txn` uses the `rt1` format with a **5 min** TTL and single use. Presenting it to the wrong endpoint returns 401 with `mfa_required`.
+    - **Enrolment:** when policy requires MFA but the user has no passkey and no unused recovery code, `login/finish` issues an **enrolment-only session**.
+      - Its access token carries `scp: "mfa_enrolment"`.
+      - It may call only `webauthn/register/*`, `me/recovery-codes`, `GET /me` and logout. Every other endpoint answers 401 with `mfa_required`.
+      - Once a factor is enrolled, the user signs in again normally.
+  - **`reregister` with MFA:** for MFA users the flag is set on the §2.4 result of `webauthn/assert/finish` (MFA) and `mfa/recovery-code`, never on the `mfa_required` body.
+    - The client may keep the password only as bytes (`Uint8Array`), never as a string. It keeps them only while the MFA prompt is open, at most for the `auth_txn` lifetime.
+    - It runs `ksf_upgrade` immediately after MFA succeeds, then zeroes the bytes. It also zeroes them on cancel, failure or timeout.
+  - **New policy keys** (owner-approved 2026-11-26, recorded in erratum C13):
+    - `mfa_required` 0 (0–1);
+    - `dpop_first_party_required` 0 (0–1);
+    - `rate_limit_source_per_min` 30 (5–1000);
+    - `rate_limit_account_per_min` 10 (3–100);
+    - `rate_limit_tenant_per_min` 600 (60–100000), all over fixed 60 s windows.
+    The rate-limit fallback is local buckets at limit/N per §5, using `[cluster] node_count` (≥ 1, checked by `check-config`).
+- (rev 15) **Idempotency-Key replay on identity writes (spec D.3; e2e finding).**
+  - Every identity write except `token/refresh`, which keeps its [R1] mechanism, records its result in the identity domain's idempotency store, using the M0 `cs-db` idempotency API in the same transaction as the effect.
+    - A retry with the same key and digest returns the original status and body within the retention period.
+    - A different digest returns `idempotency_mismatch`.
+    - Without a key, the behaviour is unchanged.
+  - **Responses containing bearer secrets** are stored **AEAD-sealed** under a key from the identity KMS hierarchy, with associated data `tenant ‖ principal ‖ key ‖ route`. This covers the §2.4 results with an access token (plus the refresh cookie, replayed as the same `Set-Cookie`), recovery grants and generated recovery codes. They are never stored in plaintext.
+  - **Retention:**
+    - Sealed secret-bearing results are kept for the shorter of the idempotency retention (C13) and the secret's own lifetime: 10 min for access tokens, 15 min for grants, and 24 h for recovery-code sets.
+    - Once a sealed result has expired, a retry returns `unauthenticated`, and the client restarts the ceremony.
+  - Pre-authentication ceremonies (`login/*`, `register/*` with a grant, `webauthn/login/*`, `recovery/*`) are keyed by the txn or ceremony ID as principal, because there is no authenticated principal yet.
+- (rev 16) **How rev 15 is implemented** (backend proposals P1–P3, accepted):
+  - **P1, §2.4 results:**
+    - The access token is signed after commit, because the KMS may be remote and no network call may run inside a DB transaction.
+    - The effect transaction therefore stores a sealed envelope: refresh token, cookie max-age, claims, signing `kid` (fetched before the transaction), `expires_in`, `session_id` and `reregister`.
+    - A replay re-signs the same claims with the same `kid`. Ed25519 is deterministic (RFC 8032), so the token and body are byte-identical, and the same `Set-Cookie` is returned. If that `kid` can no longer sign, the replay returns `unauthenticated`.
+  - **P2, retention:**
+    - The record is kept for the C13 idempotency retention, and the sealed envelope carries the secret's `not_after`; after it, a replay returns `unauthenticated`.
+    - Migration 0104 (expand-only) adds `idempotency_records.secret_expires_at` and a partial index.
+    - The identity sweeper overwrites expired sealed payloads with a tombstone in bounded batches, so ciphertext never outlives the secret.
+    - The seal key is derived (BLAKE3 `derive_key`, context `identity idempotency v1`) from the per-version seal key in `opaque_server_keys`.
+  - **P3, pre-authentication starts:**
+    - `login/start` and `recovery/start` use as principal a deterministic UUID derived from `H(route ‖ tenant ‖ normalized login)`; `webauthn/login/start` uses `H(route ‖ tenant)`.
+    - Routes that carry a grant, txn or ceremony token are keyed by that token's hash.
+    - Responses that carry ceremony txn bearers are also sealed, with retention equal to the txn TTL.
+- (rev 16 addendum, P4) **Replaying a logout.**
+  - This applies only to `POST /auth/logout` and `DELETE /me/sessions/{sid}` revoking the caller's own session.
+  - When the session check fails with `unauthenticated` and the request carries an `Idempotency-Key`, the server looks up the stored record for (tenant, user from a cryptographically verified, unexpired JWT, key). The DPoP binding is still checked.
+  - Same digest: return the stored `204` and the cookie-clearing `Set-Cookie`. Nothing else is read or changed.
+  - No record or a different digest: `unauthenticated`, exactly as in rev 14.
+  - Every other route keeps the strict rev 14 order: session check first, then idempotency.
+- (rev 15) **Client rule:** a 2xx response whose body fails to decode is never retried and never triggers a refresh, because the write succeeded. The SDK surfaces a non-retryable client error carrying `request_id`.
+- (rev 14) **Every authenticated route checks the session, not only the JWT.**
+  - One shared extractor verifies the access token, then that its session is `active` at the token's `sgen`, then scope (`scp`) and DPoP binding.
+  - A revoked or rotated-generation session gets `unauthenticated` on every route, `/me/*` included, even while the token has not expired. This is QA gate finding F-3.
+- (rev 13) **Recovery email delivery in M1 is best effort and not durable.**
+  - The `rt1` link is a bearer secret, so it never goes into the outbox or any other durable queue.
+  - After the request commits, the handler hands the link to a **bounded in-memory queue** on that node and returns `202` immediately. Response timing therefore never depends on SMTP.
+  - A background worker sends through the SMTP relay (`lettre`), with at most 5 attempts and exponential backoff capped at 30 s. It logs only error class and attempt number, never the token or the address.
+  - If the queue is full, the link is dropped and counted in a metric, and the response is still `202`. If the node crashes before sending, the link is lost and the user starts again. No delivery guarantee is claimed.
+  - Device notifications about completion stay outbox events, delivered in M4.
+  - **M4 follow-up:** durable delivery. The outbox carries only `request_id`, and the sender mints the link token at send time, storing its hash by CAS.
+  - **Config:** `[notifier] kind = "smtp" | "dev_log"`.
+    - `[notifier.smtp]` takes `host`, `port`, `tls = "tls" | "starttls" | "none"` (`none` only for loopback hosts), optional `username` and `password` as Secrets (both or neither), and `from`.
+    - `dev_log` requires `--dev` on both `cs serve` and `cs check-config`.
+    - Without a notifier, nothing is sent, and `cs serve` logs a startup warning that email recovery cannot deliver links.
+  - Link format: `https://<deployment domain>/#/recover/<token>`.
+- (rev 12) **Implementation notes accepted from backend slice 4:**
+  - **WebAuthn ceremonies:** their state is kept in a separate `auth_ceremonies` table (5 min, single use, bound like `auth_txns`). Widening the `auth_txns` CHECK constraints would need a contract migration.
+  - **`cs admin recovery start`:** prints the recovery link token once, like `setup-link`, because the CLI has no `Notifier`. The operator delivers it out of band.
+  - **`me/recovery-requests`:** lists only `email` and `device_approval` requests. Recovery-code requests are granted immediately and never pending.
+  - **Polling a granted request:** each `status` poll issues a fresh grant and invalidates the previous one, but the grant keeps the request's original `grant_expires_at`. Polling never extends the 15 min.
+  - **Still to build in M1:** the SMTP relay `Notifier`, and wiring the dev log sink into `cs serve --dev` and `check-config` ([R7]).
+- (rev 10) **Timestamps and recovery requests.**
+  - Every timestamp field in M1 JSON bodies is an RFC 3339 UTC string, for example `created_at`, `last_seen_at`, `last_used_at` and `available_at`. JWT claims and the `auth_time` mirrored from them stay in unix seconds (RFC 7519).
+  - `GET /api/v2/me/recovery-requests` → `{items: [{id, method: "email"|"device_approval", state: "pending"|"granted", created_at, available_at, requester_user_agent}]}`. It is bounded and not paginated. `requester_user_agent` may be null; it helps the user tell whether a request is their own.
+  - `POST …/{id}/approve` and `DELETE …/{id}` each return `204`.
+  - The `status` body is `{token, code?}` (email) or `{recovery_txn}` (device approval). The response is `{state, available_at?, grant?, grant_expires_in?}`.
+- (rev 10) **WebAuthn and session wire shapes** (L3 JSON forms, binary as base64url without padding):
+  - Passkey registration: `webauthn/register/start {}` (access token, DPoP, step-up) → `{registration_txn, public_key}`; `webauthn/register/finish {registration_txn, credential, label}` → `{id, label, created_at, prf}`.
+  - Passwordless sign-in: `webauthn/login/start {tenant}` → `{login_txn, public_key}`, with discoverable credentials and empty `allowCredentials`; `webauthn/login/finish {login_txn, credential}` → §2.4 result, with a DPoP proof as for OPAQUE.
+  - MFA after OPAQUE: `webauthn/assert/start {auth_txn}` → `{assert_txn, public_key}`; `webauthn/assert/finish {assert_txn, credential}` → §2.4 result. With a recovery code instead: `POST /api/v2/auth/mfa/recovery-code {auth_txn, code}` → §2.4 result.
+  - Step-up: `webauthn/assert/start {}` with the access token → `{assert_txn, public_key}`; `webauthn/assert/finish` → `204` and sets `last_strong_auth_at`.
+  - Passkeys: `GET /api/v2/me/passkeys` → `{items: [{id, label, created_at, last_used_at, prf}]}`; `DELETE /api/v2/me/passkeys/{id}` (step-up) → `204`.
+  - Sessions: `GET /api/v2/me/sessions` → `{items: [{sid, created_at, last_seen_at, amr, user_agent, current}]}`, bounded per user and not paginated. (rev 15 addendum) `last_seen_at` is null until the session's first refresh, and `user_agent` may be null.
+  - `DELETE /api/v2/me/sessions/{sid}` → `204`. Revoking another session requires step-up; revoking the current session acts as logout.
+  - Recovery codes: `POST /api/v2/me/recovery-codes` (step-up) → `{codes}`, which replaces the previous set; `GET` → `{remaining}`.
 - Email delivery uses a configured outbound SMTP relay through a `Notifier` trait. The notification service proper is M4; M1 ships the trait plus an SMTP relay implementation and a dev log sink.
   - `[R7]` The log sink writes bearer secrets (recovery links), so it is refused unless `cs serve` runs with the explicit `--dev` profile. `check-config` rejects it otherwise, and every line it writes is prefixed `DEV-ONLY SECRET`. It is never the default.
 - Account recovery never touches vault keys.
@@ -148,6 +313,7 @@ Every M1 endpoint publishes its possible codes in the OpenAPI document (App. G.5
 | `step_up_required` | `unauthenticated` | Recent strong authentication needed (§2.3) |
 | `mfa_required` | `unauthenticated` | Second factor needed to finish sign-in |
 | `group_complexity_limit` | `invalid_request` | Group depth or cardinality limit (§1) |
+| `group_cycle` | `invalid_request` | (rev 4) Membership change would create a group cycle (§1) |
 | `registration_grant_required` | `permission_denied` | `register/*` without a valid grant |
 
 ## 7. Frontend (M1)
@@ -160,11 +326,11 @@ Every M1 endpoint publishes its possible codes in the OpenAPI document (App. G.5
   - implements the "unauthenticated → refresh once → retry once" hook from M0, skipping the refresh for `step_up_required` (§2.3);
   - serializes refreshes across tabs (§3 `[R1]`).
 
-## 8. Policy ranges (proposed, owner review) `[R11]`
+## 8. Policy ranges (owner-approved, erratum C13) `[R11]`
 
-These ranges are not in the spec. They are recorded here for owner review together with the M0 policy ranges (open question OQ-6) and are enforced by `check-config`.
+These ranges were not in the spec. The owner approved them on 2026-11-24 together with the M0 policy ranges, and they are now normative as erratum C13 (docs/SPEC_ERRATA.md). `check-config` enforces them.
 
-| Policy | Default | Proposed range |
+| Policy | Default | Range |
 |---|---|---|
 | Step-up window | 5 min | 1–60 min |
 | Access-token lifetime | 600 s | 60–3600 s |
@@ -183,3 +349,22 @@ These ranges are not in the spec. They are recorded here for owner review togeth
 - 2026-11-19: draft.
 - 2026-11-20: draft rev 2: resolves QA review M1-R1 … M1-R14. Pending owner decision: §0 (no HTTP admin API in M1) and §8 policy ranges.
 - 2026-11-20: §9: log-secret scan added to the M1 gate (M0 carry-over CT.M0-28).
+- 2026-11-24: **rev 3, frozen.** The owner approved §0 (no HTTP admin API in M1: `cs admin` CLI and the first-administrator setup link only; HTTP admin in M2 under the relationship model) and the §8 ranges (erratum C13). Builds on M0 contract rev 6.
+- 2026-11-24 rev 4 (TL, from backend slice 1): §6.1 adds `group_cycle` (`errors[]` code on `invalid_request`); §1 adds three non-revocation outbox events. Owner-approved the same day (erratum C13): group nesting depth default 32 (4–64), group closure size default 10,000 (1,000–100,000), setup-link lifetime default 24 h (15 min–7 d); all are policies enforced by `check-config`.
+- 2026-11-25 rev 5 (TL, frontend question): §2.1 OPAQUE wire format fixed: crate versions, shared `cs-identity-wire` suite and normalization, base64url encoding, ksf_params shape, context and identifiers, tenant as UUID, register endpoint shapes; register/finish returns 204.
+- 2026-11-25 rev 6 (TL, backend question): §2.1 adds the `auth_txns` and `opaque_server_keys` tables (sealed state, KEK envelope, single-use and cross-node creation rules) and fixes `iss` and `aud`.
+- 2026-11-25 rev 7 (TL, frontend slice 2): KSF parameter bounds; `opaque/reauth/*` for password step-up on the existing session; `GET /api/v2/me`.
+- 2026-11-25 rev 8 (TL, frontend DPoP questions): DPoP wire details (algorithms, no nonce in M1, binding of session and refresh family, `DPoP` auth scheme, `htu`, key lifetime).
+- 2026-11-25 rev 9 (TL, backend question): re-registration by a step-up session (password change and KSF/key upgrade), the `reregister` signal, and revocation of the user's other sessions on every re-registration.
+- 2026-11-26 rev 10 (TL, frontend proposal): recovery endpoints per method (code without a waiting period; email by link with a waiting period, plus a recovery code for MFA users; device approval; admin-assisted; cancel), and WebAuthn, passkey, session and recovery-code wire shapes.
+- 2026-11-26 rev 10 addendum: RFC 3339 timestamps in bodies; `me/recovery-requests` item shape; `status` body and response.
+- 2026-11-26 rev 11 (TL, backend proposals): recovery-code sets, user email, session and passkey columns, MFA definition and the enrolment-only session, `mfa_required` response and 5 min `auth_txn`, new policy keys (ranges pending owner approval, C13).
+- 2026-11-26 rev 11 addendum: `reregister` on MFA completion, and bounded client-side retention of the password bytes.
+- 2026-11-26 rev 12 (TL): implementation notes from backend slice 4 (`auth_ceremonies` table, CLI recovery token, recovery-request listing, grant rotation on polling).
+- 2026-11-26 rev 13 (TL, backend question): recovery email delivery is best effort through a bounded in-memory queue (no bearer secret in the outbox, no durability claim; durable delivery in M4); notifier config.
+- 2026-11-26 rev 14 (TL, QA gate findings F-1, F-3): the DPoP replay record is authoritative only in `dpop_jti` (Valkey off the replay path); every authenticated route checks the session at `sgen` through one shared extractor.
+- 2026-11-26 rev 14 addendum (TL, e2e finding): `GET /me` `display_name` is nullable.
+- 2026-11-26 rev 15 (TL, e2e finding): Idempotency-Key replay on all identity writes per D.3, with secret-bearing results AEAD-sealed and retention capped at the secret's lifetime; client rule for 2xx bodies that fail to decode.
+- 2026-11-26 rev 15 addendum (TL, e2e decoder audit): `me/sessions` `last_seen_at` and `user_agent` are nullable.
+- 2026-11-26 rev 16 (TL, backend proposals): how rev 15 replay is implemented (re-signing sealed claims, tombstoning expired payloads, principals for pre-authentication starts).
+- 2026-11-26 rev 16 addendum (TL, backend P4): a logout with the same `Idempotency-Key` replays its `204` after the session is revoked; no other route is exempt from the rev 14 order.

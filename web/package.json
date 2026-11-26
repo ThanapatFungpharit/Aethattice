@@ -1,6 +1,7 @@
 {
   "name": "cs-web",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "workspaces": [
     "packages/*",
@@ -9,11 +10,13 @@
   "scripts": {
     "typecheck": "tsc -b",
     "test": "vitest run",
+    "test:e2e": "vitest run --config e2e/vitest.config.ts",
     "lint": "node tools/lint/run.mjs",
     "build": "npm run build -w @cs/shell",
     "dev": "npm run dev -w @cs/shell"
   },
   "devDependencies": {
+    "@types/node": "^26.6.6",
     "@vitest/browser": "^5.1.1",
     "happy-dom": "^21.0.4",
     "typescript": "^7.0.2",

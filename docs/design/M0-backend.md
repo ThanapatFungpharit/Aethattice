@@ -138,13 +138,30 @@ Design choices:
 
 ### Test harness (`testing` feature)
 
-- Every database the harness creates is registered before it is created. `cleanup()` drops each one with:
-  - no statement timeout, because a DROP on YugabyteDB can take minutes;
-  - up to 8 attempts, each followed by a check against `pg_database`.
-- If a database cannot be dropped, cleanup panics and names the database.
-- Test pools use a 1 s idle timeout and are closed before the drop.
-- If a `TestDomains` is dropped without `cleanup()`, the databases are still dropped and then the test fails.
-- The harness drops only databases with its own `cs_test_` prefix that it created itself.
+(Revised 2026-11-25, m1/backend-3: database pool instead of CREATE/DROP DATABASE per test, which
+degraded the dev YugabyteDB through sys-catalog bloat.)
+
+- Each domain has a bounded pool of databases `cs_test_pool_<domain>_<n>` (`CS_TEST_POOL_SIZE`,
+  default 8), created once on first use and never dropped.
+- A test leases one database per domain with a session-level advisory lock
+  (`pg_try_advisory_lock(class, blake3(name))`) held on a dedicated admin connection, so leases are
+  exclusive across processes and worktrees and die with the connection if the process crashes.
+  Domains are leased in sorted order (no lease cycles); a test waits for a free database
+  (`CS_TEST_POOL_WAIT_SECS`, default 900 s) and then fails.
+- `cleanup()` closes the pools, terminates leftover sessions, drops every user schema
+  (`DROP SCHEMA … CASCADE`, re-creating `public`) and verifies the database is empty
+  (relations, types and functions in `public`, no other user schema); up to 8 attempts, then it
+  panics naming the database. Only then is the lease released.
+- A database found non-empty at lease time (its holder crashed) is reset first, with a warning.
+- If a `TestDomains` is dropped without `cleanup()`, the databases are still reset (from a
+  separate runtime, before the leases are released) and then the test fails.
+- CREATE DATABASE retries with backoff: a failed CREATE can leave a DocDB keyspace that
+  YugabyteDB removes asynchronously ("Keyspace … already exists" while `pg_database` does not list
+  it).
+- `CS_TEST_POOL_LOG=<file>` appends one line per `create` / `lease` / `reset` (churn measurement).
+- The harness only touches databases with its `cs_test_pool_` prefix.
+- The QA harness (`crates/cs-qa-tests/tests/support/db.rs`) is separate and still creates and
+  drops a database per test.
 
 ## cs-ops
 
@@ -181,3 +198,31 @@ Design choices:
 - `serve`, `migrate`, `init-kms` and `check-config`, each taking `--config <path>`.
 - Only the `api` role is implemented. Any other role makes the binary refuse to start, with exit code 2 and an explicit message.
 - `serve` never migrates and requires an existing KMS root key (created by `init-kms`).
+
+## Decision record: cross-request batching of database requests (evaluated 2026-11-25, not adopted)
+
+The question was whether to add a hybrid batcher: a generic layer that queues database requests from many API requests and flushes them on a size limit or a time limit, whichever comes first.
+
+**Findings**
+- **No such batching exists, and none is needed.** Every API request runs as its own short transaction on one domain (`DomainPool::transaction`): BEGIN, a few statements, COMMIT, about 4–8 round trips. The statements share one pooled connection and use the prepared-statement cache. Within a transaction, YSQL already buffers writes and flushes them at statement boundaries and commit.
+- **Grouping requests from different callers into one transaction would break the contract:**
+  - Each request's effect, idempotency record and outbox event commit atomically on their own (contract §5 and §5.3). A shared transaction would couple failures: one request's constraint violation or 40001 would abort and retry everyone else's work, and turn their outcomes into `outcome_unknown`.
+  - Per-request idempotency, which returns the stored result of the original request, would need a shared record and then a split result.
+  - Outbox sequence ordering per (tenant, partition) is already serialized by the counter row lock. Batching would not remove that lock; it would only make it last longer.
+- **The workload doesn't justify it.**
+  - M1 traffic is human-rate and latency-sensitive (sign-in, refresh, admin), so a time-based trigger adds latency to every request when traffic is low.
+  - There is no measured round-trip bottleneck. The only DB-related slowness seen was catalog churn from tests creating databases (DDL), which batching would not fix.
+- **The spec asks for batching only in specific places,** and each is built in its own milestone with the spec's parameters, not as a generic layer:
+  - §17 storage group commit: records within up to 1 ms share one fdatasync (M3).
+  - §10 collaboration updates: batched per document, up to 50 ms (M6).
+  - Bounded batch authorization checks (M2).
+  - Background jobs process work in bounded batches: the saga reconciler already pages 100 sagas per pass.
+
+**Defect fixed alongside (cs-identity):** the expired-`auth_txns` sweep ran an unbounded `DELETE … WHERE expires_at < now()` across all tenants, inline in `login/start` and `register/start`. That broke App. E (no unbounded scans in request paths) and §21.3 (bounded work).
+- The sweep now runs in the background, rate-limited to once per 60 s per node, so requests never wait for it.
+- Each transaction deletes at most `SWEEP_BATCH_ROWS` (500) rows, and one run makes at most `SWEEP_MAX_BATCHES` (20) transactions. A run ends early on a short batch or the first failure, and the next interval resumes it.
+- Test: `auth::expired_txn_sweep_is_bounded_and_keeps_live_rows`.
+
+**Open follow-up (backend, next slice):** `auth_txns_expiry_idx` is a plain range index on `expires_at`. App. E requires range indexes to be prefixed by a hash-sharded column, because a monotonically growing key puts every insert on the same tablet. The fix is a hash-bucketed expiry index added by a new expand migration, with the sweep iterating the buckets.
+
+**Revisit batching when:** a measured profile shows round-trip-bound throughput on one domain at production load, and the operations involved are independent (no per-request atomicity or idempotency coupling). Candidates are background relays: outbox publishing in M4, and the DPoP `jti` fallback table if Valkey is unavailable.

@@ -208,10 +208,10 @@ async fn readyz_200_when_all_domains_reachable_and_migrated() {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     // Readiness must be withdrawn when a domain database disappears (no stale readiness).
-    let (_, victim) = dbs.remove(0);
-    // The drop is the stimulus of this test, so it is always performed (even with
-    // CS_QA_DEFER_DROP=1).
-    victim.drop_forced().await;
+    // The stimulus: the domain database stops accepting connections and its sessions end
+    // (pooled harness: the database is made unavailable instead of dropped; the reset at
+    // the end re-enables it).
+    dbs[0].1.make_unavailable().await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let r = cl.get(s.url("/readyz")).send().await.unwrap();
@@ -220,7 +220,7 @@ async fn readyz_200_when_all_domains_reachable_and_migrated() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "readyz still 200 after a domain database was dropped"
+            "readyz still 200 after a domain database became unavailable"
         );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }

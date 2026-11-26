@@ -1,7 +1,7 @@
 // Appendix D.2 error codes (contract M0 §2). The wire values are the snake_case strings below.
 // Codes are part of the API contract (App. L): never remove or repurpose an entry within a major version.
 
-/** Every core error code from spec table D.2, in table order. */
+/** Every core error code from spec table D.2 (including erratum C12), in table order. */
 export const CORE_ERROR_CODES = [
   "invalid_request",
   "unauthenticated",
@@ -10,11 +10,13 @@ export const CORE_ERROR_CODES = [
   "method_not_allowed",
   "conflict",
   "resource_trashed",
+  "cursor_expired",
   "precondition_failed",
   "payload_too_large",
   "unsupported_media_type",
   "idempotency_mismatch",
   "locked",
+  "client_upgrade_required",
   "rate_limited",
   "quota_exceeded",
   "internal",
@@ -52,11 +54,13 @@ export const ERROR_CODE_TABLE: Readonly<Record<CoreErrorCode, ErrorCodeInfo>> = 
   method_not_allowed: { status: 405, retryable: false },
   conflict: { status: 409, retryable: false },
   resource_trashed: { status: 409, retryable: false },
+  cursor_expired: { status: 410, retryable: false },
   precondition_failed: { status: 412, retryable: false },
   payload_too_large: { status: 413, retryable: false },
   unsupported_media_type: { status: 415, retryable: false },
   idempotency_mismatch: { status: 422, retryable: false },
   locked: { status: 423, retryable: false },
+  client_upgrade_required: { status: 426, retryable: false },
   rate_limited: { status: 429, retryable: true },
   quota_exceeded: { status: 507, retryable: false },
   internal: { status: 500, retryable: true },

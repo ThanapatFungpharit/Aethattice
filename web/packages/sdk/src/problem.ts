@@ -202,6 +202,49 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * A 2xx response whose body the client could not decode (not JSON, or not the contract shape). The request
+ * succeeded on the server, so it is never retried and never triggers a refresh: its problem is `internal` with
+ * `retryable: false`, and `requestId` names the server request for support. TL ruling 2026-11-26 (M1 e2e).
+ */
+export class ResponseDecodeError extends ApiError {
+  readonly requestId: string | undefined;
+  constructor(httpStatus: number, attempts: number, opts: { requestId?: string | undefined; instance?: string | undefined }) {
+    super({ ...synthesizeProblem("internal", opts), retryable: false }, { httpStatus, synthesized: true, attempts });
+    this.name = "ResponseDecodeError";
+    this.requestId = opts.requestId;
+  }
+}
+
+export function isResponseDecodeError(e: unknown): e is ResponseDecodeError {
+  return e instanceof ResponseDecodeError;
+}
+
 export function isApiError(e: unknown): e is ApiError {
   return e instanceof ApiError;
+}
+
+/** `errors[].code` that marks an `unauthenticated` problem as a step-up request (contract M1 §2.3 [R2], §6.1). */
+export const STEP_UP_REQUIRED_CODE = "step_up_required";
+
+/** True when the problem is `unauthenticated` with an `errors[]` entry `step_up_required` (contract M1 §2.3 [R2]). */
+export function isStepUpProblem(problem: Problem): boolean {
+  return problem.code === "unauthenticated" && (problem.errors ?? []).some((e) => e.code === STEP_UP_REQUIRED_CODE);
+}
+
+/**
+ * Thrown instead of a plain {@link ApiError} when a sensitive operation needs recent strong authentication
+ * (contract M1 §2.3 [R2], M0 contract rev 5). Refreshing the access token cannot satisfy it, so the client
+ * never refreshes for it; the UI runs a WebAuthn assertion or asks for the password again, then retries.
+ * It is still an ApiError, so generic error handling keeps working.
+ */
+export class StepUpRequired extends ApiError {
+  constructor(problem: Problem, opts: { httpStatus?: number | undefined; synthesized: boolean; attempts: number }) {
+    super(problem, opts);
+    this.name = "StepUpRequired";
+  }
+}
+
+export function isStepUpRequired(e: unknown): e is StepUpRequired {
+  return e instanceof StepUpRequired;
 }

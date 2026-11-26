@@ -8,18 +8,25 @@
 //! - `cs init-kms --config <file>`: creates the local software KMS root key (J.4 step 1,
 //!   single-node only).
 //! - `cs check-config --config <file>`: validates and exits.
+//! - `cs admin --config <file> <action>`: M1 tenant, user and group administration and the
+//!   first-administrator setup link (M1 contract §0 `[R4]`). A standalone subcommand, not a
+//!   server role: no listener, no `control` role. It connects only to the identity domain and
+//!   runs each action as one identity-domain transaction that writes an outbox event.
 
 use clap::{Parser, Subcommand};
 use cs_api::{ApiState, DomainReachable, MigrationsCurrent, ReadinessBarrier};
 use cs_common::config::{Config, KmsBackend, PolicyKey, Role};
+use cs_common::id::{GroupId, TenantId, UserId};
 use cs_common::vector::DomainId;
 use cs_db::migrate::{MigrationSet, Migrator, common_migrations};
 use cs_db::{DomainPool, RetryPolicy};
+use cs_identity::admin::{AdminError, IdentityAdmin, Member, NewUser, UserKind};
 use cs_kms::LocalSoftwareKms;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Roles implemented by this build. Every other role is refused, never run as a no-op.
 const IMPLEMENTED_ROLES: &[Role] = &[Role::Api];
@@ -37,6 +44,10 @@ enum Cmd {
     Serve {
         #[arg(long)]
         config: PathBuf,
+        /// Development profile. Required by `[notifier] kind = "dev_log"`, which writes bearer
+        /// secrets to stderr ([R7]). Never use in production.
+        #[arg(long)]
+        dev: bool,
     },
     /// Apply database migrations for every configured domain.
     Migrate {
@@ -52,6 +63,140 @@ enum Cmd {
     CheckConfig {
         #[arg(long)]
         config: PathBuf,
+        /// Check for the `cs serve --dev` profile ([R7]).
+        #[arg(long)]
+        dev: bool,
+    },
+    /// Identity administration (M1: CLI only; no HTTP admin API until M2).
+    Admin {
+        #[arg(long)]
+        config: PathBuf,
+        #[command(subcommand)]
+        action: AdminCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AdminCmd {
+    /// Tenant administration.
+    #[command(subcommand)]
+    Tenant(TenantCmd),
+    /// User administration.
+    #[command(subcommand)]
+    User(UserCmd),
+    /// Group administration.
+    #[command(subcommand)]
+    Group(GroupCmd),
+    /// Issue the one-time first-administrator setup link for an invited user (J.4 step 4).
+    /// Prints the link token once; only its SHA-256 is stored.
+    SetupLink {
+        #[arg(long)]
+        tenant: TenantId,
+        #[arg(long)]
+        user: UserId,
+    },
+    /// Administrator-assisted account recovery (M1 contract §4, rev 10).
+    #[command(subcommand)]
+    Recovery(RecoveryCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum RecoveryCmd {
+    /// Create an email-method recovery request under the waiting period. Prints the recovery
+    /// link token once (only its SHA-256 is stored); hand it to the user over a verified
+    /// channel. Recovery restores sign-in only, never vault keys.
+    Start {
+        #[arg(long)]
+        tenant: TenantId,
+        #[arg(long)]
+        user: UserId,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TenantCmd {
+    /// Create an active tenant.
+    Create {
+        #[arg(long)]
+        name: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum KindArg {
+    Member,
+    Guest,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum MemberKindArg {
+    User,
+    Group,
+}
+
+#[derive(Subcommand, Debug)]
+enum UserCmd {
+    /// Set the user's email address (rev 11); `--verified` marks it verified, which the email
+    /// recovery method requires.
+    SetEmail {
+        #[arg(long)]
+        tenant: TenantId,
+        #[arg(long)]
+        user: UserId,
+        #[arg(long)]
+        email: String,
+        #[arg(long)]
+        verified: bool,
+    },
+    /// Create an invited user.
+    Create {
+        #[arg(long)]
+        tenant: TenantId,
+        #[arg(long)]
+        login: String,
+        #[arg(long, value_enum, default_value = "member")]
+        kind: KindArg,
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupCmd {
+    /// Create an empty group.
+    Create {
+        #[arg(long)]
+        tenant: TenantId,
+        #[arg(long)]
+        name: String,
+    },
+    /// Add a direct member (cycles and limit breaches are rejected).
+    AddMember {
+        #[arg(long)]
+        tenant: TenantId,
+        #[arg(long)]
+        group: GroupId,
+        #[arg(long)]
+        member: Uuid,
+        #[arg(long, value_enum)]
+        kind: MemberKindArg,
+        /// Expected current membership_version (compare-and-set).
+        #[arg(long)]
+        expected_version: Option<i64>,
+    },
+    /// Remove a direct member.
+    RemoveMember {
+        #[arg(long)]
+        tenant: TenantId,
+        #[arg(long)]
+        group: GroupId,
+        #[arg(long)]
+        member: Uuid,
+        #[arg(long, value_enum)]
+        kind: MemberKindArg,
+        /// Expected current membership_version (compare-and-set).
+        #[arg(long)]
+        expected_version: Option<i64>,
     },
 }
 
@@ -61,6 +206,9 @@ fn migration_set(domain: &DomainId) -> Result<MigrationSet, String> {
     match domain {
         DomainId::Operations => common
             .merge(cs_ops::migrations().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string()),
+        DomainId::Identity => common
+            .merge(cs_identity::migrations().map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string()),
         _ => Ok(common),
     }
@@ -143,17 +291,34 @@ async fn shutdown_signal() {
     }
 }
 
-async fn serve(path: &Path) -> Result<(), String> {
+/// Profile-dependent checks shared by `serve` and `check-config` (M1 contract §4 rev 13, [R7]).
+fn check_profile(cfg: &Config, dev: bool) -> Result<(), String> {
+    cfg.check_profile(dev).map_err(|e| format!("cs: {e}"))?;
+    let domain = cfg
+        .api
+        .as_ref()
+        .map(|a| a.deployment_domain.as_str())
+        .unwrap_or("");
+    cs_identity::notify::validate_config(cfg.notifier.as_ref(), domain, dev)
+        .map_err(|e| format!("cs: invalid [notifier]: {}", admin_error(&e)))
+}
+
+async fn serve(path: &Path, dev: bool) -> Result<(), String> {
     let cfg = load(path)?;
     check_roles(&cfg)?;
+    check_profile(&cfg, dev)?;
     let telemetry = cs_common::telemetry::init(&cfg.telemetry).map_err(|e| format!("cs: {e}"))?;
-    let _kms = open_kms(&cfg)?;
+    let kms = open_kms(&cfg)?;
     let api = cfg
         .api
         .clone()
         .ok_or("cs: the api role needs an [api] section")?;
     let mut barriers: Vec<Arc<dyn ReadinessBarrier>> = Vec::new();
+    let mut identity_pool = None;
     for pool in pools(&cfg)? {
+        if pool.domain() == &DomainId::Identity {
+            identity_pool = Some(pool.clone());
+        }
         barriers.push(Arc::new(DomainReachable(pool.clone())));
         let set = migration_set(pool.domain())?;
         barriers.push(Arc::new(MigrationsCurrent { pool, set }));
@@ -164,6 +329,52 @@ async fn serve(path: &Path) -> Result<(), String> {
         Duration::from_millis(api.readiness_timeout_ms),
     );
     let max_body = usize::try_from(api.max_body_bytes).unwrap_or(usize::MAX);
+    // Identity routes (M1 contract §2, §3) need the identity domain and a KMS.
+    let mut routes = cs_api::public_routes();
+    match (identity_pool, kms) {
+        (Some(pool), Some(kms)) => {
+            let auth = cs_identity::auth::AuthService::new(
+                pool,
+                Arc::new(kms),
+                &api.deployment_domain,
+                cs_identity::session::SessionPolicy::from_policy(&cfg.policy),
+            );
+            // DPoP replay store (M1 contract §3 [R6], rev 14): dpop_jti only; Valkey serves
+            // rate limits alone.
+            // Rate limits (M1 contract §5, rev 11): Valkey counters, local buckets at limit/N
+            // ([cluster] node_count) when Valkey is unavailable; never unlimited.
+            let limits = cs_identity::ratelimit::RateLimits::from_policy(
+                &cfg.policy,
+                cfg.cluster.node_count,
+            );
+            let limiter = cs_identity::ratelimit::RateLimiter::new(
+                limits,
+                cfg.valkey.as_ref().map(|v| v.url.expose_secret().as_str()),
+            )
+            .map_err(|e| format!("cs: invalid valkey.url: {e}"))?;
+            let auth = auth.with_rate_limiter(limiter);
+            // Recovery-link delivery (M1 contract §4 rev 13): best effort, bounded queue.
+            if dev {
+                tracing::warn!("cs serve --dev: development profile, not for production");
+            }
+            if cfg.notifier.is_none() {
+                tracing::warn!(
+                    "[notifier] not configured: email recovery cannot deliver links (recovery/start still answers 202)"
+                );
+            }
+            let notifier = cs_identity::notify::from_config(
+                cfg.notifier.as_ref(),
+                &api.deployment_domain,
+                dev,
+            )
+            .map_err(|e| format!("cs: invalid [notifier]: {}", admin_error(&e)))?;
+            let auth = auth.with_notifier(notifier);
+            routes = routes.merge(cs_identity::http::routes(Arc::new(auth)));
+        }
+        _ => tracing::warn!(
+            "identity routes disabled: they need [domains.identity] and a [kms] section"
+        ),
+    }
     let public = tokio::net::TcpListener::bind(api.listen)
         .await
         .map_err(|e| format!("cs: cannot bind api.listen {}: {e}", api.listen))?;
@@ -182,7 +393,7 @@ async fn serve(path: &Path) -> Result<(), String> {
     let mut rx1 = rx;
     let public_task = tokio::spawn(cs_api::serve(
         public,
-        cs_api::router(state.clone(), max_body),
+        cs_api::with_middleware(routes, state.clone(), max_body),
         async move {
             let _ = rx1.wait_for(|v| *v).await;
         },
@@ -229,6 +440,161 @@ async fn migrate(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Render an Appendix D error for the operator (code, detail, field errors; never the cause's
+/// secrets: causes are driver errors, which carry no bearer material here).
+fn admin_error(e: &cs_common::Error) -> String {
+    let mut s = format!("cs admin: {}", e.code());
+    if let Some(d) = e.detail() {
+        s.push_str(&format!(": {d}"));
+    }
+    for f in e.field_errors() {
+        s.push_str(&format!(" [{}]", f.code));
+    }
+    if let Some(c) = e.cause() {
+        s.push_str(&format!(" (cause: {c})"));
+    }
+    s
+}
+
+fn member_of(member: Uuid, kind: MemberKindArg) -> Result<Member, String> {
+    let bad = |e: cs_common::id::IdError| format!("cs admin: invalid --member: {e}");
+    Ok(match kind {
+        MemberKindArg::User => Member::User(UserId::from_uuid(member).map_err(bad)?),
+        MemberKindArg::Group => Member::Group(GroupId::from_uuid(member).map_err(bad)?),
+    })
+}
+
+async fn admin(path: &Path, action: AdminCmd) -> Result<(), String> {
+    let cfg = load(path)?;
+    let dc = cfg
+        .domains
+        .get(&DomainId::Identity)
+        .ok_or("cs admin: no [domains.identity] configured")?;
+    let pool = DomainPool::connect_lazy(
+        DomainId::Identity,
+        dc,
+        RetryPolicy::from_policy(&cfg.policy),
+    )
+    .map_err(|e| format!("cs admin: {e}"))?;
+    let res = admin_run(&pool, &cfg.policy, action).await;
+    pool.close().await;
+    res
+}
+
+async fn admin_run(
+    pool: &DomainPool,
+    policy: &cs_common::config::Policy,
+    action: AdminCmd,
+) -> Result<(), String> {
+    // Refuse to write into a schema this binary does not match (J.4 step 3 runs first).
+    let set = migration_set(&DomainId::Identity)?;
+    let status = Migrator::status(pool, &set)
+        .await
+        .map_err(|e| format!("cs admin: identity domain: {e}"))?;
+    if !status.is_current() {
+        return Err(format!(
+            "cs admin: identity domain migrations pending {:?}; run `cs migrate --config <file>` first",
+            status.pending
+        ));
+    }
+    let a = IdentityAdmin::with_policy(pool.clone(), policy).map_err(|e| admin_error(&e))?;
+    let err = |e: AdminError| admin_error(&e);
+    match action {
+        AdminCmd::Tenant(TenantCmd::Create { name }) => {
+            let t = a.create_tenant(&name).await.map_err(err)?;
+            println!("tenant_id={}", t.tenant_id);
+        }
+        AdminCmd::User(UserCmd::SetEmail {
+            tenant,
+            user,
+            email,
+            verified,
+        }) => {
+            a.set_email(tenant, user, &email, verified)
+                .await
+                .map_err(err)?;
+            println!("user_id={user} email_verified={verified}");
+        }
+        AdminCmd::Recovery(RecoveryCmd::Start { tenant, user }) => {
+            let link = a.start_recovery(tenant, user).await.map_err(err)?;
+            println!("recovery_link_token={}", link.expose_secret());
+        }
+        AdminCmd::User(UserCmd::Create {
+            tenant,
+            login,
+            kind,
+            display_name,
+        }) => {
+            let kind = match kind {
+                KindArg::Member => UserKind::Member,
+                KindArg::Guest => UserKind::Guest,
+            };
+            let u = a
+                .create_user(
+                    tenant,
+                    NewUser {
+                        login,
+                        kind,
+                        display_name,
+                    },
+                )
+                .await
+                .map_err(err)?;
+            println!(
+                "user_id={}\nlogin={}\nstatus={}",
+                u.user_id,
+                u.login,
+                u.status.as_str()
+            );
+        }
+        AdminCmd::Group(GroupCmd::Create { tenant, name }) => {
+            let g = a.create_group(tenant, &name).await.map_err(err)?;
+            println!(
+                "group_id={}\nmembership_version={}",
+                g.group_id, g.membership_version
+            );
+        }
+        AdminCmd::Group(GroupCmd::AddMember {
+            tenant,
+            group,
+            member,
+            kind,
+            expected_version,
+        }) => {
+            let c = a
+                .add_member(tenant, group, member_of(member, kind)?, expected_version)
+                .await
+                .map_err(err)?;
+            println!("membership_version={}", c.membership_version);
+        }
+        AdminCmd::Group(GroupCmd::RemoveMember {
+            tenant,
+            group,
+            member,
+            kind,
+            expected_version,
+        }) => {
+            let c = a
+                .remove_member(tenant, group, member_of(member, kind)?, expected_version)
+                .await
+                .map_err(err)?;
+            println!("membership_version={}", c.membership_version);
+        }
+        AdminCmd::SetupLink { tenant, user } => {
+            let l = a.issue_setup_link(tenant, user).await.map_err(err)?;
+            // The token is a bearer secret: printed once to stdout for the operator, never
+            // logged.
+            println!(
+                "setup_token={}\nexpires_at={}\nrevoked_previous={}",
+                l.token.expose_secret(),
+                l.expires_at,
+                l.revoked_previous
+            );
+        }
+    }
+    Ok(())
+}
+
 fn init_kms(path: &Path) -> Result<(), String> {
     let cfg = load(path)?;
     let k = cfg.kms.ok_or("cs: no [kms] section configured")?;
@@ -258,13 +624,16 @@ fn main() -> ExitCode {
         }
     };
     let res = match cli.cmd {
-        Cmd::Serve { config } => rt.block_on(serve(&config)),
+        Cmd::Serve { config, dev } => rt.block_on(serve(&config, dev)),
         Cmd::Migrate { config } => rt.block_on(migrate(&config)),
         Cmd::InitKms { config } => init_kms(&config),
-        Cmd::CheckConfig { config } => load(&config).map(|c| {
-            let roles: Vec<_> = c.roles.iter().map(|r| r.as_str()).collect();
-            println!("configuration valid (roles: {})", roles.join(", "));
-        }),
+        Cmd::Admin { config, action } => rt.block_on(admin(&config, action)),
+        Cmd::CheckConfig { config, dev } => load(&config)
+            .and_then(|c| check_profile(&c, dev).map(|()| c))
+            .map(|c| {
+                let roles: Vec<_> = c.roles.iter().map(|r| r.as_str()).collect();
+                println!("configuration valid (roles: {})", roles.join(", "));
+            }),
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,

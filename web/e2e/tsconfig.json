@@ -1,0 +1,1 @@
+{ "extends": "../tsconfig.base.json", "compilerOptions": { "rootDir": ".", "outDir": "../dist/e2e-tsc", "types": ["node"] }, "include": ["*.ts"], "exclude": ["vitest.config.ts"], "references": [{ "path": "../packages/sdk" }] }
