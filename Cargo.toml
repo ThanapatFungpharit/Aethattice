@@ -69,6 +69,9 @@ p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "std
 # state live server-side in auth_txns (AEAD-sealed); conditional-ui enables discoverable login.
 webauthn-rs = { version = "=0.6.2", features = ["danger-allow-state-serialisation", "conditional-ui"] }
 url = "2.5.4"
+# Recovery-link SMTP relay (M1 contract §4, rev 13): async tokio transport, rustls with
+# webpki roots and ring; no native-tls, no connection pool, no hostname lookup.
+lettre = { version = "0.11.24", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
 redis = { version = "1.8.3", default-features = false, features = ["tokio-rustls-comp", "connection-manager"] }
 
 [workspace.lints.rust]

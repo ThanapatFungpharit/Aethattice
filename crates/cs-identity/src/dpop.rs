@@ -6,10 +6,12 @@
 //! - `htu` is compared, without query and fragment, with `https://<deployment domain>` plus
 //!   the request path. No `DPoP-Nonce` in M1.
 //! - The key is identified by its RFC 7638 SHA-256 JWK thumbprint (`jkt`).
-//! - Replay `[R6]`: shared across nodes. Valkey `SET NX EX 120` first; when Valkey is not
-//!   configured, times out or errors, the identity `dpop_jti` table
-//!   (`INSERT … ON CONFLICT DO NOTHING`); when both are unavailable the request fails closed
-//!   with `unavailable` (503). Never a per-node cache.
+//! - Replay `[R6]`, rev 14: the only authoritative record is the identity-domain table
+//!   `dpop_jti`. Every DPoP-checked request inserts `((tenant_id, jkt), jti)` with
+//!   `INSERT … ON CONFLICT DO NOTHING` in one short identity transaction; a conflict is a
+//!   replay. Valkey is not on the replay path (a split Valkey/table record let a node
+//!   partitioned from Valkey accept a replay: QA F-1). When the identity domain is unavailable
+//!   the request fails closed with `unavailable` (503). Never a per-node cache.
 //!
 //! Nothing here logs a proof, a token or key material.
 
@@ -21,8 +23,6 @@ use cs_common::id::TenantId;
 use cs_db::DomainPool;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// `[R12]`: proof `iat` within ±60 s.
 pub const MAX_PROOF_SKEW_SECS: i64 = 60;
@@ -32,8 +32,6 @@ pub const REPLAY_TTL_SECS: u64 = 120;
 const MAX_PROOF_BYTES: usize = 4096;
 /// Largest `jti` accepted (the `dpop_jti.jti` column bound).
 const MAX_JTI_BYTES: usize = 255;
-/// Per-call Valkey budget; a slower Valkey counts as unavailable.
-pub const VALKEY_TIMEOUT: Duration = Duration::from_millis(250);
 /// Private JWK members (RFC 7517/7518): any of them refuses the proof.
 const PRIVATE_MEMBERS: &[&str] = &["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
 
@@ -204,115 +202,25 @@ pub enum ReplayVerdict {
     Replayed,
 }
 
-/// Which store answered (observability and tests).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplayBackend {
-    Valkey,
-    Table,
-}
-
-/// The shared replay store `[R6]`.
+/// The shared replay store `[R6]` (rev 14: `dpop_jti` only).
+#[derive(Debug, Clone)]
 pub struct ReplayStore {
-    valkey: Option<Valkey>,
     pool: DomainPool,
 }
 
-impl std::fmt::Debug for ReplayStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReplayStore")
-            .field("valkey_configured", &self.valkey.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-struct Valkey {
-    client: redis::Client,
-    manager: Mutex<Option<redis::aio::ConnectionManager>>,
-}
-
-impl Valkey {
-    /// The connection manager, created on first use (Valkey may be down at startup; the
-    /// manager reconnects on its own afterwards).
-    async fn conn(&self) -> Option<redis::aio::ConnectionManager> {
-        let mut m = self.manager.lock().await;
-        if let Some(c) = m.as_ref() {
-            return Some(c.clone());
-        }
-        let cfg = redis::aio::ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(VALKEY_TIMEOUT))
-            .set_response_timeout(Some(VALKEY_TIMEOUT))
-            .set_number_of_retries(0);
-        let c = tokio::time::timeout(
-            VALKEY_TIMEOUT,
-            redis::aio::ConnectionManager::new_with_config(self.client.clone(), cfg),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        *m = Some(c.clone());
-        Some(c)
-    }
-
-    /// `SET key 1 NX EX 120`; `None` when Valkey is unavailable (timeout or any error).
-    async fn set_nx(&self, key: &str) -> Option<ReplayVerdict> {
-        let mut c = self.conn().await?;
-        let cmd = redis::cmd("SET")
-            .arg(key)
-            .arg(1)
-            .arg("NX")
-            .arg("EX")
-            .arg(REPLAY_TTL_SECS)
-            .clone();
-        let r: Result<Option<String>, _> =
-            tokio::time::timeout(VALKEY_TIMEOUT, cmd.query_async(&mut c))
-                .await
-                .ok()?;
-        match r {
-            Ok(Some(_)) => Some(ReplayVerdict::Fresh),
-            Ok(None) => Some(ReplayVerdict::Replayed),
-            Err(_) => None,
-        }
-    }
-}
-
 impl ReplayStore {
-    /// Replay checks on the `dpop_jti` table only (Valkey not configured).
-    pub fn table_only(pool: DomainPool) -> Self {
-        Self { valkey: None, pool }
-    }
-
-    /// `valkey_url`: `redis://` or `rediss://` URL, or `None` when Valkey is not configured.
     /// `pool` is the identity domain's pool (`dpop_jti`).
-    pub fn new(pool: DomainPool, valkey_url: Option<&str>) -> AuthResult<Self> {
-        let valkey = match valkey_url {
-            Some(u) => Some(Valkey {
-                client: redis::Client::open(u).map_err(Error::internal)?,
-                manager: Mutex::new(None),
-            }),
-            None => None,
-        };
-        Ok(Self { valkey, pool })
+    pub fn new(pool: DomainPool) -> Self {
+        Self { pool }
     }
 
-    /// Record `(tenant, jkt, jti)`; reports a replay, or fails closed with `unavailable`
-    /// when neither store answers.
+    /// Record `(tenant, jkt, jti)` in `dpop_jti`; reports a replay, or fails closed with
+    /// `unavailable` when the identity domain does not answer.
     pub async fn check(
         &self,
         tenant: TenantId,
         proof: &VerifiedProof,
-    ) -> AuthResult<(ReplayVerdict, ReplayBackend)> {
-        if let Some(v) = &self.valkey {
-            let jti_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(proof.jti.as_bytes()));
-            let key = format!(
-                "cs:dpop:{}:{}:{jti_hash}",
-                tenant.as_uuid(),
-                proof.jkt_b64()
-            );
-            if let Some(verdict) = v.set_nx(&key).await {
-                return Ok((verdict, ReplayBackend::Valkey));
-            }
-            tracing::warn!("Valkey unavailable for the DPoP replay check; using dpop_jti");
-        }
+    ) -> AuthResult<ReplayVerdict> {
         let (jkt, jti) = (proof.jkt, proof.jti.clone());
         let r = self
             .pool
@@ -337,10 +245,10 @@ impl ReplayStore {
             })
             .await;
         match r {
-            Ok(1) => Ok((ReplayVerdict::Fresh, ReplayBackend::Table)),
-            Ok(_) => Ok((ReplayVerdict::Replayed, ReplayBackend::Table)),
+            Ok(1) => Ok(ReplayVerdict::Fresh),
+            Ok(_) => Ok(ReplayVerdict::Replayed),
             Err(e) => {
-                tracing::error!(error = %e, "DPoP replay store unavailable (Valkey and dpop_jti)");
+                tracing::error!(error = %e, "DPoP replay store unavailable (dpop_jti)");
                 Err(Error::new(ErrorCode::Unavailable)
                     .with_detail("DPoP replay protection is temporarily unavailable.")
                     .into())
@@ -350,7 +258,7 @@ impl ReplayStore {
 
     /// Verify a replay-free proof: `Ok` only for a fresh proof.
     pub async fn require_fresh(&self, tenant: TenantId, proof: &VerifiedProof) -> AuthResult<()> {
-        match self.check(tenant, proof).await?.0 {
+        match self.check(tenant, proof).await? {
             ReplayVerdict::Fresh => Ok(()),
             ReplayVerdict::Replayed => Err(bad_proof()),
         }

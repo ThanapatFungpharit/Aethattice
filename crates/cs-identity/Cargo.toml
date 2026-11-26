@@ -18,6 +18,8 @@ cs-crypto.workspace = true
 cs-db.workspace = true
 cs-identity-wire.workspace = true
 cs-kms.workspace = true
+lettre.workspace = true
+metrics.workspace = true
 ed25519-dalek.workspace = true
 opaque-ke.workspace = true
 p256.workspace = true
@@ -42,6 +44,7 @@ http-body-util.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tower.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

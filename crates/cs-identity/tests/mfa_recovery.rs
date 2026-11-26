@@ -8,6 +8,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod common;
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -1190,6 +1192,106 @@ async fn recovery_by_code_and_r5_completion() {
     e.t.cleanup().await;
 }
 
+/// Rev 14 (QA F-3): every authenticated route checks the session at `sgen`, not only the
+/// JWT. A revoked session, or one whose generation moved on, is refused on `/me` and every
+/// `/me/*` route while its access token is still unexpired.
+#[tokio::test]
+async fn revoked_session_access_token_refused_on_every_me_route() {
+    let Some(e) = env().await else { return };
+    let t = alice(&e, "pw").await;
+    let ts = t.as_uuid().to_string();
+    let routes = [
+        "/api/v2/me",
+        "/api/v2/me/sessions",
+        "/api/v2/me/passkeys",
+        "/api/v2/me/recovery-codes",
+        "/api/v2/me/recovery-requests",
+    ];
+    let (_, _, v) = login(&e, &ts, LOGIN, "pw").await;
+    let at = v["access_token"].as_str().unwrap().to_owned();
+    for r in routes {
+        let (s, _, b) = e.req("GET", r, Some(&at), None, &[]).await;
+        assert_eq!(s, StatusCode::OK, "{r}: {b}");
+    }
+    // Generation moved on (refresh rotation): the old token is refused everywhere.
+    exec(e.pool(), "UPDATE sessions SET generation = generation + 1").await;
+    for r in routes {
+        let (s, _, b) = e.req("GET", r, Some(&at), None, &[]).await;
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "{r} after generation bump: {b}"
+        );
+        assert_eq!(b["code"], "unauthenticated");
+    }
+    // Revoked session.
+    let (_, _, v) = login(&e, &ts, LOGIN, "pw").await;
+    let at = v["access_token"].as_str().unwrap().to_owned();
+    exec(e.pool(), "UPDATE sessions SET state = 'revoked'").await;
+    for r in routes {
+        let (s, _, b) = e.req("GET", r, Some(&at), None, &[]).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{r} after revocation: {b}");
+    }
+    let (s, _, _) = e
+        .req("POST", "/api/v2/me/recovery-codes", Some(&at), None, &[])
+        .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    e.t.cleanup().await;
+}
+
+/// Rev 13: the email recovery link goes through the SMTP relay. `recovery/start` answers 202
+/// without waiting for SMTP (the fake server greets only after 3 s), and the delivered link
+/// works with `recovery/status`.
+#[tokio::test]
+async fn recovery_email_through_smtp_relay_never_waits_for_smtp() {
+    let Some(mut e) = env().await else { return };
+    let t = alice(&e, "pw").await;
+    let ts = t.as_uuid().to_string();
+    exec(
+        e.pool(),
+        "UPDATE users SET email = 'alice@mail.test', email_verified_at = now()",
+    )
+    .await;
+    let smtp = common::fake_smtp::FakeSmtp::start(Duration::from_secs(3), 0).await;
+    let relay = cs_identity::notify::SmtpRelay::start(&smtp.config(), DOMAIN).unwrap();
+    let auth = Arc::new(
+        AuthService::new(
+            e.pool().clone(),
+            e.kms.clone(),
+            DOMAIN,
+            SessionPolicy::default(),
+        )
+        .with_rate_limiter(RateLimiter::local_only(generous()))
+        .with_notifier(Arc::new(relay)),
+    );
+    e.app = app(auth);
+    let t0 = std::time::Instant::now();
+    let (s, _, a) = e
+        .post(
+            "/api/v2/auth/recovery/start",
+            json!({"tenant": ts, "login": LOGIN, "method": "email"}),
+        )
+        .await;
+    let elapsed = t0.elapsed();
+    assert_eq!((s, a), (StatusCode::ACCEPTED, json!({"state": "pending"})));
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "start waited for SMTP: {elapsed:?}"
+    );
+    assert!(smtp.mails.lock().unwrap().is_empty());
+    let mails = smtp.wait_for(1, Duration::from_secs(20)).await;
+    assert_eq!(mails.len(), 1);
+    assert!(mails[0].contains("To: alice@mail.test"), "{}", mails[0]);
+    assert!(mails[0].contains(&format!("https://{DOMAIN}/#/recover/rt1.")));
+    let link = common::fake_smtp::link_token(&mails[0]).unwrap();
+    let (s, _, st) = e
+        .post("/api/v2/auth/recovery/status", json!({"token": link}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{st}");
+    assert_eq!(st["state"], "pending");
+    e.t.cleanup().await;
+}
+
 /// rev 10 email method (waiting period, identical 202, link only through the Notifier, MFA
 /// users need a code) and device approval (step-up approval, cancel, list).
 #[tokio::test]
@@ -1210,7 +1312,22 @@ async fn recovery_by_email_and_device_approval() {
     assert_eq!((s, s2), (StatusCode::ACCEPTED, StatusCode::ACCEPTED));
     assert_eq!(a, json!({"state": "pending"}));
     assert_eq!(a, b);
-    let links = e.mail.0.lock().unwrap().clone();
+    // The hand-off runs off the request path (rev 13, QA F-2): wait for it.
+    let mut links = Vec::new();
+    for _ in 0..100 {
+        links = e.mail.0.lock().unwrap().clone();
+        if !links.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Let a (wrong) second link for the unknown account surface too.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let links = if links.is_empty() {
+        links
+    } else {
+        e.mail.0.lock().unwrap().clone()
+    };
     assert_eq!(links.len(), 1, "only the real account gets a link");
     assert_eq!(links[0].0, "alice@mail.test");
     let link = links[0].1.clone();

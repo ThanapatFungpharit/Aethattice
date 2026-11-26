@@ -26,9 +26,9 @@
 //! - Slice 4 (rev 10/11): [`webauthn`] passkeys (webauthn-rs), [`mfa`] (second factor and
 //!   the enrolment-only session), [`ceremony`] state, [`recovery`] (codes, request flows,
 //!   [R5] completion in [`auth`]), [`ratelimit`] (Valkey, limit/N fallback), [`me`]
-//!   (`/me/sessions`), [`notify`] (Notifier trait; SMTP relay not yet).
+//!   (`/me/sessions`), [`notify`] (Notifier trait, SMTP relay, `[R7]` dev sink).
 //!
-//! Not yet: SMTP relay notifier, native (device-bound) refresh.
+//! Not yet: native (device-bound) refresh.
 
 pub mod admin;
 pub mod auth;
