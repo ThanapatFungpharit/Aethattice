@@ -85,10 +85,10 @@ Recorded by QA on `m1/qa` (base `milestone/m1-identity` c88e83c, merged with 86e
 | Item | Status | Evidence |
 |---|---|---|
 | 1 Preconditions | PASS | YugabyteDB and Valkey reachable. Containers were not restarted. |
-| 2 CI | RESULTS_CI | |
+| 2 CI | NOT RUN | `scripts/ci.sh --with-db` was not run by QA. The host was memory-constrained (load 16–18, OOM reaping of background jobs), and the backend fixes are pending. The TL reruns it on the fixed branch. |
 | 3.1 Harness | PASS | See §7.1 for counts. `harness::test_db_is_leased_isolated_and_reset` passes. |
 | 3.2 Self-check | PASS | clippy `-D warnings` clean with `m1-contract`. |
-| 3.3 QA suite | FAIL (3 product defects) | RESULTS_SUITE |
+| 3.3 QA suite | FAIL (3 product defects) | Full run 2026-11-26 (m1-contract, 2 threads): config 9, consistency_vector 16, db_retry 4, error_model 14, harness 3, http_surface 7, idempotency 11, ids 5: all passed. m1: 38 passed, 4 failed (F-1, F-2, F-3, plus a step-up timing flake that QA fixed afterwards: the inside-window age is now 240 s). migrations, outbox, readiness, sagas and signing did not complete: cargo fail-fast stopped after m1, and the rerun was cut off when the host/cluster became unavailable. The TL reruns them. |
 | 3.3a malformed JSON (M1-R14) | PASS | `http_surface` 7 passed, 0 ignored. |
 | 3.4 §9 log scan | PASS | No secret found in any in-process test log or in the `cs serve` TRACE log (280 lines) or `cs admin` stderr. |
 | 4 Repeatability ×3 | NOT RUN | Blocked until the F-1 … F-3 fixes land. The suite is ready to rerun. |
@@ -98,11 +98,11 @@ Recorded by QA on `m1/qa` (base `milestone/m1-identity` c88e83c, merged with 86e
 
 | | CREATE DATABASE | DROP DATABASE |
 |---|---|---|
-| Before (old harness: one create and one drop per `TestDb`; counted as the leases of the same run) | RESULTS_BEFORE | RESULTS_BEFORE |
-| After, first run on a fresh cluster (pool created) | RESULTS_FIRST | 0 |
+| Before (old harness: one create and one drop per `TestDb`; counted as the leases of the same run) | 57 | 57 |
+| After, first run on a fresh cluster (pool created) | 9 (first M1 run; the pool has 12 databases after all runs) | 0 |
 | After, steady state (pool exists) | 0 | 0 |
 
-Method: `CS_QA_POOL_LOG` counts `create`, `lease`, `reset` and `release`. Each lease replaces one CREATE and one DROP of the old harness. QA itself created and dropped one probe database (`qa_probe_allowconn`) to confirm that `ALLOW_CONNECTIONS` works on YugabyteDB 2026.1.
+Measured on the binaries that completed in the full run (config through m1): 57 leases, 1 CREATE (a pool database not needed before), 0 DROP. The old harness would have issued 57 CREATE and 57 DROP for the same binaries. The M0 binaries that did not complete (migrations, readiness, sagas, outbox) add about 40 more leases, which means about 40 more CREATE+DROP pairs under the old harness. **Harness defect found and fixed** during the cut-off rerun: a failed `pg_database` inspection on the degraded cluster was read as "database missing". That produced 127 failed CREATE attempts for existing pool databases; none of them succeeded, and nothing was dropped. An inspection error now retries the inspection, never a CREATE. Method: `CS_QA_POOL_LOG` counts `create`, `lease`, `reset` and `release`. Each lease replaces one CREATE and one DROP of the old harness. QA itself created and dropped one probe database (`qa_probe_allowconn`) to confirm that `ALLOW_CONNECTIONS` works on YugabyteDB 2026.1.
 
 ### 7.2 Findings against the implementation (reported to the TL; all accepted, fixes in progress)
 

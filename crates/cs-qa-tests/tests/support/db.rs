@@ -208,13 +208,24 @@ async fn ensure_database(admin: &str, name: &str) -> Result<(), String> {
     for attempt in 1..=30u64 {
         match conn(admin).await {
             Ok(mut c) => {
-                let exists: bool = sqlx::query_scalar(
+                // An inspection error must never be read as "missing": that turned a degraded
+                // cluster into a CREATE retry storm (dozens of failed CREATEs for existing pool
+                // databases, 2026-11-26 full run). Retry the inspection instead.
+                let exists: bool = match sqlx::query_scalar(
                     "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
                 )
                 .bind(name)
                 .fetch_one(&mut c)
                 .await
-                .unwrap_or(false);
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        last = e.to_string();
+                        let _ = c.close().await;
+                        tokio::time::sleep(Duration::from_millis(500 * attempt.min(20))).await;
+                        continue;
+                    }
+                };
                 if exists {
                     let _ = c.close().await;
                     // A previous holder may have disabled connections (readiness stimulus)

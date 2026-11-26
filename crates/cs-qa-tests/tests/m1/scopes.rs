@@ -103,8 +103,9 @@ async fn step_up_enforced_on_every_sensitive_route() {
     for p in ["/api/v2/me", "/api/v2/me/sessions", "/api/v2/me/passkeys", "/api/v2/me/recovery-codes"] {
         e.call(s.req(Req::get(p))).await.expect(200);
     }
-    // Inside the window (4 min 59 s): the guard passes.
-    e.age_strong_auth(&s, 299).await;
+    // Inside the window: 4 min (not 4 min 59 s: on a loaded host the seven requests below
+    // can take several seconds, which would push the session past the window).
+    e.age_strong_auth(&s, 240).await;
     for (name, r) in &sensitive {
         let resp = e.call(s.req(r.clone())).await;
         assert!(!is_step_up(&resp), "{name}: step-up demanded inside the window: {}", resp.body);
