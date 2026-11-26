@@ -284,7 +284,7 @@ describe("passkey with a software authenticator (rev 10/11)", () => {
 describe("Idempotency-Key replay of identity writes (contract rev 15)", () => {
   // A lost register/finish response retried with the same Idempotency-Key must replay the first 2xx instead of
   // answering 401 for the consumed txn. Server-side replay is the backend's rev 15 work (TL, 2026-11-26).
-  it.skip("register/finish retried with the same Idempotency-Key replays the 2xx (pending backend, contract rev 15)", async () => {
+  it("register/finish retried with the same Idempotency-Key replays the 2xx (contract rev 15)", async () => {
     const t = session.tab;
     if (!t) throw new Error("no session");
     await reauthenticate(t.deps, t.authed, E2E.tenant, E2E.login, password);
